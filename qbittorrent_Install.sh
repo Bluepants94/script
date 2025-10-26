@@ -329,14 +329,12 @@ manage_service() {
                 log_info "正在重启服务..."
                 systemctl restart qbittorrent-nox
                 ;;
-            4. | status)
+            4)
                 log_info "正在显示服务状态 (按 'q' 退出状态视图)..."
-                # status 会占据屏幕，需要用户交互
                 systemctl status qbittorrent-nox
                 read -p "按任意键继续..." -n 1 -r
                 ;;
             0)
-                # (要求5) 返回上层选择
                 break
                 ;;
             *)
