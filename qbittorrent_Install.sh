@@ -263,7 +263,7 @@ do_uninstall() {
         return
     fi
 
-    read -p "[WARN] 这将彻底删除 qb-nox 程序和服务文件。确认卸载? (y/n): " confirm
+    read -p "[WARN] 这将彻底删除 qbittorrent-nox 程序和服务文件。确认卸载? (y/n): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         log_info "卸载已取消。"
         return
