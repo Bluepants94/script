@@ -82,17 +82,12 @@ check_dependencies() {
 
 # 4. 获取最新版本号
 get_latest_version() {
-    # GitHub releases page URL
     local release_url="https://github.com/userdocs/qbittorrent-nox-static/releases/latest"
-    
-    # 使用 wget 或 curl 获取重定向的最终 URL，从中提取标签名（版本号）
-    # 示例: 重定向到 .../tag/release-4.5.5 或 .../tag/v4.5.5
     local latest_tag=""
 
     if command -v curl &>/dev/null; then
         latest_tag=$(curl -sSL -o /dev/null -w %{url_effective} "$release_url" | grep -oP 'tag/\K[^/]+$')
     elif command -v wget &>/dev/null; then
-        # wget 稍微复杂，通过解析输出获取重定向URL
         local redirect_url
         redirect_url=$(wget -nv --server-response --spider "$release_url" 2>&1 | grep -i Location: | tail -1 | awk '{print $2}')
         latest_tag=$(echo "$redirect_url" | grep -oP 'tag/\K[^/]+$')
@@ -101,9 +96,14 @@ get_latest_version() {
         return 1
     fi
 
-    # 清理版本号，例如移除可能的前缀 "release-" 或 "v"
+    # --- 关键修改部分开始 ---
     if [ -n "$latest_tag" ]; then
+        # 1. 移除可能的前缀 "release-" 或 "v"
         LATEST_VERSION=$(echo "$latest_tag" | sed 's/release-//g; s/v//g')
+        
+        # 2. 移除第一个下划线 "_" 及其之后的所有内容 (例如: "5.1.2_v2.0.11" -> "5.1.2")
+        LATEST_VERSION=$(echo "$LATEST_VERSION" | cut -d '_' -f 1)
+        
         log_info "GitHub 上的最新版本是: $LATEST_VERSION"
         return 0
     else
