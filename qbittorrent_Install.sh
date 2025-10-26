@@ -271,6 +271,8 @@ do_update() {
     # 停止服务，如果服务未启动，此命令可能返回非零值，但我们不应该退出
     systemctl stop qbittorrent-nox
 
+    rm -f "$BINARY_PATH"
+
     if install_binary; then
         log_info "二进制文件更新成功。"
         
