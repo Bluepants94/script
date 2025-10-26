@@ -143,8 +143,8 @@ do_install() {
     if install_binary; then
         create_service_file
         log_info "安装完成。"
-        log_info "请注意：您需要运行一次 /usr/bin/qbittorrent-nox 来获取一次性密码。"
-        log_info "然后使用 '管理开机自启' 和 'systemd 服务控制' 菜单来启动服务。"
+        log_info "请注意：首次运行需自行获取密码 /usr/bin/qbittorrent-nox。"
+        log_info "使用 '管理开机自启' 和 'systemd 服务控制' 启动服务。"
     else
         log_error "安装过程中发生错误。"
     fi
@@ -158,7 +158,30 @@ do_update() {
         return
     fi
     
-    log_info "检测到当前版本: $INSTALLED_VERSION"
+    log_info "已安装版本: $INSTALLED_VERSION"
+    
+    # 尝试获取最新版本
+    if ! get_latest_version; then
+        log_warn "版本检测失败。出于安全考虑，建议手动检查或稍后重试。"
+        # 即使无法获取版本，也询问用户是否强制更新
+        read -p "无法获取最新版本，是否强制更新程序文件? (y/n): " force_update
+        if [[ "$force_update" != "y" && "$force_update" != "Y" ]]; then
+            log_info "更新已取消。"
+            return
+        fi
+    fi
+
+    # 检查版本差异
+    # 简单字符串对比，如果版本号格式一致，通常有效
+    if [ "$INSTALLED_VERSION" = "v$LATEST_VERSION" ] || [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
+        log_info "本地版本与最新版本 ($LATEST_VERSION) 一致。"
+        read -p "是否仍然强制下载和覆盖? (y/n): " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            log_info "更新已取消。"
+            return
+        fi
+    fi
+
     log_info "正在停止当前服务（如果正在运行）..."
     systemctl stop qbittorrent-nox
 
@@ -214,9 +237,10 @@ manage_autostart() {
     echo "--- 管理开机自启 ---"
     echo " 1. 添加开机自启 (Enable)"
     echo " 2. 移除开机自启 (Disable)"
-    echo " 3. 返回上层"
     echo "---------------------"
-    read -p "请输入选项 [1-3]: " choice
+    echo " 0. 返回"
+    echo "---------------------"
+    read -p "请输入选项 [0-2]: " choice
 
     case $choice in
         1)
@@ -229,7 +253,7 @@ manage_autostart() {
             systemctl disable qbittorrent-nox
             log_info "操作完成。"
             ;;
-        3)
+        0)
             return
             ;;
         *)
@@ -254,9 +278,10 @@ manage_service() {
         echo " 2. 停止 (Stop)"
         echo " 3. 重启 (Restart)"
         echo " 4. 查看状态 (Status)"
-        echo " 5. [返回上层菜单]"
         echo "--------------------------------"
-        read -p "请输入选项 [1-5]: " sub_choice
+        echo " 0. 返回"
+        echo "--------------------------------"
+        read -p "请输入选项 [0-4]: " sub_choice
 
         case $sub_choice in
             1)
@@ -277,7 +302,7 @@ manage_service() {
                 systemctl status qbittorrent-nox
                 read -p "按任意键继续..." -n 1 -r
                 ;;
-            5)
+            0)
                 # (要求5) 返回上层选择
                 break
                 ;;
@@ -311,12 +336,12 @@ main_menu() {
         echo "   1. 安装 qbittorrent-nox"
         echo "   2. 更新 qbittorrent-nox"
         echo "   3. 卸载 qbittorrent-nox"
-        echo "   4. 管理开机自启 (添加/移除)"
-        echo "   5. systemd 服务控制 (启动/停止/状态...)"
-        echo ""
-        echo "   Q. 退出脚本"
+        echo "   4. 管理开机自启"
+        echo "   5. systemd 服务控制"
         echo "-------------------------------------------------"
-        read -p "请输入选项 [1-5, Q]: " main_choice
+        echo "   0. 退出脚本"
+        echo "-------------------------------------------------"
+        read -p "请输入选项 [0-5]: " main_choice
 
         case $main_choice in
             1)
@@ -334,7 +359,7 @@ main_menu() {
             5)
                 manage_service
                 ;;
-            [qQ])
+            [0])
                 log_info "退出脚本。"
                 exit 0
                 ;;
