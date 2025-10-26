@@ -96,13 +96,15 @@ get_latest_version() {
         return 1
     fi
 
-    # --- 关键修改部分开始 ---
     if [ -n "$latest_tag" ]; then
         # 1. 移除可能的前缀 "release-" 或 "v"
-        LATEST_VERSION=$(echo "$latest_tag" | sed 's/release-//g; s/v//g')
+        local clean_version=$(echo "$latest_tag" | sed 's/release-//g; s/v//g')
         
         # 2. 移除第一个下划线 "_" 及其之后的所有内容 (例如: "5.1.2_v2.0.11" -> "5.1.2")
-        LATEST_VERSION=$(echo "$LATEST_VERSION" | cut -d '_' -f 1)
+        local final_version=$(echo "$clean_version" | cut -d '_' -f 1)
+
+        # 3. 添加 "v" 前缀以匹配本地版本格式 (例如: "5.1.2" -> "v5.1.2")
+        LATEST_VERSION="v$final_version"
         
         log_info "GitHub 上的最新版本是: $LATEST_VERSION"
         return 0
