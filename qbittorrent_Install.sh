@@ -165,8 +165,6 @@ EOF
 }
 
 # --- 菜单功能 ---
-
-# 4. 安装
 # 4. 安装
 do_install() {
     log_info "--- 开始安装 qbittorrent-nox ---"
@@ -181,7 +179,7 @@ do_install() {
         return
     fi
     
-    log_info "首次运行 qBittorrent-nox (内存捕获) 以获取一次性临时密码..."
+    log_info "首次运行 qBittorrent-nox 以获取一次性临时密码..."
     
     local qb_output
 
@@ -227,8 +225,7 @@ do_install() {
         log_info "    WebUI 临时密码: $temp_password"
         log_info "    **请务必登录 WebUI (https://localhost:8080) 后立即修改密码!**"
     else
-        # 如果捕获失败，提示用户查看 systemd journal
-        log_warn "    未能自动捕获到临时密码。请使用以下命令查看日志："
+        log_warn "    未能获取导临时密码。请使用以下命令查看日志："
         log_warn "    systemctl status qbittorrent-nox"
     fi
     
