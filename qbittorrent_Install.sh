@@ -185,7 +185,6 @@ do_install() {
     fi
 }
 
-# 4. 更新
 do_update() {
     log_info "--- 开始更新 qbittorrent-nox ---"
     if ! check_install_status; then
@@ -208,7 +207,7 @@ do_update() {
 
     # 检查版本差异
     # 简单字符串对比，如果版本号格式一致，通常有效
-    if [ "$INSTALLED_VERSION" = "v$LATEST_VERSION" ] || [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
+    if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
         log_info "本地版本与最新版本 ($LATEST_VERSION) 一致。"
         read -p "是否仍然强制下载和覆盖? (y/n): " confirm
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
@@ -218,12 +217,29 @@ do_update() {
     fi
 
     log_info "正在停止当前服务（如果正在运行）..."
+    # 停止服务，如果服务未启动，此命令可能返回非零值，但我们不应该退出
     systemctl stop qbittorrent-nox
 
     if install_binary; then
-        log_info "更新完成。建议您使用 'systemd 服务控制' 菜单重新启动服务。"
+        log_info "二进制文件更新成功。"
+        
+        # --- 关键修改：自动重启服务 ---
+        if [ -f "$SERVICE_FILE" ]; then
+            log_info "正在重启 systemd 服务..."
+            systemctl restart qbittorrent-nox
+            if [ $? -eq 0 ]; then
+                 log_info "服务重启成功。"
+            else
+                 log_error "服务重启失败，请使用 'systemd 服务控制' 菜单检查状态。"
+            fi
+        else
+            log_warn "未检测到 systemd 服务文件，跳过自动重启。"
+        fi
+        # --- 关键修改结束 ---
+
+        log_info "更新完成!"
     else
-        log_error "更新过程中发生错误。"
+        log_error "更新过程中发生错误!"
     fi
 }
 
