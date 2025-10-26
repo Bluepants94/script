@@ -167,6 +167,7 @@ EOF
 # --- 菜单功能 ---
 
 # 4. 安装
+# 4. 安装
 do_install() {
     log_info "--- 开始安装 qbittorrent-nox ---"
     if check_install_status; then
@@ -175,25 +176,64 @@ do_install() {
         return
     fi
 
-    if install_binary; then
-        create_service_file
-        
-        # --- 关键修改：启用开机自启并启动程序 ---
-        log_info "正在启用开机自启 (systemctl enable)..."
-        systemctl enable qbittorrent-nox
-        
-        log_info "正在启动 qBittorrent-nox 服务 (systemctl start)..."
-        systemctl start qbittorrent-nox
-        
-        log_info "=================================================="
-        log_info "安装完成，服务已启动并已设置开机自启。"
-        log_info "【重要】首次运行需执行以下命令获取一次性密码："
-        log_info "    /usr/bin/qbittorrent-nox"
-        log_info "WebUI 访问地址：https://localhost:8080"
-        log_info "=================================================="
-    else
-        log_error "安装过程中发生错误。"
+    if ! install_binary; then
+        log_error "安装二进制文件过程中发生错误，安装终止。"
+        return
     fi
+    
+    log_info "首次运行 qBittorrent-nox (内存捕获) 以获取一次性临时密码..."
+    
+    local qb_output
+
+    if command -v timeout &>/dev/null; then
+        qb_output=$(timeout 5s $BINARY_PATH -d 2>&1)
+        if [ $? -eq 124 ]; then
+            log_info "qBittorrent-nox 已被 timeout 终止 (预期行为)。"
+        fi
+    else
+        log_warn "未找到 'timeout' 命令，将直接运行 qbittorrent-nox -d 并等待 5 秒。"
+        $BINARY_PATH -d 2>&1 &
+        local qb_pid=$!
+        sleep 5
+        log_warn "由于缺少 'timeout'，无法在内存中可靠捕获。请注意手动检查密码。"
+    fi
+
+    local temp_password=""
+    if [ -n "$qb_output" ]; then
+        temp_password=$(echo "$qb_output" | grep -oP 'A temporary password is provided for this session: \K[^ ]+' | tail -1)
+    fi
+
+    # 确保没有后台进程在运行 (如果使用了 & 启动)
+    if [ -n "$qb_pid" ] && kill -0 "$qb_pid" 2>/dev/null; then
+        kill "$qb_pid" 2>/dev/null
+        wait "$qb_pid" 2>/dev/null
+    fi
+    
+    # --- 服务安装和启动 ---
+    create_service_file
+    
+    log_info "正在启用开机自启 (systemctl enable)..."
+    systemctl enable qbittorrent-nox
+    
+    log_info "正在启动 qBittorrent-nox 服务 (systemctl start)..."
+    systemctl start qbittorrent-nox
+    
+    log_info "=================================================="
+    log_info "安装完成，服务已启动并已设置开机自启。"
+    log_info "【重要】首次登录信息："
+    log_info "    WebUI 用户名: admin"
+    
+    if [ -n "$temp_password" ]; then
+        log_info "    WebUI 临时密码: $temp_password"
+        log_info "    **请务必登录 WebUI (https://localhost:8080) 后立即修改密码!**"
+    else
+        # 如果捕获失败，提示用户查看 systemd journal
+        log_warn "    未能自动捕获到临时密码。请使用以下命令查看日志："
+        log_warn "    systemctl status qbittorrent-nox"
+    fi
+    
+    log_info "WebUI 访问地址：https://localhost:8080"
+    log_info "=================================================="
 }
 
 # 4. 更新
