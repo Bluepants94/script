@@ -126,10 +126,8 @@ install_binary() {
         return 1
     fi
 
-    log_info "正在设置文件权限..."
     # 使用您提供的 chmod 参数
     chmod 700 "$BINARY_PATH"
-    log_info "二进制文件已更新/安装至 $BINARY_PATH"
     return 0
 }
 
@@ -144,7 +142,6 @@ create_service_file() {
         fi
     fi
 
-    log_info "正在创建 systemd 服务文件..."
     # 使用您提供的 cat 配置
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -159,8 +156,6 @@ ExecStart=/usr/bin/qbittorrent-nox -d
 WantedBy=multi-user.target
 EOF
 
-    log_info "服务文件创建成功。"
-    log_info "正在重载 systemd..."
     systemctl daemon-reload
 }
 
@@ -174,62 +169,69 @@ do_install() {
         return
     fi
 
+    # 1. 安装二进制文件
     if ! install_binary; then
         log_error "安装二进制文件过程中发生错误，安装终止。"
         return
     fi
     
-    log_info "首次运行 qBittorrent-nox 以获取一次性临时密码..."
+    # 2. 首次运行以获取一次性密码（内存捕获）
+    log_info "首次运行 qBittorrent-nox 以获取一次性临时密码...请稍后..."
     
     local qb_output
+    local qb_pid=""
 
+    # 使用 `timeout` (首选，更安全)
     if command -v timeout &>/dev/null; then
-        qb_output=$(timeout 5s $BINARY_PATH -d 2>&1)
-        if [ $? -eq 124 ]; then
-            log_info "qBittorrent-nox 已被 timeout 终止 (预期行为)。"
-        fi
+        qb_output=$(echo -e "\n" | timeout 1s $BINARY_PATH 2>&1)
+
     else
-        log_warn "未找到 'timeout' 命令，将直接运行 qbittorrent-nox -d 并等待 5 秒。"
-        $BINARY_PATH -d 2>&1 &
-        local qb_pid=$!
+        log_warn "无法获取密码，继续安装服务，请手动查看 /usr/bin/qbittorrent-nox 日志获取密码。"
+        
+        # 备选方案：执行一次带 -d 的启动以生成配置，并立即清理
+        echo -e "\n" | $BINARY_PATH -d 2>&1 &
+        qb_pid=$!
         sleep 5
-        log_warn "由于缺少 'timeout'，无法在内存中可靠捕获。请注意手动检查密码。"
+        
+        if kill -0 "$qb_pid" 2>/dev/null; then
+            log_info "正在清理临时启动的 qBittorrent 进程..."
+            kill "$qb_pid" 2>/dev/null
+            wait "$qb_pid" 2>/dev/null
+        fi
     fi
 
+    # 关键修复点：强制终止所有残留进程
+    pkill -f qbittorrent-nox 2>/dev/null
+    sleep 1 
+
+
+    # 提取临时密码
     local temp_password=""
     if [ -n "$qb_output" ]; then
+        # 从捕获的输出中提取密码
+        # 匹配模式：A temporary password is provided for this session: cJRGYng73
         temp_password=$(echo "$qb_output" | grep -oP 'A temporary password is provided for this session: \K[^ ]+' | tail -1)
     fi
 
-    # 确保没有后台进程在运行 (如果使用了 & 启动)
-    if [ -n "$qb_pid" ] && kill -0 "$qb_pid" 2>/dev/null; then
-        kill "$qb_pid" 2>/dev/null
-        wait "$qb_pid" 2>/dev/null
-    fi
     
-    # --- 服务安装和启动 ---
+    # 3. 设置并启动 systemd 服务
     create_service_file
-    
-    log_info "正在启用开机自启 (systemctl enable)..."
     systemctl enable qbittorrent-nox
-    
     log_info "正在启动 qBittorrent-nox 服务 (systemctl start)..."
     systemctl start qbittorrent-nox
-    
+    log_info "安装完成，服务已启动！"
     log_info "=================================================="
-    log_info "安装完成，服务已启动并已设置开机自启。"
-    log_info "【重要】首次登录信息："
-    log_info "    WebUI 用户名: admin"
-    
+    log_info "首次登录信息："
+    log_info "  WebUI 用户名: admin"
     if [ -n "$temp_password" ]; then
-        log_info "    WebUI 临时密码: $temp_password"
-        log_info "    **请务必登录 WebUI (https://localhost:8080) 后立即修改密码!**"
+        log_info "  WebUI 临时密码: $temp_password"
     else
-        log_warn "    未能获取导临时密码。请使用以下命令查看日志："
-        log_warn "    systemctl status qbittorrent-nox"
+        log_warn "  未能获取临时密码。请使用以下命令查看日志："
+        log_warn "  systemctl status qbittorrent-nox"
+        log_warn "  或手动查看临时密码："
+        log_warn "  /usr/bin/qbittorrent-nox"
     fi
-    
-    log_info "WebUI 访问地址：https://localhost:8080"
+    log_info "  WebUI (https://localhost:8080) 登录后立即修改密码!"
     log_info "=================================================="
 }
 
@@ -300,28 +302,40 @@ do_uninstall() {
         return
     fi
 
-    read -p "[WARN] 这将彻底删除 qbittorrent-nox 程序和服务文件。确认卸载? (y/n): " confirm
+    # 由于您使用 User=root，配置文件路径为 /root/.config/qBittorrent
+    CONFIG_DIR="/root/.config/qBittorrent"
+
+    echo ""
+    log_warn "========================================================================="
+    log_warn "[警告] 卸载将彻底删除 qBittorrent-nox 程序、服务文件，以及以下配置和数据目录："
+    log_warn "       -> 程序文件: $BINARY_PATH"
+    log_warn "       -> 服务文件: $SERVICE_FILE"
+    log_warn "       -> 配置文件: $CONFIG_DIR (包含设置、WebUI密码等)"
+    log_warn "========================================================================="
+    
+    read -p "确认彻底卸载? (y/n): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         log_info "卸载已取消。"
         return
     fi
 
-    log_info "正在停止服务..."
+    log_info "正在停止服务...请稍后..."
     systemctl stop qbittorrent-nox
 
-    log_info "正在移除开机自启..."
     systemctl disable qbittorrent-nox 2>/dev/null
 
-    log_info "正在删除 systemd 服务文件..."
     rm -f "$SERVICE_FILE"
 
-    log_info "正在删除程序文件..."
-    # 使用您提供的 rm 命令 (rm -r 改为 rm -f，因为目标是文件)
     rm -f "$BINARY_PATH"
-
-    log_info "正在重载 systemd..."
+    
+    # --- 关键修改：删除配置文件（不再二次确认） ---
+    if [ -d "$CONFIG_DIR" ]; then
+        rm -rf "$CONFIG_DIR"
+    else
+        log_info "配置文件目录 $CONFIG_DIR 不存在，跳过删除。"
+    fi
+    # ---------------------------------------------
     systemctl daemon-reload
-
     log_info "卸载完成。"
 }
 
@@ -424,7 +438,7 @@ main_menu() {
         
         clear
         echo "================================================="
-        echo "     qbittorrent-nox (Static) 一键管理脚本"
+        echo " qbittorrent-nox (Static) 一键管理脚本"
         echo "================================================="
         echo " [系统信息]"
         echo "   操作系统: $OS_NAME"
