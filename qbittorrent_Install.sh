@@ -80,6 +80,39 @@ check_dependencies() {
     log_info "依赖检查通过。"
 }
 
+# 4. 获取最新版本号
+get_latest_version() {
+    # GitHub releases page URL
+    local release_url="https://github.com/userdocs/qbittorrent-nox-static/releases/latest"
+    
+    # 使用 wget 或 curl 获取重定向的最终 URL，从中提取标签名（版本号）
+    # 示例: 重定向到 .../tag/release-4.5.5 或 .../tag/v4.5.5
+    local latest_tag=""
+
+    if command -v curl &>/dev/null; then
+        latest_tag=$(curl -sSL -o /dev/null -w %{url_effective} "$release_url" | grep -oP 'tag/\K[^/]+$')
+    elif command -v wget &>/dev/null; then
+        # wget 稍微复杂，通过解析输出获取重定向URL
+        local redirect_url
+        redirect_url=$(wget -nv --server-response --spider "$release_url" 2>&1 | grep -i Location: | tail -1 | awk '{print $2}')
+        latest_tag=$(echo "$redirect_url" | grep -oP 'tag/\K[^/]+$')
+    else
+        log_error "无法获取最新版本号，缺少 'curl' 或 'wget'。"
+        return 1
+    fi
+
+    # 清理版本号，例如移除可能的前缀 "release-" 或 "v"
+    if [ -n "$latest_tag" ]; then
+        LATEST_VERSION=$(echo "$latest_tag" | sed 's/release-//g; s/v//g')
+        log_info "GitHub 上的最新版本是: $LATEST_VERSION"
+        return 0
+    else
+        log_warn "无法解析 GitHub 的最新版本标签。"
+        LATEST_VERSION="未知"
+        return 1
+    fi
+}
+
 # --- 核心功能函数 ---
 
 # 下载并安装二进制文件
