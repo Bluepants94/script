@@ -177,14 +177,26 @@ do_install() {
 
     if install_binary; then
         create_service_file
-        log_info "安装完成。"
-        log_info "请注意：首次运行需自行获取密码 /usr/bin/qbittorrent-nox。"
-        log_info "使用 '管理开机自启' 和 'systemd 服务控制' 启动服务。"
+        
+        # --- 关键修改：启用开机自启并启动程序 ---
+        log_info "正在启用开机自启 (systemctl enable)..."
+        systemctl enable qbittorrent-nox
+        
+        log_info "正在启动 qBittorrent-nox 服务 (systemctl start)..."
+        systemctl start qbittorrent-nox
+        
+        log_info "=================================================="
+        log_info "安装完成，服务已启动并已设置开机自启。"
+        log_info "【重要】首次运行需执行以下命令获取一次性密码："
+        log_info "    /usr/bin/qbittorrent-nox"
+        log_info "WebUI 访问地址：https://localhost:8080"
+        log_info "=================================================="
     else
         log_error "安装过程中发生错误。"
     fi
 }
 
+# 4. 更新
 do_update() {
     log_info "--- 开始更新 qbittorrent-nox ---"
     if ! check_install_status; then
