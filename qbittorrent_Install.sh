@@ -106,7 +106,7 @@ get_latest_version() {
         # 3. 添加 "v" 前缀以匹配本地版本格式 (例如: "5.1.2" -> "v5.1.2")
         LATEST_VERSION="v$final_version"
         
-        log_info "GitHub 上的最新版本是: $LATEST_VERSION"
+        log_info "最新版本为: $LATEST_VERSION"
         return 0
     else
         log_warn "无法解析 GitHub 的最新版本标签。"
