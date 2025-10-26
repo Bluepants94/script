@@ -104,7 +104,7 @@ get_latest_version() {
         local final_version=$(echo "$clean_version" | cut -d '_' -f 1)
 
         # 3. 添加 "v" 前缀以匹配本地版本格式 (例如: "5.1.2" -> "v5.1.2")
-        LATEST_VERSION="v$final_version"
+        LATEST_VERSION="qBittorrent v$final_version"
         
         log_info "最新版本为: $LATEST_VERSION"
         return 0
