@@ -9,5 +9,5 @@ sudo ./install.sh uninstall -n xxx
 sudo ./install.sh system
 ```
 ```
-./install.sh install -n xxx
+sudo ./install.sh install -n xxx
 ```
