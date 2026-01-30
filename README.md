@@ -6,7 +6,7 @@ wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ins
 sudo ./install.sh uninstall -n xxx
 ```
 ```
-sudo ./install.sh system
+wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install.sh && bash install.sh system
 ```
 ```
 sudo ./install.sh install -n xxx
