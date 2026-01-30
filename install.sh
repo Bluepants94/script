@@ -1,146 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ======= UI colors =======
-red='\033[0;31m'
-green='\033[0;32m'
-yellow='\033[0;33m'
-plain='\033[0m'
-
-# ======= constants =======
 XRAYR_REPO="XrayR-project/XrayR"
-XRAYR_RELEASE_REPO="XrayR-project/XrayR-release"
 BASE_DIR="/etc/XrayR"
 VERSIONS_DIR="${BASE_DIR}/version"
 
-# ======= helpers =======
-err() { echo -e "${red}错误：${plain}$*"; }
-info() { echo -e "${green}${plain}$*"; }
-warn() { echo -e "${yellow}${plain}$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Must run as root."; }
 
-need_root() {
-  [[ ${EUID} -ne 0 ]] && err "必须使用 root 用户运行此脚本！" && exit 1
+check_64bit() {
+  [[ "$(getconf LONG_BIT 2>/dev/null || echo 0)" == "64" ]] || die "Only 64-bit systems are supported."
 }
 
-detect_os() {
-  local release=""
-  if [[ -f /etc/redhat-release ]]; then
-    release="centos"
-  elif grep -Eqi "debian" /etc/issue 2>/dev/null || grep -Eqi "debian" /proc/version 2>/dev/null; then
-    release="debian"
-  elif grep -Eqi "ubuntu" /etc/issue 2>/dev/null || grep -Eqi "ubuntu" /proc/version 2>/dev/null; then
-    release="ubuntu"
-  elif grep -Eqi "centos|red hat|redhat" /etc/issue 2>/dev/null || grep -Eqi "centos|red hat|redhat" /proc/version 2>/dev/null; then
-    release="centos"
-  else
-    err "未检测到系统版本，请联系脚本作者！"
-    exit 1
-  fi
-  echo "${release}"
+detect_pm() {
+  if command -v apt-get >/dev/null 2>&1; then echo "apt"; return; fi
+  if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
+  if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
+  die "No supported package manager found (apt-get/dnf/yum)."
 }
 
-detect_os_version_major() {
-  local os_version=""
-  if [[ -f /etc/os-release ]]; then
-    os_version=$(awk -F'[= ."]' '/VERSION_ID/{print $3}' /etc/os-release || true)
-  fi
-  if [[ -z "${os_version}" && -f /etc/lsb-release ]]; then
-    os_version=$(awk -F'[= ."]+' '/DISTRIB_RELEASE/{print $2}' /etc/lsb-release || true)
-  fi
-  echo "${os_version:-0}"
-}
-
-check_os_compat() {
-  local release="$1"
-  local vmaj
-  vmaj="$(detect_os_version_major)"
-
-  case "${release}" in
-    centos)
-      [[ "${vmaj}" -le 6 ]] && err "请使用 CentOS 7 或更高版本的系统！" && exit 1
+install_deps() {
+  local pm="$1"
+  case "$pm" in
+    apt)
+      apt-get update -y >/dev/null 2>&1 || apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget unzip ca-certificates systemd >/dev/null
       ;;
-    ubuntu)
-      [[ "${vmaj}" -lt 16 ]] && err "请使用 Ubuntu 16 或更高版本的系统！" && exit 1
+    dnf)
+      dnf install -y curl wget unzip ca-certificates systemd >/dev/null
       ;;
-    debian)
-      [[ "${vmaj}" -lt 8 ]] && err "请使用 Debian 8 或更高版本的系统！" && exit 1
+    yum)
+      yum install -y curl wget unzip ca-certificates systemd >/dev/null
       ;;
   esac
 }
 
 detect_arch() {
-  local arch
-  arch="$(arch || true)"
-  case "${arch}" in
-    x86_64|x64|amd64) echo "64" ;;
-    aarch64|arm64)    echo "arm64-v8a" ;;
-    s390x)            echo "s390x" ;;
-    *)
-      warn "检测架构失败，使用默认架构: 64"
-      echo "64"
-      ;;
+  local a
+  a="$(uname -m)"
+  case "$a" in
+    x86_64|amd64) echo "64" ;;
+    aarch64|arm64) echo "arm64-v8a" ;;
+    s390x) echo "s390x" ;;
+    *) die "Unsupported arch: ${a}" ;;
   esac
 }
 
-check_64bit() {
-  if [[ "$(getconf WORD_BIT)" == "32" ]] || [[ "$(getconf LONG_BIT)" != "64" ]]; then
-    err "本软件不支持 32 位系统(x86)，请使用 64 位系统(x86_64)。"
-    exit 2
-  fi
-}
-
-install_deps() {
-  local release="$1"
-  if [[ "${release}" == "centos" ]]; then
-    yum install -y epel-release
-    yum install -y wget curl unzip tar crontabs socat
-  else
-    apt update -y
-    apt install -y wget curl unzip tar cron socat
-  fi
+normalize_version_tag() {
+  local v="${1:-}"
+  [[ -z "$v" ]] && echo "" && return
+  [[ "$v" == v* ]] && echo "$v" || echo "v${v}"
 }
 
 latest_version() {
-  # GitHub API: releases/latest
   local v
   v="$(curl -fsSL "https://api.github.com/repos/${XRAYR_REPO}/releases/latest" \
-        | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-  if [[ -z "${v}" ]]; then
-    err "检测 XrayR 最新版本失败（可能触发 GitHub API 限制）。请稍后再试，或手动指定版本。"
-    exit 1
-  fi
-  echo "${v}"
+      | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
+  [[ -n "$v" ]] || die "Failed to fetch latest version from GitHub API."
+  echo "$v"
 }
 
-normalize_version_tag() {
-  local in="${1:-}"
-  if [[ -z "${in}" ]]; then
-    echo ""
-    return 0
-  fi
-  if [[ "${in}" == v* ]]; then
-    echo "${in}"
-  else
-    echo "v${in}"
-  fi
-}
-
-instance_dir() {
-  local name="$1"
-  echo "${VERSIONS_DIR}/${name}"
-}
-
-service_name() {
-  local name="$1"
-  echo "XrayR-${name}.service"
-}
+instance_dir() { echo "${VERSIONS_DIR}/$1"; }
+service_name() { echo "XrayR-$1.service"; }
 
 create_service_unit() {
   local name="$1"
   local dir="$2"
-  local unit_path="/etc/systemd/system/$(service_name "${name}")"
+  local unit="/etc/systemd/system/$(service_name "$name")"
 
-  cat > "${unit_path}" <<EOF
+  cat > "$unit" <<EOF
 [Unit]
 Description=XrayR (${name})
 After=network.target nss-lookup.target
@@ -160,284 +88,248 @@ EOF
   systemctl daemon-reload
 }
 
-download_and_install() {
+install_instance() {
   local name="$1"
   local version_tag="$2"
   local arch="$3"
-  local dir
-  dir="$(instance_dir "${name}")"
+  local dir; dir="$(instance_dir "$name")"
+  mkdir -p "$dir"
 
-  mkdir -p "${dir}"
-
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir}"' EXIT
+  # Fix: avoid "tmp: unbound variable" under set -u
+  local tmp=""
+  tmp="$(mktemp -d)"
+  trap '[[ -n "${tmp:-}" ]] && rm -rf "${tmp}"' EXIT
 
   local url="https://github.com/${XRAYR_REPO}/releases/download/${version_tag}/XrayR-linux-${arch}.zip"
-  info "开始安装实例: ${name}"
-  info "目标目录: ${dir}"
-  info "版本: ${version_tag}"
-  info "下载: ${url}"
+  echo "Installing instance: ${name}"
+  echo "Version: ${version_tag}"
+  echo "Arch: ${arch}"
+  echo "Dir: ${dir}"
+  echo "Download: ${url}"
 
-  if ! wget -q -N --no-check-certificate -O "${tmpdir}/XrayR-linux.zip" "${url}"; then
-    err "下载失败：请确认服务器可访问 GitHub，且版本存在：${version_tag}"
-    exit 1
+  wget -q -O "${tmp}/xrayr.zip" "$url" || die "Download failed. Check version/tag and GitHub connectivity."
+  unzip -q -o "${tmp}/xrayr.zip" -d "${tmp}" || die "Unzip failed."
+  [[ -f "${tmp}/XrayR" ]] || die "XrayR binary not found in archive."
+
+  install -m 0755 "${tmp}/XrayR" "${dir}/XrayR"
+  [[ -f "${tmp}/geoip.dat" ]]   && install -m 0644 "${tmp}/geoip.dat"   "${dir}/geoip.dat"
+  [[ -f "${tmp}/geosite.dat" ]] && install -m 0644 "${tmp}/geosite.dat" "${dir}/geosite.dat"
+
+  # Create config only once
+  if [[ -f "${tmp}/config.yml" && ! -f "${dir}/config.yml" ]]; then
+    install -m 0644 "${tmp}/config.yml" "${dir}/config.yml"
   fi
-
-  unzip -q -o "${tmpdir}/XrayR-linux.zip" -d "${tmpdir}"
-
-  # 需要的文件：XrayR, geoip.dat, geosite.dat, config.yml, dns.json, route.json, custom_*.json, rulelist
-  if [[ ! -f "${tmpdir}/XrayR" ]]; then
-    err "解压后未找到 XrayR 可执行文件，安装终止。"
-    exit 1
-  fi
-
-  # 二进制与数据文件：覆盖更新
-  install -m 0755 "${tmpdir}/XrayR" "${dir}/XrayR"
-  [[ -f "${tmpdir}/geoip.dat" ]]   && install -m 0644 "${tmpdir}/geoip.dat"   "${dir}/geoip.dat"
-  [[ -f "${tmpdir}/geosite.dat" ]] && install -m 0644 "${tmpdir}/geosite.dat" "${dir}/geosite.dat"
-
-  # 配置类文件：仅在不存在时写入，避免覆盖用户配置
-  for f in config.yml dns.json route.json custom_outbound.json custom_inbound.json rulelist; do
-    if [[ -f "${tmpdir}/${f}" && ! -f "${dir}/${f}" ]]; then
-      install -m 0644 "${tmpdir}/${f}" "${dir}/${f}"
-    fi
+  for f in dns.json route.json custom_outbound.json custom_inbound.json rulelist; do
+    [[ -f "${tmp}/${f}" && ! -f "${dir}/${f}" ]] && install -m 0644 "${tmp}/${f}" "${dir}/${f}"
   done
 
-  # 记录版本
   echo "${version_tag}" > "${dir}/.installed_version"
-  date -u +"%Y-%m-%dT%H:%M:%SZ" > "${dir}/.installed_at_utc"
 
-  create_service_unit "${name}" "${dir}"
-  systemctl enable "$(service_name "${name}")" >/dev/null
+  create_service_unit "$name" "$dir"
+  systemctl enable "$(service_name "$name")" >/dev/null
+  systemctl restart "$(service_name "$name")" || true
 
-  # 启动/重启实例
-  systemctl restart "$(service_name "${name}")"
-
-  sleep 1
-  if systemctl is-active --quiet "$(service_name "${name}")"; then
-    info "实例 ${name} 启动成功（systemd: $(service_name "${name}")）"
+  if systemctl is-active --quiet "$(service_name "$name")"; then
+    echo "OK: service running: $(service_name "$name")"
   else
-    warn "实例 ${name} 可能启动失败，请检查日志：journalctl -u $(service_name "${name}") -e --no-pager"
+    echo "WARN: service not active. Check:"
+    echo "  journalctl -u $(service_name "$name") -e --no-pager"
   fi
 
-  trap - EXIT
-  rm -rf "${tmpdir}"
+  rm -rf "${tmp}"
+  tmp=""
 }
 
 list_instances() {
-  mkdir -p "${VERSIONS_DIR}"
-  if [[ ! -d "${VERSIONS_DIR}" ]]; then
-    echo ""
+  mkdir -p "$VERSIONS_DIR"
+
+  local names
+  names="$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
+  if [[ -z "$names" ]]; then
+    echo "No instances found in ${VERSIONS_DIR}"
     return 0
   fi
 
-  local items=()
-  while IFS= read -r -d '' d; do
-    items+=("$(basename "${d}")")
-  done < <(find "${VERSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
-
-  if [[ ${#items[@]} -eq 0 ]]; then
-    echo ""
-    return 0
-  fi
-
-  # 按字母排序
-  IFS=$'\n' items=($(sort <<<"${items[*]}")); unset IFS
-
-  for n in "${items[@]}"; do
-    local v="unknown"
-    [[ -f "$(instance_dir "${n}")/.installed_version" ]] && v="$(cat "$(instance_dir "${n}")/.installed_version" 2>/dev/null || true)"
-    echo "${n} (${v})"
-  done
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    local d="${VERSIONS_DIR}/${name}"
+    local ver="unknown"
+    [[ -f "$d/.installed_version" ]] && ver="$(cat "$d/.installed_version" 2>/dev/null || echo unknown)"
+    echo "${name} (${ver})"
+  done <<< "$names"
 }
 
-choose_instance_interactive() {
-  local lines
-  lines="$(list_instances)"
-  if [[ -z "${lines}" ]]; then
-    err "未发现任何已安装实例：${VERSIONS_DIR} 为空。"
-    exit 1
-  fi
-
-  echo "已安装实例列表："
-  local i=1
-  local names=()
-  while IFS= read -r line; do
-    local name="${line%% *}"
-    echo "  ${i}) ${line}"
-    names+=("${name}")
-    i=$((i+1))
-  done <<< "${lines}"
-
-  echo ""
-  read -r -p "请输入要卸载的编号: " idx
-  if [[ ! "${idx}" =~ ^[0-9]+$ ]] || [[ "${idx}" -lt 1 ]] || [[ "${idx}" -gt "${#names[@]}" ]]; then
-    err "输入无效。"
-    exit 1
-  fi
-  echo "${names[$((idx-1))]}"
-}
-
-uninstall_instance() {
+uninstall_instance_no_confirm() {
   local name="$1"
-  local dir
-  dir="$(instance_dir "${name}")"
-  local unit="/etc/systemd/system/$(service_name "${name}")"
+  [[ -n "$name" ]] || die "Name required for uninstall. Use: uninstall -n <name>"
 
-  if [[ ! -d "${dir}" ]]; then
-    err "实例目录不存在：${dir}"
-    exit 1
-  fi
+  local dir; dir="$(instance_dir "$name")"
+  [[ -d "$dir" ]] || die "Instance dir not found: $dir"
 
-  echo ""
-  read -r -p "确认卸载实例 '${name}' 以及其 systemd 服务？[y/N]: " yn
-  yn="${yn:-N}"
-  if [[ ! "${yn}" =~ ^[Yy]$ ]]; then
-    warn "已取消。"
-    exit 0
-  fi
+  local svc; svc="$(service_name "$name")"
 
-  # stop/disable service
-  if systemctl list-unit-files | grep -q "^$(service_name "${name}")"; then
-    systemctl stop "$(service_name "${name}")" >/dev/null 2>&1 || true
-    systemctl disable "$(service_name "${name}")" >/dev/null 2>&1 || true
-  fi
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  systemctl disable "$svc" >/dev/null 2>&1 || true
 
-  # remove unit file
-  rm -f "${unit}"
+  rm -f "/etc/systemd/system/${svc}"
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
 
-  # remove instance dir
-  rm -rf "${dir}"
+  rm -rf "$dir"
+  echo "OK: Uninstalled '${name}' (service + ${dir})"
+}
 
-  info "卸载完成：${name}"
+# ===== system control =====
+list_xrayr_units() {
+  local units=""
 
-  # 如果没有任何实例了，可选清理 BASE_DIR（仅保留空目录）
-  if [[ -d "${VERSIONS_DIR}" ]] && [[ -z "$(ls -A "${VERSIONS_DIR}" 2>/dev/null || true)" ]]; then
-    warn "当前已无任何实例残留：${VERSIONS_DIR} 为空。"
+  # list-unit-files covers enabled/disabled/static units
+  units="$(systemctl list-unit-files --no-legend 2>/dev/null \
+          | awk '{print $1}' \
+          | grep -E '^XrayR-.*\.service$' \
+          | LC_ALL=C sort -u || true)"
+
+  # fallback scan
+  if [[ -z "$units" ]]; then
+    units="$(find /etc/systemd/system -maxdepth 1 -type f -name 'XrayR-*.service' -printf '%f\n' 2>/dev/null \
+            | LC_ALL=C sort -u || true)"
   fi
+
+  echo "$units"
+}
+
+choose_xrayr_unit() {
+  local units
+  units="$(list_xrayr_units)"
+  [[ -n "$units" ]] || die "No systemd units found with prefix 'XrayR-'."
+
+  # IMPORTANT: menu output must go to stderr to avoid polluting command substitution
+  echo "XrayR systemd units:" >&2
+
+  local i=0
+  local arr=()
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    i=$((i+1))
+    echo "  ${i}) ${u}" >&2
+    arr+=("$u")
+  done <<< "$units"
+
+  echo "" >&2
+  read -r -p "Select number: " idx
+
+  [[ "$idx" =~ ^[0-9]+$ ]] || die "Invalid selection."
+  [[ "$idx" -ge 1 && "$idx" -le "${#arr[@]}" ]] || die "Out of range."
+
+  # ONLY this line goes to stdout
+  printf '%s\n' "${arr[$((idx-1))]}"
+}
+
+system_menu() {
+  local unit
+  unit="$(choose_xrayr_unit)"
+
+  echo "" >&2
+  echo "Selected: ${unit}" >&2
+  echo "1) Start" >&2
+  echo "2) Stop" >&2
+  echo "3) Restart" >&2
+  echo "4) Status" >&2
+  echo "" >&2
+
+  read -r -p "Choose action (1-4): " act
+  case "$act" in
+    1) systemctl start "$unit";   echo "OK: started $unit" ;;
+    2) systemctl stop "$unit";    echo "OK: stopped $unit" ;;
+    3) systemctl restart "$unit"; echo "OK: restarted $unit" ;;
+    4) systemctl status "$unit" --no-pager -l ;;
+    *) die "Invalid action." ;;
+  esac
 }
 
 usage() {
   cat <<EOF
-用法:
+Usage:
+  bash install.sh install   <name> [version]
   bash install.sh install   -n <name> [-v <version>]
-  bash install.sh uninstall [-n <name>]
   bash install.sh list
-  bash install.sh help
+  bash install.sh uninstall -n <name>
+  bash install.sh system
 
-说明:
-  -n, --name       实例名/版本名（目录: ${VERSIONS_DIR}/<name>；服务: XrayR-<name>.service）
-  -v, --version    指定 XrayR 版本（例如 v0.9.4 或 0.9.4）；不指定则安装最新版本
-
-示例:
-  bash install.sh install -n nodeA
-  bash install.sh install -n nodeB -v v0.9.4
-  bash install.sh list
-  bash install.sh uninstall           # 交互选择要卸载的实例
-  bash install.sh uninstall -n nodeA  # 直接卸载 nodeA
+Notes:
+  - Files: ${VERSIONS_DIR}/<name>/
+  - Service: XrayR-<name>.service
+  - Uninstall performs NO confirmation prompt.
 EOF
 }
 
-# ======= main =======
 main() {
   need_root
   check_64bit
+  mkdir -p "$VERSIONS_DIR"
 
-  local action="${1:-install}"
+  local action="${1:-help}"
   shift || true
 
   local name=""
   local version_in=""
 
+  # Positional args supported ONLY for install
+  if [[ "$action" == "install" ]]; then
+    if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+      name="$1"; shift
+    fi
+    if [[ $# -gt 0 && "${1:-}" != -* ]]; then
+      version_in="$1"; shift
+    fi
+  fi
+
+  # Parse flags
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -n|--name)
-        name="${2:-}"
-        shift 2
-        ;;
-      -v|--version)
-        version_in="${2:-}"
-        shift 2
-        ;;
-      list|install|uninstall|help)
-        # 允许 "bash install.sh install -n xxx" 这种位置之外的写法时，忽略
-        shift
-        ;;
+      -n|--name) name="${2:-}"; shift 2 ;;
+      -v|--version) version_in="${2:-}"; shift 2 ;;
+      -h|--help) action="help"; shift ;;
       *)
-        err "未知参数: $1"
-        usage
-        exit 1
+        if [[ "$action" == "uninstall" ]]; then
+          die "Uninstall requires -n <name>. Example: ./install.sh uninstall -n nodeB"
+        fi
+        die "Unknown arg: $1"
         ;;
     esac
   done
 
-  mkdir -p "${VERSIONS_DIR}"
+  case "$action" in
+    install)
+      [[ -n "$name" ]] || read -r -p "Instance name: " name
+      [[ -n "$name" ]] || die "Name required."
+      [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Name allowed chars: [a-zA-Z0-9._-]"
 
-  case "${action}" in
-    help|-h|--help)
-      usage
-      exit 0
+      local pm; pm="$(detect_pm)"
+      install_deps "$pm"
+
+      local arch; arch="$(detect_arch)"
+      local tag; tag="$(normalize_version_tag "$version_in")"
+      [[ -n "$tag" ]] || tag="$(latest_version)"
+
+      install_instance "$name" "$tag" "$arch"
       ;;
     list)
-      local out
-      out="$(list_instances)"
-      if [[ -z "${out}" ]]; then
-        echo "暂无已安装实例（${VERSIONS_DIR} 为空）。"
-      else
-        echo "${out}"
-      fi
-      exit 0
-      ;;
-    install)
-      if [[ -z "${name}" ]]; then
-        read -r -p "请输入实例名（例如 nodeA、panel1 等）: " name
-      fi
-      if [[ -z "${name}" ]]; then
-        err "实例名不能为空。"
-        exit 1
-      fi
-      if [[ "${name}" =~ [^a-zA-Z0-9._-] ]]; then
-        err "实例名仅允许字母/数字/点/下划线/短横线。"
-        exit 1
-      fi
-
-      local release
-      release="$(detect_os)"
-      check_os_compat "${release}"
-      install_deps "${release}"
-
-      local arch
-      arch="$(detect_arch)"
-      echo "架构: ${arch}"
-
-      local tag
-      tag="$(normalize_version_tag "${version_in}")"
-      if [[ -z "${tag}" ]]; then
-        tag="$(latest_version)"
-        info "检测到 XrayR 最新版本：${tag}"
-      fi
-
-      download_and_install "${name}" "${tag}" "${arch}"
-
-      echo ""
-      echo "管理建议："
-      echo "  查看状态: systemctl status $(service_name "${name}") --no-pager -l"
-      echo "  查看日志: journalctl -u $(service_name "${name}") -e --no-pager"
-      echo "  配置路径: $(instance_dir "${name}")/config.yml"
+      list_instances
       ;;
     uninstall)
-      if [[ -z "${name}" ]]; then
-        name="$(choose_instance_interactive)"
-      fi
-      uninstall_instance "${name}"
+      [[ -n "$name" ]] || die "Uninstall requires -n <name>. Example: ./install.sh uninstall -n nodeB"
+      uninstall_instance_no_confirm "$name"
+      ;;
+    system)
+      system_menu
+      ;;
+    help|-h|--help|"")
+      usage
       ;;
     *)
-      err "未知动作: ${action}"
       usage
-      exit 1
+      die "Unknown action: $action"
       ;;
   esac
 }
