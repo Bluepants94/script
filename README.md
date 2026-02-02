@@ -1,4 +1,4 @@
-# script
+# XrayR多进程
 ```
 wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install.sh && bash install.sh
 ```
@@ -11,3 +11,4 @@ wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ins
 ```
 wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install.sh && bash install.sh install -n xxx
 ```
+# TC 端口限速
