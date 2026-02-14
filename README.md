@@ -14,4 +14,6 @@ wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ins
 # TC 端口限速
 
 # IP变更通知
+```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ip_monitor_setup.sh)
+```
