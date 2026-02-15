@@ -26,7 +26,7 @@ print_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════╗"
-    echo "║     GOST v3 SOCKS5 → SS 转发管理工具        ║"
+    echo "║     GOST v3 SOCKS5 → SS 转发管理工具         ║"
     echo "║     支持 TCP + UDP 同时转发                  ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
