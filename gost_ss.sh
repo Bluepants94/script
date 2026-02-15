@@ -26,7 +26,7 @@ print_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════╗"
-    echo "║     GOST v3 SOCKS5 → SS 转发管理工具        ║"
+    echo "║     GOST v3 SOCKS5 → SS 转发管理工具         ║"
     echo "║     支持 TCP + UDP 同时转发                  ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -39,8 +39,30 @@ print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
 press_any_key() {
     echo ""
-    read -n 1 -s -r -p "按任意键继续..."
+    read -n 1 -s -r -p "按任意键返回主菜单..."
     echo ""
+}
+
+# 生成 n 个重复字符
+repeat_char() {
+    local char="$1" count="$2" result=""
+    for ((j=0; j<count; j++)); do result="${result}${char}"; done
+    echo "$result"
+}
+
+# 保存配置并重启服务（统一函数，消除重复代码）
+save_and_restart() {
+    local msg="${1:-配置已更新}"
+    create_config
+    create_service
+    print_info "正在重启服务以应用新配置..."
+    systemctl restart gost-ss.service
+    sleep 1
+    if systemctl is-active --quiet gost-ss.service; then
+        print_success "${msg}，服务已重启！"
+    else
+        print_error "服务重启失败，请查看日志"
+    fi
 }
 
 print_entries() {
@@ -57,14 +79,7 @@ print_entries() {
     done
 
     # 构建分隔线
-    local sep="  |"
-    local dash_idx="" dash_port="" dash_pass="" dash_method="" dash_socks5=""
-    for ((j=0; j<w_idx+2; j++)); do dash_idx="${dash_idx}-"; done
-    for ((j=0; j<w_port+2; j++)); do dash_port="${dash_port}-"; done
-    for ((j=0; j<w_pass+2; j++)); do dash_pass="${dash_pass}-"; done
-    for ((j=0; j<w_method+2; j++)); do dash_method="${dash_method}-"; done
-    for ((j=0; j<w_socks5+2; j++)); do dash_socks5="${dash_socks5}-"; done
-    sep="${sep}${dash_idx}|${dash_port}|${dash_pass}|${dash_method}|${dash_socks5}|"
+    local sep="  |$(repeat_char '-' $((w_idx+2)))|$(repeat_char '-' $((w_port+2)))|$(repeat_char '-' $((w_pass+2)))|$(repeat_char '-' $((w_method+2)))|$(repeat_char '-' $((w_socks5+2)))|"
 
     # 用纯文本 printf 构建行，再套颜色，确保 "|" 对齐
     # 打印表头
@@ -100,75 +115,46 @@ load_config_entries() {
         return 1
     fi
 
-    # 按 TCP 服务块解析，不依赖固定行数，兼容结构变动
-    local in_tcp_block=0
-    local current_port=""
-    local current_method=""
-    local current_password=""
-    local current_socks5=""
-    local line trimmed
+    # 使用 grep + sed 直接从配置文件中提取各字段
+    local tcp_block_count
+    tcp_block_count=$(grep -c 'name: ss-forward-.*-tcp' "$CONFIG_FILE" 2>/dev/null)
 
-    append_if_complete() {
-        if [[ -n "$current_port" && -n "$current_method" && -n "$current_password" && -n "$current_socks5" ]]; then
-            ss_ports+=("$current_port")
-            ss_methods+=("$current_method")
-            ss_passwords+=("$current_password")
-            socks5_addrs+=("$current_socks5")
-        fi
-    }
-
-    while IFS= read -r line; do
-        trimmed="$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-
-        if [[ "$trimmed" =~ ^-\ name:\ ss-forward-.*-tcp$ ]]; then
-            if [[ $in_tcp_block -eq 1 ]]; then
-                append_if_complete
-            fi
-            in_tcp_block=1
-            current_port=""
-            current_method=""
-            current_password=""
-            current_socks5=""
-            continue
-        fi
-
-        if [[ "$trimmed" =~ ^-\ name: ]] && [[ $in_tcp_block -eq 1 ]]; then
-            append_if_complete
-            in_tcp_block=0
-            continue
-        fi
-
-        if [[ $in_tcp_block -eq 0 ]]; then
-            continue
-        fi
-
-        if [[ -z "$current_port" ]]; then
-            current_port=$(echo "$trimmed" | sed -n 's/^addr: *":\([0-9]\+\)"$/\1/p')
-            [[ -n "$current_port" ]] && continue
-        fi
-
-        if [[ -z "$current_method" ]]; then
-            current_method=$(echo "$trimmed" | sed -n 's/^username: *"\(.*\)"$/\1/p')
-            [[ -n "$current_method" ]] && continue
-        fi
-
-        if [[ -z "$current_password" ]]; then
-            current_password=$(echo "$trimmed" | sed -n 's/^password: *"\(.*\)"$/\1/p')
-            [[ -n "$current_password" ]] && continue
-        fi
-
-        if [[ -z "$current_socks5" ]]; then
-            local addr_value
-            addr_value=$(echo "$trimmed" | sed -n 's/^addr: *"\([^"]\+\)"$/\1/p')
-            if [[ -n "$addr_value" && "$addr_value" != :* ]]; then
-                current_socks5="$addr_value"
-            fi
-        fi
-    done < "$CONFIG_FILE"
-
-    if [[ $in_tcp_block -eq 1 ]]; then
-        append_if_complete
+    if [[ "$tcp_block_count" -eq 0 ]]; then
+        return 0
     fi
+
+    # 逐块提取：找到每个 tcp 块的行号，然后从该行号起提取后续字段
+    local tcp_line_nums
+    tcp_line_nums=$(grep -n 'name: ss-forward-.*-tcp' "$CONFIG_FILE" | cut -d: -f1)
+
+    for start_line in $tcp_line_nums; do
+        # 从 tcp 块开始行往后取 15 行来提取字段
+        local block
+        block=$(sed -n "${start_line},$((start_line + 15))p" "$CONFIG_FILE")
+
+        # 提取端口: addr: ":PORT"
+        local port
+        port=$(echo "$block" | grep 'addr:' | head -n1 | sed 's/.*":\([0-9]*\)".*/\1/')
+
+        # 提取加密方式: username: "METHOD"
+        local method
+        method=$(echo "$block" | grep 'username:' | head -n1 | sed 's/.*username: *"\(.*\)".*/\1/')
+
+        # 提取密码: password: "PASSWORD"
+        local password
+        password=$(echo "$block" | grep 'password:' | head -n1 | sed 's/.*password: *"\(.*\)".*/\1/')
+
+        # 提取 SOCKS5 地址: 第二个 addr 行 (不含冒号开头)
+        local socks5
+        socks5=$(echo "$block" | grep 'addr:' | tail -n1 | sed 's/.*addr: *"\(.*\)".*/\1/')
+
+        if [[ -n "$port" && -n "$method" && -n "$password" && -n "$socks5" ]]; then
+            ss_ports+=("$port")
+            ss_methods+=("$method")
+            ss_passwords+=("$password")
+            socks5_addrs+=("$socks5")
+        fi
+    done
 
     return 0
 }
@@ -287,11 +273,7 @@ get_arch() {
 
 # ---------- 检查 GOST 是否已安装 ----------
 check_gost_installed() {
-    if [[ -f "$GOST_BIN" ]]; then
-        return 0
-    else
-        return 1
-    fi
+    [[ -f "$GOST_BIN" ]]
 }
 
 # ---------- 获取 GOST 版本 ----------
@@ -558,25 +540,6 @@ EOF
     systemctl daemon-reload
 }
 
-apply_config_and_restart() {
-    local success_msg="$1"
-
-    create_config
-    create_service
-
-    print_info "正在重启服务以应用新配置..."
-    systemctl restart gost-ss.service
-    sleep 1
-
-    if systemctl is-active --quiet gost-ss.service; then
-        print_success "$success_msg"
-        return 0
-    else
-        print_error "服务重启失败，请查看日志"
-        return 1
-    fi
-}
-
 # ---------- 安装完整流程 ----------
 do_install() {
     print_banner
@@ -835,7 +798,7 @@ do_modify() {
         done
         # 新增配置后自动保存并重启
         if [[ ${#ss_ports[@]} -gt 0 ]]; then
-            apply_config_and_restart "配置已保存，服务已重启！"
+            save_and_restart "配置已保存"
         fi
         press_any_key
         return
@@ -880,7 +843,7 @@ do_modify() {
                 ss_methods[$idx]="$ss_method"
                 ss_ports[$idx]="$ss_port"
                 socks5_addrs[$idx]="$socks5_addr"
-                apply_config_and_restart "已更新第 ${edit_index} 条转发，服务已重启！"
+                save_and_restart "已更新第 ${edit_index} 条转发"
                 press_any_key
                 ;;
             2)
@@ -891,7 +854,7 @@ do_modify() {
                 ss_methods+=("$ss_method")
                 ss_ports+=("$ss_port")
                 socks5_addrs+=("$socks5_addr")
-                apply_config_and_restart "已新增转发，服务已重启！"
+                save_and_restart "已新增转发"
                 press_any_key
                 ;;
             3)
@@ -915,12 +878,10 @@ do_modify() {
                 ss_methods=("${ss_methods[@]}")
                 ss_ports=("${ss_ports[@]}")
                 socks5_addrs=("${socks5_addrs[@]}")
-                # 自动保存并重启
                 if [[ ${#ss_ports[@]} -gt 0 ]]; then
-                    apply_config_and_restart "已删除第 ${del_index} 条转发，服务已重启！"
+                    save_and_restart "已删除第 ${del_index} 条转发"
                 else
                     print_warn "所有转发已删除"
-                    # 停止服务
                     systemctl stop gost-ss.service 2>/dev/null
                     print_info "服务已停止"
                 fi
