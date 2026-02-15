@@ -44,32 +44,48 @@ press_any_key() {
 }
 
 print_entries() {
-    # 计算各列最大宽度
-    local w_idx=4 w_port=6 w_pass=6 w_method=6 w_socks5=10
+    # 计算各列最大宽度（中文字符占2个显示宽度）
+    local w_idx=4 w_port=4 w_pass=4 w_method=8 w_socks5=10
     for ((i=0; i<${#ss_ports[@]}; i++)); do
         local idx=$((i + 1))
-        (( ${#idx} + 2 > w_idx )) && w_idx=$(( ${#idx} + 2 ))
+        local idx_len=$(( ${#idx} + 2 ))
+        (( idx_len > w_idx )) && w_idx=$idx_len
         (( ${#ss_ports[$i]} > w_port )) && w_port=${#ss_ports[$i]}
         (( ${#ss_passwords[$i]} > w_pass )) && w_pass=${#ss_passwords[$i]}
         (( ${#ss_methods[$i]} > w_method )) && w_method=${#ss_methods[$i]}
         (( ${#socks5_addrs[$i]} > w_socks5 )) && w_socks5=${#socks5_addrs[$i]}
     done
 
+    # 构建分隔线
+    local sep="  |"
+    local dash_idx="" dash_port="" dash_pass="" dash_method="" dash_socks5=""
+    for ((j=0; j<w_idx+2; j++)); do dash_idx="${dash_idx}-"; done
+    for ((j=0; j<w_port+2; j++)); do dash_port="${dash_port}-"; done
+    for ((j=0; j<w_pass+2; j++)); do dash_pass="${dash_pass}-"; done
+    for ((j=0; j<w_method+2; j++)); do dash_method="${dash_method}-"; done
+    for ((j=0; j<w_socks5+2; j++)); do dash_socks5="${dash_socks5}-"; done
+    sep="${sep}${dash_idx}|${dash_port}|${dash_pass}|${dash_method}|${dash_socks5}|"
+
+    # 用纯文本 printf 构建行，再套颜色，确保 "|" 对齐
     # 打印表头
-    printf "  ${BOLD}| %-${w_idx}s | %-${w_port}s | %-${w_pass}s | %-${w_method}s | %-${w_socks5}s |${NC}\n" \
-        "序号" "端口" "密码" "加密方式" "SOCKS5地址"
+    local header
+    header=$(printf "| %-${w_idx}s | %-${w_port}s | %-${w_pass}s | %-${w_method}s | %-${w_socks5}s |" \
+        "序号" "端口" "密码" "加密方式" "SOCKS5地址")
+    echo -e "  ${BOLD}${header}${NC}"
     # 打印分隔线
-    printf "  |"
-    for ((j=0; j<w_idx+2; j++)); do printf "-"; done; printf "|"
-    for ((j=0; j<w_port+2; j++)); do printf "-"; done; printf "|"
-    for ((j=0; j<w_pass+2; j++)); do printf "-"; done; printf "|"
-    for ((j=0; j<w_method+2; j++)); do printf "-"; done; printf "|"
-    for ((j=0; j<w_socks5+2; j++)); do printf "-"; done; printf "|\n"
+    echo "  ${sep#  }"
     # 打印数据行
     for ((i=0; i<${#ss_ports[@]}; i++)); do
         local idx=$((i + 1))
-        printf "  | ${GREEN}%-${w_idx}s${NC} | ${CYAN}%-${w_port}s${NC} | ${CYAN}%-${w_pass}s${NC} | ${CYAN}%-${w_method}s${NC} | ${CYAN}%-${w_socks5}s${NC} |\n" \
-            "[$idx]" "${ss_ports[$i]}" "${ss_passwords[$i]}" "${ss_methods[$i]}" "${socks5_addrs[$i]}"
+        # 先用纯文本构建对齐的各列内容
+        local col_idx col_port col_pass col_method col_socks5
+        col_idx=$(printf "%-${w_idx}s" "[$idx]")
+        col_port=$(printf "%-${w_port}s" "${ss_ports[$i]}")
+        col_pass=$(printf "%-${w_pass}s" "${ss_passwords[$i]}")
+        col_method=$(printf "%-${w_method}s" "${ss_methods[$i]}")
+        col_socks5=$(printf "%-${w_socks5}s" "${socks5_addrs[$i]}")
+        # 再加上颜色输出，"|" 本身不受颜色影响
+        echo -e "  | ${GREEN}${col_idx}${NC} | ${CYAN}${col_port}${NC} | ${CYAN}${col_pass}${NC} | ${CYAN}${col_method}${NC} | ${CYAN}${col_socks5}${NC} |"
     done
     echo ""
 }
@@ -771,129 +787,146 @@ do_modify() {
                 break
             fi
         done
-    else
-        while true; do
-            print_banner
-            echo -e "${BOLD}${BLUE}[ 修改配置 ]${NC}"
-            echo ""
-            echo -e "${BOLD}${BLUE}当前转发条目:${NC}"
-            if [[ ${#ss_ports[@]} -eq 0 ]]; then
-                echo -e "  ${YELLOW}(暂无转发条目)${NC}"
+        # 新增配置后自动保存并重启
+        if [[ ${#ss_ports[@]} -gt 0 ]]; then
+            create_config
+            create_service
+            print_info "正在重启服务以应用新配置..."
+            systemctl restart gost-ss.service
+            sleep 1
+            if systemctl is-active --quiet gost-ss.service; then
+                print_success "配置已保存，服务已重启！"
             else
-                print_entries
+                print_error "服务重启失败，请查看日志"
             fi
-
-            echo -e "${GREEN}1)${NC} 修改已有转发"
-            echo -e "${CYAN}2)${NC} 增加转发"
-            echo -e "${RED}3)${NC} 删除转发"
-            echo -e "${NC}0)${NC} 保存并返回"
-            echo ""
-
-            read -r -p "请选择操作 [0-3]: " modify_choice
-            case "$modify_choice" in
-                1)
-                    if [[ ${#ss_ports[@]} -eq 0 ]]; then
-                        print_warn "当前没有可修改的转发"
-                        press_any_key
-                        continue
-                    fi
-                    read -r -p "请输入要修改的序号 [1-${#ss_ports[@]}]: " edit_index
-                    if [[ ! "$edit_index" =~ ^[0-9]+$ ]] || [ "$edit_index" -lt 1 ] || [ "$edit_index" -gt ${#ss_ports[@]} ]; then
-                        print_error "序号无效"
-                        press_any_key
-                        continue
-                    fi
-                    local idx=$((edit_index - 1))
-                    echo ""
-                    echo -e "${BOLD}${CYAN}--- 修改第 ${edit_index} 条转发 ---${NC}"
-                    input_entry "${ss_passwords[$idx]}" "${ss_methods[$idx]}" "${ss_ports[$idx]}" "${socks5_addrs[$idx]}"
-                    ss_passwords[$idx]="$ss_password"
-                    ss_methods[$idx]="$ss_method"
-                    ss_ports[$idx]="$ss_port"
-                    socks5_addrs[$idx]="$socks5_addr"
-                    print_success "已更新第 ${edit_index} 条转发"
-                    press_any_key
-                    ;;
-                2)
-                    echo ""
-                    echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
-                    input_entry "" "" "" ""
-                    ss_passwords+=("$ss_password")
-                    ss_methods+=("$ss_method")
-                    ss_ports+=("$ss_port")
-                    socks5_addrs+=("$socks5_addr")
-                    print_success "已新增转发"
-                    press_any_key
-                    ;;
-                3)
-                    if [[ ${#ss_ports[@]} -eq 0 ]]; then
-                        print_warn "当前没有可删除的转发"
-                        press_any_key
-                        continue
-                    fi
-                    read -r -p "请输入要删除的序号 [1-${#ss_ports[@]}]: " del_index
-                    if [[ ! "$del_index" =~ ^[0-9]+$ ]] || [ "$del_index" -lt 1 ] || [ "$del_index" -gt ${#ss_ports[@]} ]; then
-                        print_error "序号无效"
-                        press_any_key
-                        continue
-                    fi
-                    local del_pos=$((del_index - 1))
-                    unset 'ss_passwords[del_pos]'
-                    unset 'ss_methods[del_pos]'
-                    unset 'ss_ports[del_pos]'
-                    unset 'socks5_addrs[del_pos]'
-                    ss_passwords=("${ss_passwords[@]}")
-                    ss_methods=("${ss_methods[@]}")
-                    ss_ports=("${ss_ports[@]}")
-                    socks5_addrs=("${socks5_addrs[@]}")
-                    print_success "已删除第 ${del_index} 条转发"
-                    press_any_key
-                    ;;
-                0)
-                    break
-                    ;;
-                *)
-                    print_error "无效选择"
-                    press_any_key
-                    ;;
-            esac
-        done
-    fi
-
-    if [[ ${#ss_ports[@]} -eq 0 ]]; then
-        print_warn "当前没有转发条目，未生成配置"
+        fi
         press_any_key
         return
     fi
 
-    echo ""
-    echo -e "${BOLD}${BLUE}========== 修改后配置确认 ==========${NC}"
-    print_entries
-    echo -e "${BOLD}${BLUE}===============================${NC}"
-    echo ""
-    read -r -p "确认保存并重启服务？[Y/n]: " confirm
-    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
-        print_info "已取消修改"
-        press_any_key
-        return
-    fi
+    while true; do
+        print_banner
+        echo -e "${BOLD}${BLUE}[ 修改配置 ]${NC}"
+        echo ""
+        echo -e "${BOLD}${BLUE}当前转发条目:${NC}"
+        if [[ ${#ss_ports[@]} -eq 0 ]]; then
+            echo -e "  ${YELLOW}(暂无转发条目)${NC}"
+        else
+            print_entries
+        fi
 
-    # 更新配置文件和服务文件
-    create_config
-    create_service
+        echo -e "${GREEN}1)${NC} 修改已有转发"
+        echo -e "${CYAN}2)${NC} 增加转发"
+        echo -e "${RED}3)${NC} 删除转发"
+        echo -e "${NC}0)${NC} 返回"
+        echo ""
 
-    # 重启服务
-    print_info "正在重启服务以应用新配置..."
-    systemctl restart gost-ss.service
-    sleep 1
-
-    if systemctl is-active --quiet gost-ss.service; then
-        print_success "配置已更新，服务已重启！"
-    else
-        print_error "服务重启失败，请查看日志"
-    fi
-
-    press_any_key
+        read -r -p "请选择操作 [0-3]: " modify_choice
+        case "$modify_choice" in
+            1)
+                if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                    print_warn "当前没有可修改的转发"
+                    press_any_key
+                    continue
+                fi
+                read -r -p "请输入要修改的序号 [1-${#ss_ports[@]}]: " edit_index
+                if [[ ! "$edit_index" =~ ^[0-9]+$ ]] || [ "$edit_index" -lt 1 ] || [ "$edit_index" -gt ${#ss_ports[@]} ]; then
+                    print_error "序号无效"
+                    press_any_key
+                    continue
+                fi
+                local idx=$((edit_index - 1))
+                echo ""
+                echo -e "${BOLD}${CYAN}--- 修改第 ${edit_index} 条转发 ---${NC}"
+                input_entry "${ss_passwords[$idx]}" "${ss_methods[$idx]}" "${ss_ports[$idx]}" "${socks5_addrs[$idx]}"
+                ss_passwords[$idx]="$ss_password"
+                ss_methods[$idx]="$ss_method"
+                ss_ports[$idx]="$ss_port"
+                socks5_addrs[$idx]="$socks5_addr"
+                # 自动保存并重启
+                create_config
+                create_service
+                print_info "正在重启服务以应用新配置..."
+                systemctl restart gost-ss.service
+                sleep 1
+                if systemctl is-active --quiet gost-ss.service; then
+                    print_success "已更新第 ${edit_index} 条转发，服务已重启！"
+                else
+                    print_error "服务重启失败，请查看日志"
+                fi
+                press_any_key
+                ;;
+            2)
+                echo ""
+                echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
+                input_entry "" "" "" ""
+                ss_passwords+=("$ss_password")
+                ss_methods+=("$ss_method")
+                ss_ports+=("$ss_port")
+                socks5_addrs+=("$socks5_addr")
+                # 自动保存并重启
+                create_config
+                create_service
+                print_info "正在重启服务以应用新配置..."
+                systemctl restart gost-ss.service
+                sleep 1
+                if systemctl is-active --quiet gost-ss.service; then
+                    print_success "已新增转发，服务已重启！"
+                else
+                    print_error "服务重启失败，请查看日志"
+                fi
+                press_any_key
+                ;;
+            3)
+                if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                    print_warn "当前没有可删除的转发"
+                    press_any_key
+                    continue
+                fi
+                read -r -p "请输入要删除的序号 [1-${#ss_ports[@]}]: " del_index
+                if [[ ! "$del_index" =~ ^[0-9]+$ ]] || [ "$del_index" -lt 1 ] || [ "$del_index" -gt ${#ss_ports[@]} ]; then
+                    print_error "序号无效"
+                    press_any_key
+                    continue
+                fi
+                local del_pos=$((del_index - 1))
+                unset 'ss_passwords[del_pos]'
+                unset 'ss_methods[del_pos]'
+                unset 'ss_ports[del_pos]'
+                unset 'socks5_addrs[del_pos]'
+                ss_passwords=("${ss_passwords[@]}")
+                ss_methods=("${ss_methods[@]}")
+                ss_ports=("${ss_ports[@]}")
+                socks5_addrs=("${socks5_addrs[@]}")
+                # 自动保存并重启
+                if [[ ${#ss_ports[@]} -gt 0 ]]; then
+                    create_config
+                    create_service
+                    print_info "正在重启服务以应用新配置..."
+                    systemctl restart gost-ss.service
+                    sleep 1
+                    if systemctl is-active --quiet gost-ss.service; then
+                        print_success "已删除第 ${del_index} 条转发，服务已重启！"
+                    else
+                        print_error "服务重启失败，请查看日志"
+                    fi
+                else
+                    print_warn "所有转发已删除"
+                    # 停止服务
+                    systemctl stop gost-ss.service 2>/dev/null
+                    print_info "服务已停止"
+                fi
+                press_any_key
+                ;;
+            0)
+                break
+                ;;
+            *)
+                print_error "无效选择"
+                press_any_key
+                ;;
+        esac
+    done
 }
 
 # ---------- 主菜单 ----------
