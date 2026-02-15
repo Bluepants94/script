@@ -43,6 +43,158 @@ press_any_key() {
     echo ""
 }
 
+print_entries() {
+    for ((i=0; i<${#ss_ports[@]}; i++)); do
+        local idx=$((i + 1))
+        echo -e "  [${idx}] SS 密码:      ${GREEN}${ss_passwords[$i]}${NC}"
+        echo -e "      加密方式:     ${GREEN}${ss_methods[$i]}${NC}"
+        echo -e "      SS 监听端口:  ${GREEN}${ss_ports[$i]}${NC}"
+        echo -e "      SOCKS5 地址:  ${GREEN}${socks5_addrs[$i]}${NC}"
+        echo ""
+    done
+}
+
+load_config_entries() {
+    ss_passwords=()
+    ss_methods=()
+    ss_ports=()
+    socks5_addrs=()
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+
+    local line reading=0
+    local current_name=""
+    local current_addr=""
+    local current_method=""
+    local current_password=""
+    local current_socks5=""
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^\ {2}-\ name:\ (.*) ]]; then
+            current_name="${BASH_REMATCH[1]}"
+            if [[ "$current_name" == ss-forward-*"-tcp" ]]; then
+                reading=1
+                current_addr=""
+                current_method=""
+                current_password=""
+                current_socks5=""
+            else
+                reading=0
+            fi
+        fi
+
+        if [[ $reading -eq 1 ]]; then
+            if [[ "$line" =~ ^\ {4}addr:\ ":(.*)"$ ]]; then
+                current_addr="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^\ {8}username:\ "(.*)"$ ]]; then
+                current_method="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^\ {8}password:\ "(.*)"$ ]]; then
+                current_password="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ ^\ {10}addr:\ "(.*)"$ ]]; then
+                current_socks5="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -n "$current_addr" && -n "$current_method" && -n "$current_password" && -n "$current_socks5" ]]; then
+                ss_ports+=("$current_addr")
+                ss_methods+=("$current_method")
+                ss_passwords+=("$current_password")
+                socks5_addrs+=("$current_socks5")
+                reading=0
+            fi
+        fi
+    done < "$CONFIG_FILE"
+
+    return 0
+}
+
+choose_method() {
+    local default_method="$1"
+    echo ""
+    echo -e "${CYAN}常用加密方式:${NC}"
+    echo "  1) aes-128-gcm"
+    echo "  2) aes-256-gcm"
+    echo "  3) chacha20-ietf-poly1305"
+    echo "  4) 自定义输入"
+    echo ""
+    if [[ -n "$default_method" ]]; then
+        read -r -p "请选择加密方式 [1-4] (回车保持: ${default_method}): " method_choice
+        if [[ -z "$method_choice" ]]; then
+            ss_method="$default_method"
+            return
+        fi
+    else
+        read -r -p "请选择加密方式 [1-4] (默认: 2): " method_choice
+    fi
+
+    case "$method_choice" in
+        1) ss_method="aes-128-gcm" ;;
+        3) ss_method="chacha20-ietf-poly1305" ;;
+        4)
+            read -r -p "请输入自定义加密方式: " ss_method
+            if [[ -z "$ss_method" ]]; then
+                ss_method="${default_method:-aes-256-gcm}"
+                print_warn "未输入，使用默认: ${ss_method}"
+            fi
+            ;;
+        *) ss_method="${default_method:-aes-256-gcm}" ;;
+    esac
+}
+
+input_entry() {
+    local default_password="$1"
+    local default_method="$2"
+    local default_port="$3"
+    local default_socks5="$4"
+
+    # SS 密码
+    while true; do
+        if [[ -n "$default_password" ]]; then
+            read -r -p "请输入 SS 密码 [${default_password}]: " ss_password
+            ss_password=${ss_password:-$default_password}
+        else
+            read -r -p "请输入 SS 密码: " ss_password
+        fi
+        if [[ -n "$ss_password" ]]; then
+            break
+        fi
+        print_error "密码不能为空！"
+    done
+
+    # 加密方式
+    choose_method "$default_method"
+
+    # SS 监听端口
+    while true; do
+        if [[ -n "$default_port" ]]; then
+            read -r -p "请输入 SS 监听端口 [${default_port}]: " ss_port
+            ss_port=${ss_port:-$default_port}
+        else
+            read -r -p "请输入 SS 监听端口 (默认: 8388): " ss_port
+            ss_port=${ss_port:-8388}
+        fi
+        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [ "$ss_port" -ge 1 ] && [ "$ss_port" -le 65535 ]; then
+            break
+        fi
+        print_error "端口号无效，请输入 1-65535 之间的数字！"
+    done
+
+    # SOCKS5 地址
+    while true; do
+        if [[ -n "$default_socks5" ]]; then
+            read -r -p "请输入上游 SOCKS5 代理地址 [${default_socks5}]: " socks5_addr
+            socks5_addr=${socks5_addr:-$default_socks5}
+        else
+            read -r -p "请输入上游 SOCKS5 代理地址 (如 127.0.0.1:1080): " socks5_addr
+        fi
+        if [[ -n "$socks5_addr" ]]; then
+            break
+        fi
+        print_error "SOCKS5 地址不能为空！"
+    done
+}
+
 # ---------- 检查 root 权限 ----------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -243,57 +395,7 @@ input_config() {
         echo ""
         echo -e "${BOLD}${CYAN}--- 第 ${i} 条转发 ---${NC}"
 
-        # SS 密码
-        while true; do
-            read -r -p "请输入 SS 密码: " ss_password
-            if [[ -n "$ss_password" ]]; then
-                break
-            fi
-            print_error "密码不能为空！"
-        done
-
-        # 加密方式
-        echo ""
-        echo -e "${CYAN}常用加密方式:${NC}"
-        echo "  1) aes-128-gcm"
-        echo "  2) aes-256-gcm"
-        echo "  3) chacha20-ietf-poly1305"
-        echo "  4) 自定义输入"
-        echo ""
-        read -r -p "请选择加密方式 [1-4] (默认: 2): " method_choice
-        case "$method_choice" in
-            1) ss_method="aes-128-gcm" ;;
-            3) ss_method="chacha20-ietf-poly1305" ;;
-            4)
-                read -r -p "请输入自定义加密方式: " ss_method
-                if [[ -z "$ss_method" ]]; then
-                    ss_method="aes-256-gcm"
-                    print_warn "未输入，使用默认: aes-256-gcm"
-                fi
-                ;;
-            *) ss_method="aes-256-gcm" ;;
-        esac
-
-        # SS 监听端口
-        echo ""
-        while true; do
-            read -r -p "请输入 SS 监听端口 (默认: 8388): " ss_port
-            ss_port=${ss_port:-8388}
-            if [[ "$ss_port" =~ ^[0-9]+$ ]] && [ "$ss_port" -ge 1 ] && [ "$ss_port" -le 65535 ]; then
-                break
-            fi
-            print_error "端口号无效，请输入 1-65535 之间的数字！"
-        done
-
-        # SOCKS5 地址
-        echo ""
-        while true; do
-            read -r -p "请输入上游 SOCKS5 代理地址 (如 127.0.0.1:1080): " socks5_addr
-            if [[ -n "$socks5_addr" ]]; then
-                break
-            fi
-            print_error "SOCKS5 地址不能为空！"
-        done
+        input_entry "" "" "" ""
 
         ss_passwords+=("$ss_password")
         ss_methods+=("$ss_method")
@@ -304,14 +406,7 @@ input_config() {
     # 显示配置确认
     echo ""
     echo -e "${BOLD}${BLUE}========== 配置确认 ==========${NC}"
-    for ((i=0; i<${#ss_ports[@]}; i++)); do
-        local idx=$((i + 1))
-        echo -e "  [${idx}] SS 密码:      ${GREEN}${ss_passwords[$i]}${NC}"
-        echo -e "      加密方式:     ${GREEN}${ss_methods[$i]}${NC}"
-        echo -e "      SS 监听端口:  ${GREEN}${ss_ports[$i]}${NC}"
-        echo -e "      SOCKS5 地址:  ${GREEN}${socks5_addrs[$i]}${NC}"
-        echo ""
-    done
+    print_entries
     echo -e "${BOLD}${BLUE}===============================${NC}"
     echo ""
 
@@ -569,53 +664,22 @@ do_status() {
 
     # 显示当前配置
     if [[ -f "$CONFIG_FILE" ]]; then
-        echo ""
-        echo -e "${BOLD}${BLUE}[ 当前转发配置 ]${NC}"
-        local entry_index=0
-        local reading=0
-        local line
-        local current_name=""
-        local current_addr=""
-        local current_method=""
-        local current_password=""
-        local current_socks5=""
-
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^\ {2}-\ name:\ (.*) ]]; then
-                current_name="${BASH_REMATCH[1]}"
-                if [[ "$current_name" == ss-forward-*"-tcp" ]]; then
-                    reading=1
-                    entry_index=$((entry_index + 1))
-                    current_addr=""
-                    current_method=""
-                    current_password=""
-                    current_socks5=""
-                else
-                    reading=0
-                fi
-            fi
-
-            if [[ $reading -eq 1 ]]; then
-                if [[ "$line" =~ ^\ {4}addr:\ ":(.*)"$ ]]; then
-                    current_addr="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^\ {8}username:\ "(.*)"$ ]]; then
-                    current_method="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^\ {8}password:\ "(.*)"$ ]]; then
-                    current_password="${BASH_REMATCH[1]}"
-                elif [[ "$line" =~ ^\ {10}addr:\ "(.*)"$ ]]; then
-                    current_socks5="${BASH_REMATCH[1]}"
-                fi
-
-                if [[ -n "$current_addr" && -n "$current_method" && -n "$current_password" && -n "$current_socks5" ]]; then
-                    echo -e "  [${entry_index}] SS 端口:      ${CYAN}${current_addr}${NC}"
-                    echo -e "      SS 密码:      ${CYAN}${current_password}${NC}"
-                    echo -e "      加密方式:     ${CYAN}${current_method}${NC}"
-                    echo -e "      SOCKS5 上游:  ${CYAN}${current_socks5}${NC}"
+        if load_config_entries; then
+            echo ""
+            echo -e "${BOLD}${BLUE}[ 当前转发配置 ]${NC}"
+            if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                echo -e "  ${YELLOW}(未检测到转发条目)${NC}"
+            else
+                for ((i=0; i<${#ss_ports[@]}; i++)); do
+                    local idx=$((i + 1))
+                    echo -e "  [${idx}] SS 端口:      ${CYAN}${ss_ports[$i]}${NC}"
+                    echo -e "      SS 密码:      ${CYAN}${ss_passwords[$i]}${NC}"
+                    echo -e "      加密方式:     ${CYAN}${ss_methods[$i]}${NC}"
+                    echo -e "      SOCKS5 上游:  ${CYAN}${socks5_addrs[$i]}${NC}"
                     echo ""
-                    reading=0
-                fi
+                done
             fi
-        done < "$CONFIG_FILE"
+        fi
     fi
 
     echo ""
@@ -688,15 +752,119 @@ do_modify() {
         return
     fi
 
-    # 重新输入多条配置
-    echo -e "${BOLD}当前为多条转发配置，将重新输入全部配置。${NC}"
-    echo ""
+    if ! load_config_entries; then
+        print_warn "未检测到现有配置，进入新增配置流程"
+        while true; do
+            if input_config; then
+                break
+            fi
+        done
+    else
+        while true; do
+            print_banner
+            echo -e "${BOLD}${BLUE}[ 修改配置 ]${NC}"
+            echo ""
+            echo -e "${BOLD}${BLUE}当前转发条目:${NC}"
+            if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                echo -e "  ${YELLOW}(暂无转发条目)${NC}"
+            else
+                print_entries
+            fi
 
-    while true; do
-        if input_config; then
-            break
-        fi
-    done
+            echo -e "${GREEN}1)${NC} 修改已有转发"
+            echo -e "${CYAN}2)${NC} 增加转发"
+            echo -e "${RED}3)${NC} 删除转发"
+            echo -e "${NC}0)${NC} 保存并返回"
+            echo ""
+
+            read -r -p "请选择操作 [0-3]: " modify_choice
+            case "$modify_choice" in
+                1)
+                    if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                        print_warn "当前没有可修改的转发"
+                        press_any_key
+                        continue
+                    fi
+                    read -r -p "请输入要修改的序号 [1-${#ss_ports[@]}]: " edit_index
+                    if [[ ! "$edit_index" =~ ^[0-9]+$ ]] || [ "$edit_index" -lt 1 ] || [ "$edit_index" -gt ${#ss_ports[@]} ]; then
+                        print_error "序号无效"
+                        press_any_key
+                        continue
+                    fi
+                    local idx=$((edit_index - 1))
+                    echo ""
+                    echo -e "${BOLD}${CYAN}--- 修改第 ${edit_index} 条转发 ---${NC}"
+                    input_entry "${ss_passwords[$idx]}" "${ss_methods[$idx]}" "${ss_ports[$idx]}" "${socks5_addrs[$idx]}"
+                    ss_passwords[$idx]="$ss_password"
+                    ss_methods[$idx]="$ss_method"
+                    ss_ports[$idx]="$ss_port"
+                    socks5_addrs[$idx]="$socks5_addr"
+                    print_success "已更新第 ${edit_index} 条转发"
+                    press_any_key
+                    ;;
+                2)
+                    echo ""
+                    echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
+                    input_entry "" "" "" ""
+                    ss_passwords+=("$ss_password")
+                    ss_methods+=("$ss_method")
+                    ss_ports+=("$ss_port")
+                    socks5_addrs+=("$socks5_addr")
+                    print_success "已新增转发"
+                    press_any_key
+                    ;;
+                3)
+                    if [[ ${#ss_ports[@]} -eq 0 ]]; then
+                        print_warn "当前没有可删除的转发"
+                        press_any_key
+                        continue
+                    fi
+                    read -r -p "请输入要删除的序号 [1-${#ss_ports[@]}]: " del_index
+                    if [[ ! "$del_index" =~ ^[0-9]+$ ]] || [ "$del_index" -lt 1 ] || [ "$del_index" -gt ${#ss_ports[@]} ]; then
+                        print_error "序号无效"
+                        press_any_key
+                        continue
+                    fi
+                    local del_pos=$((del_index - 1))
+                    unset 'ss_passwords[del_pos]'
+                    unset 'ss_methods[del_pos]'
+                    unset 'ss_ports[del_pos]'
+                    unset 'socks5_addrs[del_pos]'
+                    ss_passwords=("${ss_passwords[@]}")
+                    ss_methods=("${ss_methods[@]}")
+                    ss_ports=("${ss_ports[@]}")
+                    socks5_addrs=("${socks5_addrs[@]}")
+                    print_success "已删除第 ${del_index} 条转发"
+                    press_any_key
+                    ;;
+                0)
+                    break
+                    ;;
+                *)
+                    print_error "无效选择"
+                    press_any_key
+                    ;;
+            esac
+        done
+    fi
+
+    if [[ ${#ss_ports[@]} -eq 0 ]]; then
+        print_warn "当前没有转发条目，未生成配置"
+        press_any_key
+        return
+    fi
+
+    echo ""
+    echo -e "${BOLD}${BLUE}========== 修改后配置确认 ==========${NC}"
+    print_entries
+    echo -e "${BOLD}${BLUE}===============================${NC}"
+    echo ""
+    read -r -p "确认保存并重启服务？[Y/n]: " confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+        print_info "已取消修改"
+        press_any_key
+        return
+    fi
 
     # 更新配置文件和服务文件
     create_config
