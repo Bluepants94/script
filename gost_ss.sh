@@ -100,22 +100,40 @@ install_gost_binary() {
         fi
     fi
 
+    # 检查依赖工具
+    for cmd in curl tar gzip; do
+        if ! command -v "$cmd" &>/dev/null; then
+            print_error "缺少依赖工具: $cmd，请先安装"
+            return 1
+        fi
+    done
+
     print_info "正在获取 GOST v3 最新版本信息..."
 
     # 获取最新版本号
     local latest_version
-    latest_version=$(curl -sL "https://api.github.com/repos/go-gost/gost/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+    latest_version=$(curl -sL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/go-gost/gost/releases/latest" \
+        | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 
     if [[ -z "$latest_version" ]]; then
-        print_error "无法获取最新版本信息，请检查网络连接"
-        return 1
+        print_warn "无法从 GitHub API 获取版本信息，尝试备用方式..."
+        latest_version=$(curl -sL --connect-timeout 10 --max-time 30 \
+            -o /dev/null -w '%{redirect_url}' \
+            "https://github.com/go-gost/gost/releases/latest" \
+            | grep -oP 'tag/\K.*')
+        if [[ -z "$latest_version" ]]; then
+            print_error "无法获取最新版本信息，请检查网络连接"
+            return 1
+        fi
     fi
 
     print_info "最新版本: $latest_version"
 
     local arch
     arch=$(get_arch)
-    local filename="gost_${latest_version#v}_linux_${arch}.tar.gz"
+    local version_num="${latest_version#v}"
+    local filename="gost_${version_num}_linux_${arch}.tar.gz"
     local download_url="https://github.com/go-gost/gost/releases/download/${latest_version}/${filename}"
 
     print_info "正在下载: $filename"
@@ -124,29 +142,67 @@ install_gost_binary() {
     # 创建临时目录
     local tmp_dir
     tmp_dir=$(mktemp -d)
+    local filepath="${tmp_dir}/${filename}"
 
-    if ! curl -sL -o "${tmp_dir}/${filename}" "$download_url"; then
+    # 下载文件（使用 -L 跟随重定向，显示进度）
+    if ! curl -L --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 3 \
+        -o "$filepath" --progress-bar "$download_url"; then
         print_error "下载失败，请检查网络连接"
         rm -rf "$tmp_dir"
         return 1
     fi
 
+    # 验证下载的文件
+    local filesize
+    filesize=$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null || echo "0")
+
+    if [[ "$filesize" -lt 1000000 ]]; then
+        print_error "下载的文件大小异常 (${filesize} bytes)，可能下载失败"
+        print_warn "文件内容预览:"
+        head -c 200 "$filepath" 2>/dev/null
+        echo ""
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    print_info "文件大小: $(( filesize / 1024 / 1024 )) MB"
+
+    # 验证文件是否为 gzip 格式
+    if ! file "$filepath" 2>/dev/null | grep -qi "gzip\|compressed"; then
+        # 备用检查：检查 gzip 魔数 (1f 8b)
+        local magic
+        magic=$(xxd -l 2 -p "$filepath" 2>/dev/null)
+        if [[ "$magic" != "1f8b" ]]; then
+            print_error "下载的文件不是有效的 gzip 格式"
+            print_warn "文件头信息:"
+            xxd -l 16 "$filepath" 2>/dev/null || head -c 50 "$filepath"
+            echo ""
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+
     print_info "正在解压安装..."
 
     # 解压
-    if ! tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"; then
+    if ! tar -xzf "$filepath" -C "$tmp_dir" 2>&1; then
         print_error "解压失败"
         rm -rf "$tmp_dir"
         return 1
     fi
 
-    # 安装二进制文件
-    if [[ -f "${tmp_dir}/gost" ]]; then
-        mv "${tmp_dir}/gost" "$GOST_BIN"
+    # 查找 gost 可执行文件（可能在子目录中）
+    local gost_file
+    gost_file=$(find "$tmp_dir" -name "gost" -type f | head -n 1)
+
+    if [[ -n "$gost_file" ]]; then
+        mv "$gost_file" "$GOST_BIN"
         chmod +x "$GOST_BIN"
         print_success "GOST 安装成功: $GOST_BIN"
     else
         print_error "解压后未找到 gost 可执行文件"
+        print_warn "解压目录内容:"
+        ls -la "$tmp_dir"
         rm -rf "$tmp_dir"
         return 1
     fi
