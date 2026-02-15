@@ -65,35 +65,49 @@ load_config_entries() {
     fi
 
     local line reading=0
-    local current_name=""
     local current_addr=""
     local current_method=""
     local current_password=""
     local current_socks5=""
+    local trimmed=""
 
     while IFS= read -r line; do
-        if [[ "$line" =~ ^\ {2}-\ name:\ (.*) ]]; then
-            current_name="${BASH_REMATCH[1]}"
-            if [[ "$current_name" == ss-forward-*"-tcp" ]]; then
-                reading=1
-                current_addr=""
-                current_method=""
-                current_password=""
-                current_socks5=""
-            else
-                reading=0
-            fi
+        # 去除前后空白
+        trimmed="$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+
+        # 检测 service name 行
+        if [[ "$trimmed" == "- name: ss-forward-"*"-tcp" ]]; then
+            reading=1
+            current_addr=""
+            current_method=""
+            current_password=""
+            current_socks5=""
+            continue
+        elif [[ "$trimmed" == "- name: ss-forward-"*"-udp" ]]; then
+            reading=0
+            continue
+        elif [[ "$trimmed" == "- name:"* ]]; then
+            reading=0
+            continue
         fi
 
         if [[ $reading -eq 1 ]]; then
-            if [[ "$line" =~ ^\ {4}addr:\ ":(.*)"$ ]]; then
-                current_addr="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^\ {8}username:\ "(.*)"$ ]]; then
-                current_method="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^\ {8}password:\ "(.*)"$ ]]; then
-                current_password="${BASH_REMATCH[1]}"
-            elif [[ "$line" =~ ^\ {10}addr:\ "(.*)"$ ]]; then
-                current_socks5="${BASH_REMATCH[1]}"
+            # 匹配 addr: ":PORT"
+            if [[ "$trimmed" == 'addr: ":'*'"' && -z "$current_addr" ]]; then
+                current_addr="${trimmed#addr: \":}"
+                current_addr="${current_addr%\"}"
+            # 匹配 username: "METHOD"
+            elif [[ "$trimmed" == 'username: "'*'"' ]]; then
+                current_method="${trimmed#username: \"}"
+                current_method="${current_method%\"}"
+            # 匹配 password: "PASSWORD"
+            elif [[ "$trimmed" == 'password: "'*'"' ]]; then
+                current_password="${trimmed#password: \"}"
+                current_password="${current_password%\"}"
+            # 匹配 addr: "SOCKS5_ADDR" (不以冒号开头的 addr)
+            elif [[ "$trimmed" == 'addr: "'*'"' && -n "$current_addr" ]]; then
+                current_socks5="${trimmed#addr: \"}"
+                current_socks5="${current_socks5%\"}"
             fi
 
             if [[ -n "$current_addr" && -n "$current_method" && -n "$current_password" && -n "$current_socks5" ]]; then
