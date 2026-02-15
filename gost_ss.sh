@@ -1,0 +1,693 @@
+#!/bin/bash
+
+# ============================================================
+#  GOST v3 - SOCKS5 → Shadowsocks 转发管理脚本
+#  功能: 安装/卸载/配置/管理 GOST 转发服务
+#  协议: SOCKS5 入站 → SS 出站 (TCP + UDP)
+# ============================================================
+
+# ---------- 颜色定义 ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # 无颜色
+
+# ---------- 路径定义 ----------
+GOST_BIN="/usr/local/bin/gost"
+SERVICE_FILE="/etc/systemd/system/gost-ss.service"
+CONFIG_FILE="/etc/gost/config.yaml"
+CONFIG_DIR="/etc/gost"
+
+# ---------- 工具函数 ----------
+print_banner() {
+    clear
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════════╗"
+    echo "║     GOST v3 SOCKS5 → SS 转发管理工具        ║"
+    echo "║     支持 TCP + UDP 同时转发                  ║"
+    echo "╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+print_info()    { echo -e "${GREEN}[信息]${NC} $1"; }
+print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
+print_error()   { echo -e "${RED}[错误]${NC} $1"; }
+print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
+
+press_any_key() {
+    echo ""
+    read -n 1 -s -r -p "按任意键返回主菜单..."
+    echo ""
+}
+
+# ---------- 检查 root 权限 ----------
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "请使用 root 权限运行此脚本！"
+        print_info "使用方法: sudo bash $0"
+        exit 1
+    fi
+}
+
+# ---------- 检测系统架构 ----------
+get_arch() {
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  echo "amd64" ;;
+        aarch64) echo "arm64" ;;
+        armv7l)  echo "armv7" ;;
+        i686)    echo "386" ;;
+        *)
+            print_error "不支持的系统架构: $arch"
+            exit 1
+            ;;
+    esac
+}
+
+# ---------- 检查 GOST 是否已安装 ----------
+check_gost_installed() {
+    if [[ -f "$GOST_BIN" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ---------- 获取 GOST 版本 ----------
+get_gost_version() {
+    if check_gost_installed; then
+        $GOST_BIN -V 2>&1 | head -n 1
+    else
+        echo "未安装"
+    fi
+}
+
+# ---------- 下载安装 GOST v3 ----------
+install_gost_binary() {
+    if check_gost_installed; then
+        local version
+        version=$(get_gost_version)
+        print_info "GOST 已安装: $version"
+        echo ""
+        read -r -p "是否重新安装/更新？[y/N]: " confirm
+        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+            print_info "跳过安装 GOST 二进制文件"
+            return 0
+        fi
+    fi
+
+    print_info "正在获取 GOST v3 最新版本信息..."
+
+    # 获取最新版本号
+    local latest_version
+    latest_version=$(curl -sL "https://api.github.com/repos/go-gost/gost/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
+
+    if [[ -z "$latest_version" ]]; then
+        print_error "无法获取最新版本信息，请检查网络连接"
+        return 1
+    fi
+
+    print_info "最新版本: $latest_version"
+
+    local arch
+    arch=$(get_arch)
+    local filename="gost_${latest_version#v}_linux_${arch}.tar.gz"
+    local download_url="https://github.com/go-gost/gost/releases/download/${latest_version}/${filename}"
+
+    print_info "正在下载: $filename"
+    print_info "下载地址: $download_url"
+
+    # 创建临时目录
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+
+    if ! curl -sL -o "${tmp_dir}/${filename}" "$download_url"; then
+        print_error "下载失败，请检查网络连接"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    print_info "正在解压安装..."
+
+    # 解压
+    if ! tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"; then
+        print_error "解压失败"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 安装二进制文件
+    if [[ -f "${tmp_dir}/gost" ]]; then
+        mv "${tmp_dir}/gost" "$GOST_BIN"
+        chmod +x "$GOST_BIN"
+        print_success "GOST 安装成功: $GOST_BIN"
+    else
+        print_error "解压后未找到 gost 可执行文件"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    # 清理临时文件
+    rm -rf "$tmp_dir"
+
+    # 验证安装
+    local version
+    version=$(get_gost_version)
+    print_success "安装版本: $version"
+    return 0
+}
+
+# ---------- 用户输入配置 ----------
+input_config() {
+    echo ""
+    echo -e "${BOLD}${BLUE}========== 请输入转发配置 ==========${NC}"
+    echo ""
+
+    # SS 密码
+    while true; do
+        read -r -p "请输入 SS 密码: " ss_password
+        if [[ -n "$ss_password" ]]; then
+            break
+        fi
+        print_error "密码不能为空！"
+    done
+
+    # 加密方式
+    echo ""
+    echo -e "${CYAN}常用加密方式:${NC}"
+    echo "  1) aes-128-gcm"
+    echo "  2) aes-256-gcm"
+    echo "  3) chacha20-ietf-poly1305"
+    echo "  4) 自定义输入"
+    echo ""
+    read -r -p "请选择加密方式 [1-4] (默认: 2): " method_choice
+    case "$method_choice" in
+        1) ss_method="aes-128-gcm" ;;
+        3) ss_method="chacha20-ietf-poly1305" ;;
+        4)
+            read -r -p "请输入自定义加密方式: " ss_method
+            if [[ -z "$ss_method" ]]; then
+                ss_method="aes-256-gcm"
+                print_warn "未输入，使用默认: aes-256-gcm"
+            fi
+            ;;
+        *) ss_method="aes-256-gcm" ;;
+    esac
+
+    # SS 监听端口
+    echo ""
+    while true; do
+        read -r -p "请输入 SS 监听端口 (默认: 8388): " ss_port
+        ss_port=${ss_port:-8388}
+        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [ "$ss_port" -ge 1 ] && [ "$ss_port" -le 65535 ]; then
+            break
+        fi
+        print_error "端口号无效，请输入 1-65535 之间的数字！"
+    done
+
+    # SOCKS5 地址
+    echo ""
+    while true; do
+        read -r -p "请输入上游 SOCKS5 代理地址 (如 127.0.0.1:1080): " socks5_addr
+        if [[ -n "$socks5_addr" ]]; then
+            break
+        fi
+        print_error "SOCKS5 地址不能为空！"
+    done
+
+    # 显示配置确认
+    echo ""
+    echo -e "${BOLD}${BLUE}========== 配置确认 ==========${NC}"
+    echo -e "  SS 密码:      ${GREEN}${ss_password}${NC}"
+    echo -e "  加密方式:     ${GREEN}${ss_method}${NC}"
+    echo -e "  SS 监听端口:  ${GREEN}${ss_port}${NC}"
+    echo -e "  SOCKS5 地址:  ${GREEN}${socks5_addr}${NC}"
+    echo -e "${BOLD}${BLUE}===============================${NC}"
+    echo ""
+
+    read -r -p "确认以上配置？[Y/n]: " confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+        print_warn "已取消，请重新输入"
+        return 1
+    fi
+
+    return 0
+}
+
+# ---------- 创建配置文件 ----------
+create_config() {
+    mkdir -p "$CONFIG_DIR"
+
+    cat > "$CONFIG_FILE" <<EOF
+# GOST v3 配置文件 - SOCKS5 → Shadowsocks 转发
+# 自动生成，请勿手动修改（可通过脚本修改配置菜单修改）
+
+services:
+  - name: ss-forward
+    addr: ":${ss_port}"
+    handler:
+      type: ss
+      auth:
+        username: "${ss_method}"
+        password: "${ss_password}"
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - name: socks5-upstream
+          addr: "${socks5_addr}"
+          connector:
+            type: socks5
+
+  - name: ss-forward-udp
+    addr: ":${ss_port}"
+    handler:
+      type: ss
+      auth:
+        username: "${ss_method}"
+        password: "${ss_password}"
+    listener:
+      type: udp
+    forwarder:
+      nodes:
+        - name: socks5-upstream-udp
+          addr: "${socks5_addr}"
+          connector:
+            type: socks5
+EOF
+
+    print_success "配置文件已创建: $CONFIG_FILE"
+}
+
+# ---------- 创建 Systemd 服务 ----------
+create_service() {
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=GOST v3 SOCKS5 to Shadowsocks Forwarding Service
+Documentation=https://gost.run
+After=network.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${GOST_BIN} -L "ss://${ss_method}:${ss_password}@:${ss_port}?udp=true" -F "socks5://${socks5_addr}"
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    print_success "服务文件已创建: $SERVICE_FILE"
+
+    # 重新加载 systemd
+    systemctl daemon-reload
+}
+
+# ---------- 安装完整流程 ----------
+do_install() {
+    print_banner
+    echo -e "${BOLD}${GREEN}[ 安装 GOST 并配置转发 ]${NC}"
+    echo ""
+
+    # 步骤1: 安装 GOST 二进制文件
+    print_info "步骤 1/4: 安装 GOST..."
+    if ! install_gost_binary; then
+        print_error "GOST 安装失败！"
+        press_any_key
+        return
+    fi
+
+    # 步骤2: 用户输入配置
+    echo ""
+    print_info "步骤 2/4: 配置转发参数..."
+    while true; do
+        if input_config; then
+            break
+        fi
+    done
+
+    # 步骤3: 创建服务文件
+    echo ""
+    print_info "步骤 3/4: 创建系统服务..."
+    create_service
+
+    # 步骤4: 启用并启动服务
+    echo ""
+    print_info "步骤 4/4: 启用开机自启并启动服务..."
+    systemctl enable gost-ss.service 2>/dev/null
+    print_success "已设置开机自启"
+
+    systemctl start gost-ss.service
+    sleep 1
+
+    if systemctl is-active --quiet gost-ss.service; then
+        print_success "GOST 转发服务已启动！"
+        echo ""
+        echo -e "${BOLD}${GREEN}========== 安装完成 ==========${NC}"
+        echo -e "  SS 连接信息:"
+        echo -e "  地址:     ${CYAN}服务器IP:${ss_port}${NC}"
+        echo -e "  密码:     ${CYAN}${ss_password}${NC}"
+        echo -e "  加密方式: ${CYAN}${ss_method}${NC}"
+        echo -e "  协议:     ${CYAN}TCP + UDP${NC}"
+        echo -e "${BOLD}${GREEN}===============================${NC}"
+    else
+        print_error "服务启动失败，请查看日志:"
+        echo -e "${YELLOW}  journalctl -u gost-ss.service -n 20${NC}"
+    fi
+
+    press_any_key
+}
+
+# ---------- 卸载完整流程 ----------
+do_uninstall() {
+    print_banner
+    echo -e "${BOLD}${RED}[ 卸载 GOST ]${NC}"
+    echo ""
+
+    if ! check_gost_installed && [[ ! -f "$SERVICE_FILE" ]]; then
+        print_warn "GOST 未安装，无需卸载"
+        press_any_key
+        return
+    fi
+
+    echo -e "${RED}${BOLD}警告: 此操作将完全卸载 GOST，包括:${NC}"
+    echo -e "  - 停止并禁用 gost-ss 服务"
+    echo -e "  - 删除服务文件: $SERVICE_FILE"
+    echo -e "  - 删除二进制文件: $GOST_BIN"
+    echo -e "  - 删除配置目录: $CONFIG_DIR"
+    echo ""
+
+    read -r -p "确认卸载？请输入 'yes' 确认: " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        print_info "已取消卸载"
+        press_any_key
+        return
+    fi
+
+    echo ""
+
+    # 停止服务
+    if systemctl is-active --quiet gost-ss.service 2>/dev/null; then
+        print_info "正在停止服务..."
+        systemctl stop gost-ss.service
+        print_success "服务已停止"
+    fi
+
+    # 禁用开机自启
+    if systemctl is-enabled --quiet gost-ss.service 2>/dev/null; then
+        print_info "正在禁用开机自启..."
+        systemctl disable gost-ss.service 2>/dev/null
+        print_success "已禁用开机自启"
+    fi
+
+    # 删除服务文件
+    if [[ -f "$SERVICE_FILE" ]]; then
+        rm -f "$SERVICE_FILE"
+        systemctl daemon-reload
+        print_success "服务文件已删除: $SERVICE_FILE"
+    fi
+
+    # 删除二进制文件
+    if [[ -f "$GOST_BIN" ]]; then
+        rm -f "$GOST_BIN"
+        print_success "二进制文件已删除: $GOST_BIN"
+    fi
+
+    # 删除配置文件目录
+    if [[ -d "$CONFIG_DIR" ]]; then
+        rm -rf "$CONFIG_DIR"
+        print_success "配置目录已删除: $CONFIG_DIR"
+    fi
+
+    echo ""
+    print_success "GOST 已完全卸载！"
+
+    press_any_key
+}
+
+# ---------- 查看服务状态 ----------
+do_status() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ 服务状态 ]${NC}"
+    echo ""
+
+    # GOST 安装状态
+    if check_gost_installed; then
+        local version
+        version=$(get_gost_version)
+        echo -e "  GOST 安装状态: ${GREEN}已安装${NC} ($version)"
+    else
+        echo -e "  GOST 安装状态: ${RED}未安装${NC}"
+        press_any_key
+        return
+    fi
+
+    # 服务状态
+    if [[ -f "$SERVICE_FILE" ]]; then
+        echo -e "  服务文件:      ${GREEN}已配置${NC}"
+
+        local status
+        status=$(systemctl is-active gost-ss.service 2>/dev/null)
+        if [[ "$status" == "active" ]]; then
+            echo -e "  运行状态:      ${GREEN}运行中${NC}"
+        else
+            echo -e "  运行状态:      ${RED}已停止${NC}"
+        fi
+
+        local enabled
+        enabled=$(systemctl is-enabled gost-ss.service 2>/dev/null)
+        if [[ "$enabled" == "enabled" ]]; then
+            echo -e "  开机自启:      ${GREEN}已启用${NC}"
+        else
+            echo -e "  开机自启:      ${YELLOW}未启用${NC}"
+        fi
+    else
+        echo -e "  服务文件:      ${RED}未配置${NC}"
+    fi
+
+    # 显示当前配置
+    if [[ -f "$SERVICE_FILE" ]]; then
+        echo ""
+        echo -e "${BOLD}${BLUE}[ 当前转发配置 ]${NC}"
+        local exec_line
+        exec_line=$(grep "ExecStart" "$SERVICE_FILE" 2>/dev/null)
+        if [[ -n "$exec_line" ]]; then
+            # 解析配置
+            local current_method current_password current_port current_socks5
+            current_method=$(echo "$exec_line" | grep -oP 'ss://\K[^:]+')
+            current_password=$(echo "$exec_line" | grep -oP 'ss://[^:]+:\K[^@]+')
+            current_port=$(echo "$exec_line" | grep -oP '@:\K[0-9]+')
+            current_socks5=$(echo "$exec_line" | grep -oP 'socks5://\K[^"]+')
+
+            echo -e "  加密方式:     ${CYAN}${current_method}${NC}"
+            echo -e "  SS 密码:      ${CYAN}${current_password}${NC}"
+            echo -e "  SS 端口:      ${CYAN}${current_port}${NC}"
+            echo -e "  SOCKS5 上游:  ${CYAN}${current_socks5}${NC}"
+        fi
+    fi
+
+    echo ""
+    echo -e "${BOLD}${BLUE}[ 最近日志 ]${NC}"
+    journalctl -u gost-ss.service -n 5 --no-pager 2>/dev/null || echo "  (无日志)"
+
+    press_any_key
+}
+
+# ---------- 重启服务 ----------
+do_restart() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ 重启服务 ]${NC}"
+    echo ""
+
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_error "服务未配置，请先安装！"
+        press_any_key
+        return
+    fi
+
+    print_info "正在重启 gost-ss 服务..."
+    systemctl restart gost-ss.service
+    sleep 1
+
+    if systemctl is-active --quiet gost-ss.service; then
+        print_success "服务已成功重启！"
+    else
+        print_error "服务重启失败，请查看日志:"
+        echo -e "${YELLOW}  journalctl -u gost-ss.service -n 20${NC}"
+    fi
+
+    press_any_key
+}
+
+# ---------- 停止服务 ----------
+do_stop() {
+    print_banner
+    echo -e "${BOLD}${YELLOW}[ 停止服务 ]${NC}"
+    echo ""
+
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_error "服务未配置，请先安装！"
+        press_any_key
+        return
+    fi
+
+    if ! systemctl is-active --quiet gost-ss.service; then
+        print_warn "服务当前未运行"
+        press_any_key
+        return
+    fi
+
+    print_info "正在停止 gost-ss 服务..."
+    systemctl stop gost-ss.service
+    print_success "服务已停止"
+
+    press_any_key
+}
+
+# ---------- 修改配置 ----------
+do_modify() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ 修改配置 ]${NC}"
+    echo ""
+
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_error "服务未配置，请先安装！"
+        press_any_key
+        return
+    fi
+
+    # 解析当前配置
+    local exec_line
+    exec_line=$(grep "ExecStart" "$SERVICE_FILE" 2>/dev/null)
+
+    local current_method current_password current_port current_socks5
+    current_method=$(echo "$exec_line" | grep -oP 'ss://\K[^:]+')
+    current_password=$(echo "$exec_line" | grep -oP 'ss://[^:]+:\K[^@]+')
+    current_port=$(echo "$exec_line" | grep -oP '@:\K[0-9]+')
+    current_socks5=$(echo "$exec_line" | grep -oP 'socks5://\K[^"]+')
+
+    echo -e "${BOLD}当前配置 (直接回车保持不变):${NC}"
+    echo ""
+
+    # SS 密码
+    read -r -p "SS 密码 [${current_password}]: " new_password
+    ss_password=${new_password:-$current_password}
+
+    # 加密方式
+    read -r -p "加密方式 [${current_method}]: " new_method
+    ss_method=${new_method:-$current_method}
+
+    # SS 端口
+    while true; do
+        read -r -p "SS 端口 [${current_port}]: " new_port
+        ss_port=${new_port:-$current_port}
+        if [[ "$ss_port" =~ ^[0-9]+$ ]] && [ "$ss_port" -ge 1 ] && [ "$ss_port" -le 65535 ]; then
+            break
+        fi
+        print_error "端口号无效，请输入 1-65535 之间的数字！"
+    done
+
+    # SOCKS5 地址
+    read -r -p "SOCKS5 地址 [${current_socks5}]: " new_socks5
+    socks5_addr=${new_socks5:-$current_socks5}
+
+    # 确认
+    echo ""
+    echo -e "${BOLD}${BLUE}========== 新配置确认 ==========${NC}"
+    echo -e "  SS 密码:      ${GREEN}${ss_password}${NC}"
+    echo -e "  加密方式:     ${GREEN}${ss_method}${NC}"
+    echo -e "  SS 监听端口:  ${GREEN}${ss_port}${NC}"
+    echo -e "  SOCKS5 地址:  ${GREEN}${socks5_addr}${NC}"
+    echo -e "${BOLD}${BLUE}=================================${NC}"
+    echo ""
+
+    read -r -p "确认修改？[Y/n]: " confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+        print_info "已取消修改"
+        press_any_key
+        return
+    fi
+
+    # 更新服务文件
+    create_service
+
+    # 重启服务
+    print_info "正在重启服务以应用新配置..."
+    systemctl restart gost-ss.service
+    sleep 1
+
+    if systemctl is-active --quiet gost-ss.service; then
+        print_success "配置已更新，服务已重启！"
+    else
+        print_error "服务重启失败，请查看日志"
+    fi
+
+    press_any_key
+}
+
+# ---------- 主菜单 ----------
+show_menu() {
+    print_banner
+
+    # 显示简要状态
+    if check_gost_installed; then
+        local status_text
+        if systemctl is-active --quiet gost-ss.service 2>/dev/null; then
+            status_text="${GREEN}● 运行中${NC}"
+        elif [[ -f "$SERVICE_FILE" ]]; then
+            status_text="${RED}● 已停止${NC}"
+        else
+            status_text="${YELLOW}● 已安装但未配置${NC}"
+        fi
+        echo -e "  状态: $status_text"
+    else
+        echo -e "  状态: ${YELLOW}● 未安装${NC}"
+    fi
+    echo ""
+
+    echo -e "  ${GREEN}1)${NC} 安装 GOST 并配置转发"
+    echo -e "  ${RED}2)${NC} 卸载 GOST（移除所有配置）"
+    echo -e "  ${BLUE}3)${NC} 查看服务状态"
+    echo -e "  ${CYAN}4)${NC} 重启服务"
+    echo -e "  ${YELLOW}5)${NC} 停止服务"
+    echo -e "  ${BLUE}6)${NC} 修改配置"
+    echo -e "  ${NC}0)${NC} 退出"
+    echo ""
+
+    read -r -p "请选择操作 [0-6]: " choice
+}
+
+# ---------- 主入口 ----------
+main() {
+    check_root
+
+    while true; do
+        show_menu
+        case "$choice" in
+            1) do_install ;;
+            2) do_uninstall ;;
+            3) do_status ;;
+            4) do_restart ;;
+            5) do_stop ;;
+            6) do_modify ;;
+            0)
+                echo ""
+                print_info "再见！"
+                exit 0
+                ;;
+            *)
+                print_error "无效选择，请输入 0-6"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# 启动脚本
+main
