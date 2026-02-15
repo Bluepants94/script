@@ -5,11 +5,25 @@ XRAYR_REPO="XrayR-project/XrayR"
 BASE_DIR="/etc/XrayR"
 VERSIONS_DIR="${BASE_DIR}/version"
 
-die() { echo "ERROR: $*" >&2; exit 1; }
-need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Must run as root."; }
+# ===== Colors =====
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ===== Utilities =====
+die() { echo -e "${RED}ERROR: $*${NC}" >&2; }
+info() { echo -e "${GREEN}$*${NC}"; }
+warn() { echo -e "${YELLOW}$*${NC}"; }
+header() { echo -e "${BOLD}${CYAN}$*${NC}"; }
+
+need_root() { [[ ${EUID:-$(id -u)} -eq 0 ]] || { die "Must run as root."; return 1; }; }
 
 check_64bit() {
-  [[ "$(getconf LONG_BIT 2>/dev/null || echo 0)" == "64" ]] || die "Only 64-bit systems are supported."
+  [[ "$(getconf LONG_BIT 2>/dev/null || echo 0)" == "64" ]] || { die "Only 64-bit systems are supported."; return 1; }
 }
 
 detect_pm() {
@@ -17,6 +31,7 @@ detect_pm() {
   if command -v dnf >/dev/null 2>&1; then echo "dnf"; return; fi
   if command -v yum >/dev/null 2>&1; then echo "yum"; return; fi
   die "No supported package manager found (apt-get/dnf/yum)."
+  return 1
 }
 
 install_deps() {
@@ -42,7 +57,7 @@ detect_arch() {
     x86_64|amd64) echo "64" ;;
     aarch64|arm64) echo "arm64-v8a" ;;
     s390x) echo "s390x" ;;
-    *) die "Unsupported arch: ${a}" ;;
+    *) die "Unsupported arch: ${a}"; return 1 ;;
   esac
 }
 
@@ -56,13 +71,43 @@ latest_version() {
   local v
   v="$(curl -fsSL "https://api.github.com/repos/${XRAYR_REPO}/releases/latest" \
       | grep -m1 '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || true)"
-  [[ -n "$v" ]] || die "Failed to fetch latest version from GitHub API."
+  [[ -n "$v" ]] || { die "Failed to fetch latest version from GitHub API."; return 1; }
   echo "$v"
 }
 
 instance_dir() { echo "${VERSIONS_DIR}/$1"; }
 service_name() { echo "XrayR-$1.service"; }
 
+# ===== Drawing Helpers =====
+draw_line() {
+  local char="${1:--}"
+  local len="${2:-56}"
+  printf '%*s\n' "$len" '' | tr ' ' "$char"
+}
+
+draw_box_header() {
+  local title="$1"
+  echo ""
+  echo -e "${CYAN}"
+  draw_line "═" 56
+  printf "║  %-52s║\n" "$title"
+  draw_line "═" 56
+  echo -e "${NC}"
+}
+
+draw_menu_item() {
+  local num="$1"
+  local text="$2"
+  echo -e "  ${BOLD}${YELLOW}${num})${NC}  ${text}"
+}
+
+press_any_key() {
+  echo ""
+  echo -e "${YELLOW}Press Enter to return to the main menu...${NC}"
+  read -r
+}
+
+# ===== Core Functions =====
 create_service_unit() {
   local name="$1"
   local dir="$2"
@@ -95,27 +140,27 @@ install_instance() {
   local dir; dir="$(instance_dir "$name")"
   mkdir -p "$dir"
 
-  # Fix: avoid "tmp: unbound variable" under set -u
   local tmp=""
   tmp="$(mktemp -d)"
   trap '[[ -n "${tmp:-}" ]] && rm -rf "${tmp}"' EXIT
 
   local url="https://github.com/${XRAYR_REPO}/releases/download/${version_tag}/XrayR-linux-${arch}.zip"
-  echo "Installing instance: ${name}"
-  echo "Version: ${version_tag}"
-  echo "Arch: ${arch}"
-  echo "Dir: ${dir}"
-  echo "Download: ${url}"
+  echo ""
+  info "Installing instance: ${name}"
+  echo -e "  Version : ${BOLD}${version_tag}${NC}"
+  echo -e "  Arch    : ${BOLD}${arch}${NC}"
+  echo -e "  Dir     : ${BOLD}${dir}${NC}"
+  echo -e "  URL     : ${url}"
+  echo ""
 
-  wget -q -O "${tmp}/xrayr.zip" "$url" || die "Download failed. Check version/tag and GitHub connectivity."
-  unzip -q -o "${tmp}/xrayr.zip" -d "${tmp}" || die "Unzip failed."
-  [[ -f "${tmp}/XrayR" ]] || die "XrayR binary not found in archive."
+  wget -q -O "${tmp}/xrayr.zip" "$url" || { die "Download failed. Check version/tag and GitHub connectivity."; return 1; }
+  unzip -q -o "${tmp}/xrayr.zip" -d "${tmp}" || { die "Unzip failed."; return 1; }
+  [[ -f "${tmp}/XrayR" ]] || { die "XrayR binary not found in archive."; return 1; }
 
   install -m 0755 "${tmp}/XrayR" "${dir}/XrayR"
   [[ -f "${tmp}/geoip.dat" ]]   && install -m 0644 "${tmp}/geoip.dat"   "${dir}/geoip.dat"
   [[ -f "${tmp}/geosite.dat" ]] && install -m 0644 "${tmp}/geosite.dat" "${dir}/geosite.dat"
 
-  # Create config only once
   if [[ -f "${tmp}/config.yml" && ! -f "${dir}/config.yml" ]]; then
     install -m 0644 "${tmp}/config.yml" "${dir}/config.yml"
   fi
@@ -130,9 +175,9 @@ install_instance() {
   systemctl restart "$(service_name "$name")" || true
 
   if systemctl is-active --quiet "$(service_name "$name")"; then
-    echo "OK: service running: $(service_name "$name")"
+    info "✔ Service running: $(service_name "$name")"
   else
-    echo "WARN: service not active. Check:"
+    warn "⚠ Service not active. Check:"
     echo "  journalctl -u $(service_name "$name") -e --no-pager"
   fi
 
@@ -146,25 +191,37 @@ list_instances() {
   local names
   names="$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
   if [[ -z "$names" ]]; then
-    echo "No instances found in ${VERSIONS_DIR}"
+    warn "No instances found in ${VERSIONS_DIR}"
     return 0
   fi
 
+  echo ""
+  printf "  ${BOLD}%-20s %-15s %-12s${NC}\n" "NAME" "VERSION" "STATUS"
+  draw_line "-" 52
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
     local d="${VERSIONS_DIR}/${name}"
     local ver="unknown"
     [[ -f "$d/.installed_version" ]] && ver="$(cat "$d/.installed_version" 2>/dev/null || echo unknown)"
-    echo "${name} (${ver})"
+    local svc; svc="$(service_name "$name")"
+    local status
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      status="${GREEN}running${NC}"
+    else
+      status="${RED}stopped${NC}"
+    fi
+    printf "  %-20s %-15s " "$name" "$ver"
+    echo -e "$status"
   done <<< "$names"
+  echo ""
 }
 
 uninstall_instance_no_confirm() {
   local name="$1"
-  [[ -n "$name" ]] || die "Name required for uninstall. Use: uninstall -n <name>"
+  [[ -n "$name" ]] || { die "Name required for uninstall."; return 1; }
 
   local dir; dir="$(instance_dir "$name")"
-  [[ -d "$dir" ]] || die "Instance dir not found: $dir"
+  [[ -d "$dir" ]] || { die "Instance dir not found: $dir"; return 1; }
 
   local svc; svc="$(service_name "$name")"
 
@@ -176,20 +233,17 @@ uninstall_instance_no_confirm() {
   systemctl reset-failed >/dev/null 2>&1 || true
 
   rm -rf "$dir"
-  echo "OK: Uninstalled '${name}' (service + ${dir})"
+  info "✔ Uninstalled '${name}' (service + ${dir})"
 }
 
-# ===== system control =====
+# ===== System Control =====
 list_xrayr_units() {
   local units=""
-
-  # list-unit-files covers enabled/disabled/static units
   units="$(systemctl list-unit-files --no-legend 2>/dev/null \
           | awk '{print $1}' \
           | grep -E '^XrayR-.*\.service$' \
           | LC_ALL=C sort -u || true)"
 
-  # fallback scan
   if [[ -z "$units" ]]; then
     units="$(find /etc/systemd/system -maxdepth 1 -type f -name 'XrayR-*.service' -printf '%f\n' 2>/dev/null \
             | LC_ALL=C sort -u || true)"
@@ -198,140 +252,296 @@ list_xrayr_units() {
   echo "$units"
 }
 
-choose_xrayr_unit() {
+# ===== UI Menus =====
+
+ui_install() {
+  draw_box_header "Install New Instance"
+
+  local name=""
+  while true; do
+    echo -ne "  ${BOLD}Instance name${NC} (e.g. nodeA): "
+    read -r name
+    if [[ -z "$name" ]]; then
+      die "Name cannot be empty. Please try again."
+      continue
+    fi
+    if [[ ! "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+      die "Name can only contain: [a-zA-Z0-9._-]. Please try again."
+      continue
+    fi
+    break
+  done
+
+  echo -ne "  ${BOLD}Version${NC} (leave empty for latest): "
+  read -r version_in
+
+  echo ""
+  echo -e "  ${BOLD}Confirm installation:${NC}"
+  echo -e "    Name    : ${YELLOW}${name}${NC}"
+  echo -e "    Version : ${YELLOW}${version_in:-latest}${NC}"
+  echo ""
+  echo -ne "  ${BOLD}Proceed? (y/n):${NC} "
+  read -r confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    warn "Installation cancelled."
+    return
+  fi
+
+  echo ""
+  info "Preparing installation..."
+
+  local pm; pm="$(detect_pm)" || return
+  install_deps "$pm"
+
+  local arch; arch="$(detect_arch)" || return
+  local tag; tag="$(normalize_version_tag "$version_in")"
+  [[ -n "$tag" ]] || tag="$(latest_version)" || return
+
+  install_instance "$name" "$tag" "$arch"
+}
+
+ui_list() {
+  draw_box_header "Installed Instances"
+  list_instances
+}
+
+ui_uninstall() {
+  draw_box_header "Uninstall Instance"
+
+  mkdir -p "$VERSIONS_DIR"
+  local names
+  names="$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
+
+  if [[ -z "$names" ]]; then
+    warn "No instances found. Nothing to uninstall."
+    return
+  fi
+
+  echo "  Available instances:"
+  echo ""
+
+  local i=0
+  local arr=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    i=$((i+1))
+    local ver="unknown"
+    [[ -f "${VERSIONS_DIR}/${n}/.installed_version" ]] && ver="$(cat "${VERSIONS_DIR}/${n}/.installed_version" 2>/dev/null || echo unknown)"
+    draw_menu_item "$i" "${n} (${ver})"
+    arr+=("$n")
+  done <<< "$names"
+
+  echo ""
+  echo -ne "  ${BOLD}Select instance number to uninstall (0 to cancel):${NC} "
+  read -r idx
+
+  if [[ "$idx" == "0" ]]; then
+    warn "Cancelled."
+    return
+  fi
+
+  [[ "$idx" =~ ^[0-9]+$ ]] || { die "Invalid selection."; return; }
+  [[ "$idx" -ge 1 && "$idx" -le "${#arr[@]}" ]] || { die "Out of range."; return; }
+
+  local selected="${arr[$((idx-1))]}"
+  echo ""
+  echo -e "  ${RED}${BOLD}WARNING:${NC} This will permanently remove instance '${YELLOW}${selected}${NC}'"
+  echo -e "  Including service, binary, and all config files."
+  echo ""
+  echo -ne "  ${BOLD}Type the instance name to confirm:${NC} "
+  read -r confirm_name
+
+  if [[ "$confirm_name" != "$selected" ]]; then
+    warn "Name does not match. Uninstall cancelled."
+    return
+  fi
+
+  uninstall_instance_no_confirm "$selected"
+}
+
+ui_system_control() {
+  draw_box_header "System Control"
+
   local units
   units="$(list_xrayr_units)"
-  [[ -n "$units" ]] || die "No systemd units found with prefix 'XrayR-'."
+  if [[ -z "$units" ]]; then
+    warn "No XrayR systemd units found."
+    return
+  fi
 
-  # IMPORTANT: menu output must go to stderr to avoid polluting command substitution
-  echo "XrayR systemd units:" >&2
+  echo "  Available services:"
+  echo ""
 
   local i=0
   local arr=()
   while IFS= read -r u; do
     [[ -n "$u" ]] || continue
     i=$((i+1))
-    echo "  ${i}) ${u}" >&2
+    local status
+    if systemctl is-active --quiet "$u" 2>/dev/null; then
+      status="${GREEN}● running${NC}"
+    else
+      status="${RED}● stopped${NC}"
+    fi
+    printf "  ${BOLD}${YELLOW}%d)${NC}  %-30s " "$i" "$u"
+    echo -e "$status"
     arr+=("$u")
   done <<< "$units"
 
-  echo "" >&2
-  read -r -p "Select number: " idx
+  echo ""
+  echo -ne "  ${BOLD}Select service number (0 to cancel):${NC} "
+  read -r idx
 
-  [[ "$idx" =~ ^[0-9]+$ ]] || die "Invalid selection."
-  [[ "$idx" -ge 1 && "$idx" -le "${#arr[@]}" ]] || die "Out of range."
+  if [[ "$idx" == "0" ]]; then
+    warn "Cancelled."
+    return
+  fi
 
-  # ONLY this line goes to stdout
-  printf '%s\n' "${arr[$((idx-1))]}"
-}
+  [[ "$idx" =~ ^[0-9]+$ ]] || { die "Invalid selection."; return; }
+  [[ "$idx" -ge 1 && "$idx" -le "${#arr[@]}" ]] || { die "Out of range."; return; }
 
-system_menu() {
-  local unit
-  unit="$(choose_xrayr_unit)"
+  local selected="${arr[$((idx-1))]}"
 
-  echo "" >&2
-  echo "Selected: ${unit}" >&2
-  echo "1) Start" >&2
-  echo "2) Stop" >&2
-  echo "3) Restart" >&2
-  echo "4) Status" >&2
-  echo "" >&2
+  echo ""
+  echo -e "  Selected: ${BOLD}${selected}${NC}"
+  echo ""
+  draw_menu_item "1" "Start"
+  draw_menu_item "2" "Stop"
+  draw_menu_item "3" "Restart"
+  draw_menu_item "4" "Status"
+  draw_menu_item "5" "View Logs (last 50 lines)"
+  echo ""
+  echo -ne "  ${BOLD}Choose action (1-5):${NC} "
+  read -r act
 
-  read -r -p "Choose action (1-4): " act
+  echo ""
   case "$act" in
-    1) systemctl start "$unit";   echo "OK: started $unit" ;;
-    2) systemctl stop "$unit";    echo "OK: stopped $unit" ;;
-    3) systemctl restart "$unit"; echo "OK: restarted $unit" ;;
-    4) systemctl status "$unit" --no-pager -l ;;
+    1) systemctl start "$selected";   info "✔ Started $selected" ;;
+    2) systemctl stop "$selected";    info "✔ Stopped $selected" ;;
+    3) systemctl restart "$selected"; info "✔ Restarted $selected" ;;
+    4) systemctl status "$selected" --no-pager -l ;;
+    5) journalctl -u "$selected" --no-pager -n 50 ;;
     *) die "Invalid action." ;;
   esac
 }
 
-usage() {
-  cat <<EOF
-Usage:
-  bash install.sh install   <name> [version]
-  bash install.sh install   -n <name> [-v <version>]
-  bash install.sh list
-  bash install.sh uninstall -n <name>
-  bash install.sh system
+ui_edit_config() {
+  draw_box_header "Edit Instance Config"
 
-Notes:
-  - Files: ${VERSIONS_DIR}/<name>/
-  - Service: XrayR-<name>.service
-  - Uninstall performs NO confirmation prompt.
-EOF
-}
-
-main() {
-  need_root
-  check_64bit
   mkdir -p "$VERSIONS_DIR"
+  local names
+  names="$(find "$VERSIONS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort || true)"
 
-  local action="${1:-help}"
-  shift || true
-
-  local name=""
-  local version_in=""
-
-  # Positional args supported ONLY for install
-  if [[ "$action" == "install" ]]; then
-    if [[ $# -gt 0 && "${1:-}" != -* ]]; then
-      name="$1"; shift
-    fi
-    if [[ $# -gt 0 && "${1:-}" != -* ]]; then
-      version_in="$1"; shift
-    fi
+  if [[ -z "$names" ]]; then
+    warn "No instances found."
+    return
   fi
 
-  # Parse flags
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -n|--name) name="${2:-}"; shift 2 ;;
-      -v|--version) version_in="${2:-}"; shift 2 ;;
-      -h|--help) action="help"; shift ;;
+  echo "  Available instances:"
+  echo ""
+
+  local i=0
+  local arr=()
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    i=$((i+1))
+    draw_menu_item "$i" "$n"
+    arr+=("$n")
+  done <<< "$names"
+
+  echo ""
+  echo -ne "  ${BOLD}Select instance number (0 to cancel):${NC} "
+  read -r idx
+
+  if [[ "$idx" == "0" ]]; then
+    warn "Cancelled."
+    return
+  fi
+
+  [[ "$idx" =~ ^[0-9]+$ ]] || { die "Invalid selection."; return; }
+  [[ "$idx" -ge 1 && "$idx" -le "${#arr[@]}" ]] || { die "Out of range."; return; }
+
+  local selected="${arr[$((idx-1))]}"
+  local config_file="${VERSIONS_DIR}/${selected}/config.yml"
+
+  if [[ ! -f "$config_file" ]]; then
+    die "Config file not found: $config_file"
+    return
+  fi
+
+  local editor="${EDITOR:-vi}"
+  info "Opening ${config_file} with ${editor}..."
+  "$editor" "$config_file"
+
+  echo ""
+  echo -ne "  ${BOLD}Restart service to apply changes? (y/n):${NC} "
+  read -r restart
+  if [[ "$restart" == "y" || "$restart" == "Y" ]]; then
+    local svc; svc="$(service_name "$selected")"
+    systemctl restart "$svc" || true
+    if systemctl is-active --quiet "$svc"; then
+      info "✔ Service restarted successfully."
+    else
+      warn "⚠ Service may not have started properly."
+      echo "  journalctl -u $svc -e --no-pager"
+    fi
+  fi
+}
+
+# ===== Main Menu =====
+main_menu() {
+  while true; do
+    clear
+    echo ""
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║                                                  ║"
+    echo "  ║           XrayR Instance Manager                 ║"
+    echo "  ║                                                  ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  ${BOLD}Base directory:${NC} ${VERSIONS_DIR}"
+    echo ""
+    draw_line "─" 56
+    echo ""
+    draw_menu_item "1" "Install new instance"
+    draw_menu_item "2" "List installed instances"
+    draw_menu_item "3" "Uninstall an instance"
+    draw_menu_item "4" "System control (start/stop/restart)"
+    draw_menu_item "5" "Edit instance config"
+    echo ""
+    draw_line "─" 56
+    echo ""
+    draw_menu_item "0" "Exit"
+    echo ""
+    echo -ne "  ${BOLD}Enter your choice [0-5]:${NC} "
+    read -r choice
+
+    case "$choice" in
+      1) ui_install;          press_any_key ;;
+      2) ui_list;             press_any_key ;;
+      3) ui_uninstall;        press_any_key ;;
+      4) ui_system_control;   press_any_key ;;
+      5) ui_edit_config;      press_any_key ;;
+      0)
+        echo ""
+        info "Goodbye!"
+        exit 0
+        ;;
       *)
-        if [[ "$action" == "uninstall" ]]; then
-          die "Uninstall requires -n <name>. Example: ./install.sh uninstall -n nodeB"
-        fi
-        die "Unknown arg: $1"
+        die "Invalid choice. Please select 0-5."
+        sleep 1
         ;;
     esac
   done
-
-  case "$action" in
-    install)
-      [[ -n "$name" ]] || read -r -p "Instance name: " name
-      [[ -n "$name" ]] || die "Name required."
-      [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]] || die "Name allowed chars: [a-zA-Z0-9._-]"
-
-      local pm; pm="$(detect_pm)"
-      install_deps "$pm"
-
-      local arch; arch="$(detect_arch)"
-      local tag; tag="$(normalize_version_tag "$version_in")"
-      [[ -n "$tag" ]] || tag="$(latest_version)"
-
-      install_instance "$name" "$tag" "$arch"
-      ;;
-    list)
-      list_instances
-      ;;
-    uninstall)
-      [[ -n "$name" ]] || die "Uninstall requires -n <name>. Example: ./install.sh uninstall -n nodeB"
-      uninstall_instance_no_confirm "$name"
-      ;;
-    system)
-      system_menu
-      ;;
-    help|-h|--help|"")
-      usage
-      ;;
-    *)
-      usage
-      die "Unknown action: $action"
-      ;;
-  esac
 }
 
-main "$@"
+# ===== Entry Point =====
+main() {
+  need_root || exit 1
+  check_64bit || exit 1
+  mkdir -p "$VERSIONS_DIR"
+  main_menu
+}
+
+main
