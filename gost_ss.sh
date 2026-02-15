@@ -44,14 +44,34 @@ press_any_key() {
 }
 
 print_entries() {
+    # 计算各列最大宽度
+    local w_idx=4 w_port=6 w_pass=6 w_method=6 w_socks5=10
     for ((i=0; i<${#ss_ports[@]}; i++)); do
         local idx=$((i + 1))
-        echo -e "  [${idx}] SS 密码:      ${GREEN}${ss_passwords[$i]}${NC}"
-        echo -e "      加密方式:     ${GREEN}${ss_methods[$i]}${NC}"
-        echo -e "      SS 监听端口:  ${GREEN}${ss_ports[$i]}${NC}"
-        echo -e "      SOCKS5 地址:  ${GREEN}${socks5_addrs[$i]}${NC}"
-        echo ""
+        (( ${#idx} + 2 > w_idx )) && w_idx=$(( ${#idx} + 2 ))
+        (( ${#ss_ports[$i]} > w_port )) && w_port=${#ss_ports[$i]}
+        (( ${#ss_passwords[$i]} > w_pass )) && w_pass=${#ss_passwords[$i]}
+        (( ${#ss_methods[$i]} > w_method )) && w_method=${#ss_methods[$i]}
+        (( ${#socks5_addrs[$i]} > w_socks5 )) && w_socks5=${#socks5_addrs[$i]}
     done
+
+    # 打印表头
+    printf "  ${BOLD}| %-${w_idx}s | %-${w_port}s | %-${w_pass}s | %-${w_method}s | %-${w_socks5}s |${NC}\n" \
+        "序号" "端口" "密码" "加密方式" "SOCKS5地址"
+    # 打印分隔线
+    printf "  |"
+    for ((j=0; j<w_idx+2; j++)); do printf "-"; done; printf "|"
+    for ((j=0; j<w_port+2; j++)); do printf "-"; done; printf "|"
+    for ((j=0; j<w_pass+2; j++)); do printf "-"; done; printf "|"
+    for ((j=0; j<w_method+2; j++)); do printf "-"; done; printf "|"
+    for ((j=0; j<w_socks5+2; j++)); do printf "-"; done; printf "|\n"
+    # 打印数据行
+    for ((i=0; i<${#ss_ports[@]}; i++)); do
+        local idx=$((i + 1))
+        printf "  | ${GREEN}%-${w_idx}s${NC} | ${CYAN}%-${w_port}s${NC} | ${CYAN}%-${w_pass}s${NC} | ${CYAN}%-${w_method}s${NC} | ${CYAN}%-${w_socks5}s${NC} |\n" \
+            "[$idx]" "${ss_ports[$i]}" "${ss_passwords[$i]}" "${ss_methods[$i]}" "${socks5_addrs[$i]}"
+    done
+    echo ""
 }
 
 load_config_entries() {
@@ -669,14 +689,7 @@ do_status() {
             if [[ ${#ss_ports[@]} -eq 0 ]]; then
                 echo -e "  ${YELLOW}(未检测到转发条目)${NC}"
             else
-                for ((i=0; i<${#ss_ports[@]}; i++)); do
-                    local idx=$((i + 1))
-                    echo -e "  [${idx}] SS 端口:      ${CYAN}${ss_ports[$i]}${NC}"
-                    echo -e "      SS 密码:      ${CYAN}${ss_passwords[$i]}${NC}"
-                    echo -e "      加密方式:     ${CYAN}${ss_methods[$i]}${NC}"
-                    echo -e "      SOCKS5 上游:  ${CYAN}${socks5_addrs[$i]}${NC}"
-                    echo ""
-                done
+                print_entries
             fi
         fi
     fi
