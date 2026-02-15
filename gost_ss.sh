@@ -125,20 +125,21 @@ choose_method() {
             return
         fi
     else
-        read -r -p "请选择加密方式 [1-4] (默认: 2): " method_choice
+        read -r -p "请选择加密方式 [1-4] (默认: 3): " method_choice
     fi
 
     case "$method_choice" in
         1) ss_method="aes-128-gcm" ;;
+        2) ss_method="aes-256-gcm" ;;
         3) ss_method="chacha20-ietf-poly1305" ;;
         4)
             read -r -p "请输入自定义加密方式: " ss_method
             if [[ -z "$ss_method" ]]; then
-                ss_method="${default_method:-aes-256-gcm}"
+                ss_method="${default_method:-chacha20-ietf-poly1305}"
                 print_warn "未输入，使用默认: ${ss_method}"
             fi
             ;;
-        *) ss_method="${default_method:-aes-256-gcm}" ;;
+        *) ss_method="${default_method:-chacha20-ietf-poly1305}" ;;
     esac
 }
 
@@ -375,25 +376,16 @@ input_config() {
     echo -e "${BOLD}${BLUE}========== 请输入转发配置 ==========${NC}"
     echo ""
 
-    # 转发条数
-    local forward_count
-    while true; do
-        read -r -p "请输入需要配置的转发条数 (1-20): " forward_count
-        if [[ "$forward_count" =~ ^[0-9]+$ ]] && [ "$forward_count" -ge 1 ] && [ "$forward_count" -le 20 ]; then
-            break
-        fi
-        print_error "请输入 1-20 之间的数字！"
-    done
-
     # 清空旧数组
     ss_passwords=()
     ss_methods=()
     ss_ports=()
     socks5_addrs=()
 
-    for ((i=1; i<=forward_count; i++)); do
+    local entry_index=1
+    while true; do
         echo ""
-        echo -e "${BOLD}${CYAN}--- 第 ${i} 条转发 ---${NC}"
+        echo -e "${BOLD}${CYAN}--- 第 ${entry_index} 条转发 ---${NC}"
 
         input_entry "" "" "" ""
 
@@ -401,6 +393,12 @@ input_config() {
         ss_methods+=("$ss_method")
         ss_ports+=("$ss_port")
         socks5_addrs+=("$socks5_addr")
+
+        read -r -p "是否继续添加下一条转发？[Y/n]: " add_more
+        if [[ "$add_more" == "n" || "$add_more" == "N" ]]; then
+            break
+        fi
+        entry_index=$((entry_index + 1))
     done
 
     # 显示配置确认
