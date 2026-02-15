@@ -17,3 +17,7 @@ wget -N https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ins
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/ip_monitor_setup.sh)
 ```
+# GOST Sock5转SS
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_ss.sh)
+```
