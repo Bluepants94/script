@@ -1,6 +1,6 @@
 # XrayR多进程
 ```
-bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_install.sh)
 ```
 # TC 端口限速
 
