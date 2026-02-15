@@ -64,61 +64,48 @@ load_config_entries() {
         return 1
     fi
 
-    local line reading=0
-    local current_addr=""
-    local current_method=""
-    local current_password=""
-    local current_socks5=""
-    local trimmed=""
+    # 使用 grep + sed 直接从配置文件中提取各字段
+    # 提取所有 TCP 转发块中的端口号 (从 addr: ":PORT" 行)
+    local i=0
+    local tcp_block_count
+    tcp_block_count=$(grep -c 'name: ss-forward-.*-tcp' "$CONFIG_FILE" 2>/dev/null)
 
-    while IFS= read -r line; do
-        # 去除前后空白
-        trimmed="$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
+    if [[ "$tcp_block_count" -eq 0 ]]; then
+        return 0
+    fi
 
-        # 检测 service name 行
-        if [[ "$trimmed" == "- name: ss-forward-"*"-tcp" ]]; then
-            reading=1
-            current_addr=""
-            current_method=""
-            current_password=""
-            current_socks5=""
-            continue
-        elif [[ "$trimmed" == "- name: ss-forward-"*"-udp" ]]; then
-            reading=0
-            continue
-        elif [[ "$trimmed" == "- name:"* ]]; then
-            reading=0
-            continue
+    # 逐块提取：找到每个 tcp 块的行号，然后从该行号起提取后续字段
+    local tcp_line_nums
+    tcp_line_nums=$(grep -n 'name: ss-forward-.*-tcp' "$CONFIG_FILE" | cut -d: -f1)
+
+    for start_line in $tcp_line_nums; do
+        # 从 tcp 块开始行往后取 15 行来提取字段
+        local block
+        block=$(sed -n "${start_line},$((start_line + 15))p" "$CONFIG_FILE")
+
+        # 提取端口: addr: ":PORT"
+        local port
+        port=$(echo "$block" | grep 'addr:' | head -n1 | sed 's/.*":\([0-9]*\)".*/\1/')
+
+        # 提取加密方式: username: "METHOD"
+        local method
+        method=$(echo "$block" | grep 'username:' | head -n1 | sed 's/.*username: *"\(.*\)".*/\1/')
+
+        # 提取密码: password: "PASSWORD"
+        local password
+        password=$(echo "$block" | grep 'password:' | head -n1 | sed 's/.*password: *"\(.*\)".*/\1/')
+
+        # 提取 SOCKS5 地址: 第二个 addr 行 (不含冒号开头)
+        local socks5
+        socks5=$(echo "$block" | grep 'addr:' | tail -n1 | sed 's/.*addr: *"\(.*\)".*/\1/')
+
+        if [[ -n "$port" && -n "$method" && -n "$password" && -n "$socks5" ]]; then
+            ss_ports+=("$port")
+            ss_methods+=("$method")
+            ss_passwords+=("$password")
+            socks5_addrs+=("$socks5")
         fi
-
-        if [[ $reading -eq 1 ]]; then
-            # 匹配 addr: ":PORT"
-            if [[ "$trimmed" == 'addr: ":'*'"' && -z "$current_addr" ]]; then
-                current_addr="${trimmed#addr: \":}"
-                current_addr="${current_addr%\"}"
-            # 匹配 username: "METHOD"
-            elif [[ "$trimmed" == 'username: "'*'"' ]]; then
-                current_method="${trimmed#username: \"}"
-                current_method="${current_method%\"}"
-            # 匹配 password: "PASSWORD"
-            elif [[ "$trimmed" == 'password: "'*'"' ]]; then
-                current_password="${trimmed#password: \"}"
-                current_password="${current_password%\"}"
-            # 匹配 addr: "SOCKS5_ADDR" (不以冒号开头的 addr)
-            elif [[ "$trimmed" == 'addr: "'*'"' && -n "$current_addr" ]]; then
-                current_socks5="${trimmed#addr: \"}"
-                current_socks5="${current_socks5%\"}"
-            fi
-
-            if [[ -n "$current_addr" && -n "$current_method" && -n "$current_password" && -n "$current_socks5" ]]; then
-                ss_ports+=("$current_addr")
-                ss_methods+=("$current_method")
-                ss_passwords+=("$current_password")
-                socks5_addrs+=("$current_socks5")
-                reading=0
-            fi
-        fi
-    done < "$CONFIG_FILE"
+    done
 
     return 0
 }
