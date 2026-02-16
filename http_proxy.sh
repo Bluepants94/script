@@ -220,14 +220,65 @@ stop_proxy() {
 show_usage() {
   cat <<EOF_USAGE
 用法:
-  bash tinyproxy_manager.sh start   # 检查安装并开启代理
-  bash tinyproxy_manager.sh stop    # 关闭代理并清理配置
+  ./tinyproxy_manager.sh            # 交互式 UI 菜单
+  ./tinyproxy_manager.sh start      # 命令行模式：检查安装并开启代理
+  ./tinyproxy_manager.sh stop       # 命令行模式：关闭代理并清理配置
 EOF_USAGE
+}
+
+show_banner() {
+  echo ""
+  echo "=================================================="
+  echo "        Tinyproxy HTTP 代理管理工具 (UI)"
+  echo "=================================================="
+}
+
+show_menu() {
+  echo ""
+  echo "请选择操作："
+  echo "  1) 开启代理（检查/安装 tinyproxy）"
+  echo "  2) 关闭代理（并清理配置）"
+  echo "  3) 查看帮助"
+  echo "  0) 退出"
+  echo -n "输入选项 [0-3]: "
+}
+
+run_ui() {
+  while true; do
+    show_banner
+    show_menu
+    read -r choice
+
+    case "${choice}" in
+      1)
+        start_proxy || true
+        ;;
+      2)
+        stop_proxy || true
+        ;;
+      3)
+        show_usage
+        ;;
+      0)
+        print_ok "已退出。"
+        exit 0
+        ;;
+      *)
+        print_warn "无效选项，请输入 0-3。"
+        ;;
+    esac
+
+    echo ""
+    read -r -p "按回车键继续..." _
+  done
 }
 
 main() {
   local cmd="${1:-}"
   case "$cmd" in
+    "")
+      run_ui
+      ;;
     start)
       start_proxy
       ;;
