@@ -12,3 +12,7 @@ bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_ss.sh)
 ```
+# iptables端口转发
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward.sh)
+```
