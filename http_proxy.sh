@@ -117,7 +117,19 @@ is_port_used() {
   return 1
 }
 
+detect_runtime_user() {
+  id -un 2>/dev/null || echo "nobody"
+}
+
+detect_runtime_group() {
+  id -gn 2>/dev/null || echo "nogroup"
+}
+
 generate_config() {
+  local run_user run_group
+  run_user="$(detect_runtime_user)"
+  run_group="$(detect_runtime_group)"
+
   : > "$CONFIG_FILE"
 
   cat >> "$CONFIG_FILE" <<EOF_CONF
@@ -125,10 +137,16 @@ Port ${PROXY_PORT}
 Listen 0.0.0.0
 Timeout 600
 MaxClients 100
+StartServers 5
+MinSpareServers 5
+MaxSpareServers 20
+MaxRequestsPerChild 0
 LogFile "${LOG_FILE}"
 LogLevel Info
 PidFile "${PID_FILE}"
 DisableViaHeader Yes
+User ${run_user}
+Group ${run_group}
 EOF_CONF
 
   # 用户名和密码都不为空时启用认证，否则不启用
