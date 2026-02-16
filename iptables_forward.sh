@@ -150,6 +150,28 @@ init_env() {
     fi
 }
 
+# ---------- 公网IP检测 ----------
+PUBLIC_IP_CACHE=""
+detect_public_ip() {
+    # 如果已缓存则直接返回
+    if [[ -n "$PUBLIC_IP_CACHE" ]]; then
+        return 0
+    fi
+
+    local ip=""
+    # 尝试多个公网IP检测服务，超时3秒
+    for url in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
+        ip=$(curl -4 -s --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            PUBLIC_IP_CACHE="$ip"
+            return 0
+        fi
+    done
+
+    PUBLIC_IP_CACHE="(检测失败)"
+    return 1
+}
+
 # ---------- 本机IP探测 ----------
 get_local_ipv4_list() {
     local_ips=()
@@ -163,21 +185,38 @@ get_local_ipv4_list() {
 }
 
 choose_listen_ip() {
+    SELECTED_LISTEN_IP="0.0.0.0"
     get_local_ipv4_list
+    detect_public_ip
 
     echo ""
     echo -e "${CYAN}请选择监听IP（用于区分公网/内网入口）:${NC}"
     echo "  1) 0.0.0.0 (所有IP，公网+内网都匹配，默认)"
 
-    local base=2
+    local next_idx=2
+
+    # 如果检测到公网IP，显示为选项
+    local has_public_ip=false
+    local public_ip_idx=0
+    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
+        has_public_ip=true
+        public_ip_idx=$next_idx
+        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
+        next_idx=$((next_idx + 1))
+    fi
+
+    # 本机网卡IP
+    local iface_base=$next_idx
     for ((i=0; i<${#local_ips[@]}; i++)); do
         local tag="公网"
         if is_private_ip "${local_ips[$i]}"; then
             tag="内网"
         fi
-        echo "  $((base+i))) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
+        echo "  $((iface_base+i))) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
     done
-    local manual_idx=$((base + ${#local_ips[@]}))
+    next_idx=$((iface_base + ${#local_ips[@]}))
+
+    local manual_idx=$next_idx
     echo "  ${manual_idx}) 手动输入IP"
 
     local choice
@@ -185,13 +224,20 @@ choose_listen_ip() {
     choice=${choice:-1}
 
     if [[ "$choice" == "1" ]]; then
-        echo "0.0.0.0"
+        SELECTED_LISTEN_IP="0.0.0.0"
         return 0
     fi
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge "$base" ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-        local idx=$((choice - base))
-        echo "${local_ips[$idx]}"
+    # 公网IP选项
+    if $has_public_ip && [[ "$choice" == "$public_ip_idx" ]]; then
+        SELECTED_LISTEN_IP="$PUBLIC_IP_CACHE"
+        return 0
+    fi
+
+    # 网卡IP选项
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge "$iface_base" ]] && [[ "$choice" -lt "$manual_idx" ]]; then
+        local idx=$((choice - iface_base))
+        SELECTED_LISTEN_IP="${local_ips[$idx]}"
         return 0
     fi
 
@@ -200,14 +246,15 @@ choose_listen_ip() {
             local manual_ip
             read -r -p "请输入监听IP: " manual_ip
             if [[ "$manual_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                echo "$manual_ip"
+                SELECTED_LISTEN_IP="$manual_ip"
                 return 0
             fi
             print_error "IP格式错误"
         done
     fi
 
-    echo "0.0.0.0"
+    print_warn "无效选择，已使用默认监听IP: 0.0.0.0"
+    SELECTED_LISTEN_IP="0.0.0.0"
 }
 
 # ---------- 加载规则配置 ----------
@@ -461,7 +508,8 @@ do_add() {
         echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
 
         local listen_ip
-        listen_ip=$(choose_listen_ip)
+        choose_listen_ip
+        listen_ip="$SELECTED_LISTEN_IP"
 
         local src_port src_meta src_type src_start src_end
         while true; do
@@ -643,9 +691,15 @@ do_list() {
     print_rules_table
 
     echo -e "${BOLD}${BLUE}[ 本机IP（公网/内网） ]${NC}"
+    detect_public_ip
+    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" ]]; then
+        echo -e "  - ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
+    else
+        echo -e "  - ${RED}公网IP检测失败${NC}"
+    fi
     get_local_ipv4_list
     if [[ ${#local_ips[@]} -eq 0 ]]; then
-        echo "  (未检测到全局IPv4地址)"
+        echo "  (未检测到本机网卡IPv4地址)"
     else
         for ((i=0; i<${#local_ips[@]}; i++)); do
             local tag="公网"
@@ -762,6 +816,13 @@ show_menu() {
         echo -e "  开机自启: ${GREEN}● 已启用${NC}"
     else
         echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+    fi
+
+    detect_public_ip
+    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" ]]; then
+        echo -e "  公网IP:   ${GREEN}${PUBLIC_IP_CACHE}${NC}"
+    else
+        echo -e "  公网IP:   ${RED}${PUBLIC_IP_CACHE}${NC}"
     fi
     echo ""
 
