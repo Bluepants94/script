@@ -16,3 +16,7 @@ bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward.sh)
 ```
+# HTTP代理
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy.sh)
+```
