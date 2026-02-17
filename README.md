@@ -20,3 +20,7 @@ bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy.sh)
 ```
+# 流量消耗器
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/traffic_consumer.sh)
+```
