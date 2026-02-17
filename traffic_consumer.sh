@@ -25,6 +25,7 @@ LOG_FILE="/tmp/traffic_consumer.log"
 CONFIG_FILE="/tmp/traffic_consumer.conf"
 SERVICE_NAME="traffic-consumer.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_TMP_PATH="/tmp/${SERVICE_NAME}"
 
 DEFAULT_TARGET_MB_PER_HOUR=50
 TARGET_MB_PER_HOUR="$DEFAULT_TARGET_MB_PER_HOUR"
@@ -268,26 +269,8 @@ start_consumer() {
 }
 
 stop_consumer() {
-  cleanup_stale_pid
-
-  if ! is_running; then
-    print_warn "当前未运行。"
-    return 0
-  fi
-
-  local pid
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-
-  if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
-    kill "$pid" >/dev/null 2>&1 || true
-    sleep 1
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill -9 "$pid" >/dev/null 2>&1 || true
-    fi
-    print_ok "已关闭流量消耗器（PID: ${pid}）。"
-  fi
-
-  rm -f "$PID_FILE"
+  # 按需求：关闭时同时清理进程、自启、systemd 文件、配置和日志
+  full_cleanup
 }
 
 install_systemd_service() {
@@ -295,10 +278,7 @@ install_systemd_service() {
     print_warn "脚本路径含空格，可能导致 systemd ExecStart 解析异常。"
   fi
 
-  local service_tmp
-  service_tmp="/tmp/${SERVICE_NAME}"
-
-  cat > "$service_tmp" <<EOF_SERVICE
+  cat > "$SERVICE_TMP_PATH" <<EOF_SERVICE
 [Unit]
 Description=Traffic Consumer (50MB/hour)
 After=network-online.target
@@ -315,7 +295,7 @@ WantedBy=multi-user.target
 EOF_SERVICE
 
   print_info "写入 systemd 服务文件（需要 sudo 权限）..."
-  sudo cp "$service_tmp" "$SERVICE_PATH"
+  sudo cp "$SERVICE_TMP_PATH" "$SERVICE_PATH"
   sudo chmod 644 "$SERVICE_PATH"
   sudo systemctl daemon-reload
   sudo systemctl enable "$SERVICE_NAME"
@@ -324,14 +304,54 @@ EOF_SERVICE
   print_info "如需立即启动可执行：sudo systemctl start ${SERVICE_NAME}"
 }
 
-uninstall_systemd_service() {
-  print_info "关闭并移除 systemd 自启（需要 sudo 权限）..."
+remove_systemd_service() {
+  print_info "移除 systemd 服务与自启（需要 sudo 权限）..."
   sudo systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   sudo systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   sudo rm -f "$SERVICE_PATH"
   sudo systemctl daemon-reload
+}
 
-  print_ok "开机自启已关闭。"
+cleanup_generated_files() {
+  rm -f "$PID_FILE" "$LOG_FILE" "$CONFIG_FILE" "$SERVICE_TMP_PATH"
+  print_ok "已清理脚本产生的本地文件（PID/LOG/CONFIG/TMP）。"
+}
+
+full_cleanup() {
+  local was_running=0
+
+  cleanup_stale_pid
+  if is_running; then
+    was_running=1
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+      sleep 1
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
+      print_ok "已停止流量消耗器（PID: ${pid}）。"
+    fi
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    remove_systemd_service || print_warn "移除 systemd 服务失败，请手动用 sudo 检查。"
+  else
+    print_warn "未检测到 systemctl，跳过 systemd 清理。"
+  fi
+
+  cleanup_generated_files
+
+  if [ "$was_running" -eq 0 ]; then
+    print_info "进程原本未运行。"
+  fi
+  print_ok "已完成关闭与清理（含自启、systemd 文件、配置和日志）。"
+}
+
+uninstall_systemd_service() {
+  # 按需求：关闭自启时也执行完整清理
+  full_cleanup
 }
 
 show_status() {
@@ -372,9 +392,9 @@ show_usage() {
 用法：
   ./traffic_consumer.sh                # 交互式菜单 UI
   ./traffic_consumer.sh start [MB]     # 开启（可指定每小时MB，不指定则交互输入）
-  ./traffic_consumer.sh stop           # 关闭
+  ./traffic_consumer.sh stop           # 关闭并清理全部文件（含systemd）
   ./traffic_consumer.sh enable-auto    # 开机自启（systemd）
-  ./traffic_consumer.sh disable-auto   # 关闭自启
+  ./traffic_consumer.sh disable-auto   # 关闭自启并清理全部文件（含systemd）
   ./traffic_consumer.sh status         # 查看状态
 
 可选依赖：
