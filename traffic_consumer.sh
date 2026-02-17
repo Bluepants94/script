@@ -4,31 +4,20 @@
 # 流量消耗器（Linux Bash + 终端菜单 UI）
 # ============================================================
 # 功能：
-#   1) 开启（可自定义每小时目标流量 MB）
+#   1) 开启（输入每小时目标流量，必须为 100MB 的倍数）
 #   2) 关闭（同时清理所有脚本产生的文件）
 #   3) 开机自启（systemd）
 #   4) 关闭自启（同时清理所有脚本产生的文件）
 #   5) 状态查看
 #
-# 流量来源：
-#   - 优先 speedtest-cli（若已安装）
-#   - 失败自动切换 curl 分片下载（更可控）
-#
-# 依赖：
-#   必需：curl, bash, nohup
-#   可选：speedtest-cli（pip install speedtest-cli）
+# 流量来源：curl 下载 100MB 测试文件
+# 依赖：curl（启动时自动检测并安装）
 #
 # 用法：
 #   chmod +x traffic_consumer.sh
-#   ./traffic_consumer.sh              # 交互式菜单
-#   ./traffic_consumer.sh start [MB]   # 开启
-#   ./traffic_consumer.sh stop         # 关闭并清理
-#   ./traffic_consumer.sh enable-auto  # 开机自启
-#   ./traffic_consumer.sh disable-auto # 关闭自启并清理
-#   ./traffic_consumer.sh status       # 查看状态
+#   ./traffic_consumer.sh
 # ============================================================
 
-# 不使用 set -e，守护进程需要容忍子命令失败
 set -uo pipefail
 
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -40,9 +29,18 @@ SERVICE_NAME="traffic-consumer.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 SERVICE_TMP_PATH="/tmp/${SERVICE_NAME}"
 
-DEFAULT_TARGET_MB_PER_HOUR=50
+DEFAULT_TARGET_MB_PER_HOUR=100
 TARGET_MB_PER_HOUR="$DEFAULT_TARGET_MB_PER_HOUR"
-CHUNK_MB=5
+
+# 每次下载 100MB，按次数拆分
+CHUNK_MB=100
+
+# 下载源（优先级从高到低）
+DOWNLOAD_URLS=(
+  "http://ipv4.download.thinkbroadband.com/100MB.zip"
+  "http://proof.ovh.net/files/100Mb.dat"
+  "http://speedtest.tele2.net/100MB.zip"
+)
 
 # ---- 颜色 ----
 RED='\033[0;31m'
@@ -56,10 +54,84 @@ print_ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
 print_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 print_err()  { echo -e "${RED}[ERR]${NC} $1"; }
 
+# ---- 包管理器检测 ----
+
+detect_pkg_manager() {
+  if command -v apt-get >/dev/null 2>&1; then echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then echo "yum"
+  elif command -v pacman >/dev/null 2>&1; then echo "pacman"
+  elif command -v apk >/dev/null 2>&1; then echo "apk"
+  else echo ""
+  fi
+}
+
+# ---- 依赖安装 ----
+
+install_curl() {
+  local pm
+  pm="$(detect_pkg_manager)"
+  print_info "正在安装 curl..."
+  case "$pm" in
+    apt)    sudo apt-get update -qq && sudo apt-get install -y -qq curl ;;
+    dnf)    sudo dnf install -y -q curl ;;
+    yum)    sudo yum install -y -q curl ;;
+    pacman) sudo pacman -Sy --noconfirm curl ;;
+    apk)    sudo apk add --no-cache curl ;;
+    *)
+      print_err "未识别的包管理器，请手动安装 curl。"
+      return 1
+      ;;
+  esac
+  if command -v curl >/dev/null 2>&1; then
+    print_ok "curl 安装成功。"
+    return 0
+  fi
+  print_err "curl 安装失败。"
+  return 1
+}
+
+check_and_install_deps() {
+  if command -v curl >/dev/null 2>&1; then
+    print_ok "curl 已安装。"
+  else
+    print_warn "curl 未安装，正在自动安装..."
+    if ! install_curl; then
+      print_err "curl 是必需依赖，无法继续。"
+      return 1
+    fi
+  fi
+
+  # 测试网络连通性
+  print_info "测试网络连通性..."
+  local test_ok=0
+  local test_url
+  for test_url in "${DOWNLOAD_URLS[@]}"; do
+    local http_code
+    http_code="$(timeout 15 curl -sL -o /dev/null -w '%{http_code}' --range '0-1023' "$test_url" 2>/dev/null || echo '000')"
+    if [ "$http_code" = "200" ] || [ "$http_code" = "206" ]; then
+      print_ok "网络连通：$test_url（HTTP $http_code）"
+      test_ok=1
+      break
+    fi
+  done
+
+  if [ "$test_ok" -eq 0 ]; then
+    print_warn "所有下载源连通性测试失败，流量消耗可能无法正常工作。请检查网络。"
+  fi
+
+  return 0
+}
+
 # ---- 工具函数 ----
 
 is_positive_int() {
   [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+is_multiple_of_100() {
+  local v="${1:-0}"
+  is_positive_int "$v" && [ $((v % 100)) -eq 0 ]
 }
 
 load_target_mb_config() {
@@ -67,7 +139,7 @@ load_target_mb_config() {
   if [ -f "$CONFIG_FILE" ]; then
     local v
     v="$(tr -d '[:space:]' < "$CONFIG_FILE" 2>/dev/null || true)"
-    if is_positive_int "$v"; then
+    if is_multiple_of_100 "$v"; then
       TARGET_MB_PER_HOUR="$v"
     fi
   fi
@@ -77,29 +149,19 @@ save_target_mb_config() {
   echo "$1" > "$CONFIG_FILE"
 }
 
-# 交互式提示输入 MB 值
-# 注意：所有提示/警告输出到 stderr，只有最终有效值 echo 到 stdout
 prompt_target_mb() {
   load_target_mb_config
   local default_mb="$TARGET_MB_PER_HOUR"
   local input
   while true; do
-    read -r -p "请输入每小时目标流量（MB，默认 ${default_mb}）: " input </dev/tty
+    read -r -p "请输入每小时目标流量（必须为 100MB 的倍数，默认 ${default_mb}）: " input </dev/tty
     input="${input:-$default_mb}"
-    if is_positive_int "$input"; then
+    if is_multiple_of_100 "$input"; then
       echo "$input"
       return 0
     fi
-    echo -e "${YELLOW}[WARN]${NC} 请输入大于 0 的整数（单位 MB）。" >&2
+    echo -e "${YELLOW}[WARN]${NC} 请输入 100 的正整数倍（如 100、200、500、1000）。" >&2
   done
-}
-
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    print_err "缺少命令：$1"
-    return 1
-  fi
-  return 0
 }
 
 is_running() {
@@ -121,90 +183,77 @@ cleanup_stale_pid() {
 
 # ---- 流量消耗核心 ----
 
-consume_with_speedtest() {
-  command -v speedtest-cli >/dev/null 2>&1 || return 1
+# 下载一次 100MB 文件，返回实际下载字节数
+download_100mb() {
+  local url dl_bytes
 
-  print_info "尝试使用 speedtest-cli 消耗流量..."
-  if timeout 180 speedtest-cli --secure --no-upload >/dev/null 2>&1; then
-    print_ok "speedtest-cli 执行成功。"
-    return 0
-  fi
+  for url in "${DOWNLOAD_URLS[@]}"; do
+    dl_bytes="$(timeout 300 curl -L -s \
+      --max-time 240 \
+      --output /dev/null \
+      -w '%{size_download}' \
+      "$url" 2>/dev/null || echo '0')"
 
-  print_warn "speedtest-cli 执行失败。"
+    dl_bytes="${dl_bytes%%.*}"
+    dl_bytes="${dl_bytes:-0}"
+
+    # 至少下载了 50MB 算成功
+    if [ "$dl_bytes" -gt 52428800 ] 2>/dev/null; then
+      echo "$dl_bytes"
+      return 0
+    fi
+  done
+
+  echo "0"
   return 1
 }
 
-consume_with_curl() {
-  need_cmd curl || return 1
-
-  local target_mb="$TARGET_MB_PER_HOUR"
-  local chunk_mb="$CHUNK_MB"
-  local remaining_mb="$target_mb"
-  local piece_idx=0
-  local current_chunk_mb chunk_bytes ok url
-
-  local urls=(
-    "https://speed.hetzner.de/100MB.bin"
-    "https://proof.ovh.net/files/100Mb.dat"
-    "https://download.thinkbroadband.com/100MB.zip"
-  )
-
-  print_info "使用 curl 分片下载，目标约 ${target_mb}MB/小时（每片最多 ${chunk_mb}MB）。"
-
-  while [ "$remaining_mb" -gt 0 ]; do
-    piece_idx=$((piece_idx + 1))
-
-    current_chunk_mb="$chunk_mb"
-    if [ "$remaining_mb" -lt "$chunk_mb" ]; then
-      current_chunk_mb="$remaining_mb"
-    fi
-    chunk_bytes=$((current_chunk_mb * 1024 * 1024))
-
-    ok=0
-    for url in "${urls[@]}"; do
-      # 方式1：Range 下载
-      if timeout 120 curl -L --fail --silent --show-error \
-        --range "0-$((chunk_bytes - 1))" \
-        --output /dev/null "$url" 2>/dev/null; then
-        ok=1
-        break
-      fi
-      # 方式2：流式截取
-      if timeout 120 bash -c "curl -L --fail --silent '$url' 2>/dev/null | head -c ${chunk_bytes} >/dev/null"; then
-        ok=1
-        break
-      fi
-    done
-
-    if [ "$ok" -eq 1 ]; then
-      print_info "第 ${piece_idx} 片完成（约 ${current_chunk_mb}MB）。"
-    else
-      print_warn "第 ${piece_idx} 片失败，跳过。"
-    fi
-
-    remaining_mb=$((remaining_mb - current_chunk_mb))
-    sleep 2
-  done
-
-  print_ok "本小时 curl 流量任务完成（目标约 ${target_mb}MB）。"
-  return 0
-}
-
 consume_once() {
-  local start_ts end_ts
+  local target_mb="$TARGET_MB_PER_HOUR"
+  local times=$((target_mb / CHUNK_MB))
+  local interval=$((3600 / times))
+  local total_downloaded=0
+
+  local start_ts
   start_ts="$(date +%s)"
 
-  if consume_with_speedtest; then
-    print_info "本小时使用 speedtest-cli 模式完成。"
-  else
-    print_warn "speedtest-cli 不可用或失败，切换 curl 模式。"
-    if ! consume_with_curl; then
-      print_err "curl 模式也失败，请检查网络。"
-    fi
-  fi
+  print_info "本轮目标：${target_mb}MB，拆分为 ${times} 次下载（每次 100MB），间隔约 ${interval} 秒。"
 
+  local i
+  for ((i = 1; i <= times; i++)); do
+    print_info "第 ${i}/${times} 次下载开始..."
+
+    local dl_bytes
+    dl_bytes="$(download_100mb)"
+
+    if [ "$dl_bytes" -gt 0 ] 2>/dev/null; then
+      local dl_mb=$((dl_bytes / 1024 / 1024))
+      total_downloaded=$((total_downloaded + dl_mb))
+      print_ok "第 ${i}/${times} 次完成，本次 ${dl_mb}MB，累计 ${total_downloaded}MB。"
+    else
+      print_warn "第 ${i}/${times} 次所有下载源均失败。"
+    fi
+
+    # 如果不是最后一次，等待间隔时间
+    if [ "$i" -lt "$times" ]; then
+      local now elapsed remaining_time wait_s
+      now="$(date +%s)"
+      elapsed=$((now - start_ts))
+      # 计算理想的下一次开始时间
+      remaining_time=$(( i * interval - elapsed ))
+      if [ "$remaining_time" -gt 0 ]; then
+        wait_s="$remaining_time"
+      else
+        wait_s=5
+      fi
+      print_info "等待 ${wait_s} 秒后开始第 $((i + 1)) 次下载..."
+      sleep "$wait_s" || true
+    fi
+  done
+
+  local end_ts
   end_ts="$(date +%s)"
-  print_info "本轮耗时：$((end_ts - start_ts)) 秒。"
+  print_ok "本轮完成。目标 ${target_mb}MB，实际约 ${total_downloaded}MB，耗时 $((end_ts - start_ts)) 秒。"
 }
 
 # ---- 守护进程 ----
@@ -212,7 +261,7 @@ consume_once() {
 daemon_loop() {
   local mb_from_arg="${1:-}"
 
-  if is_positive_int "$mb_from_arg"; then
+  if is_multiple_of_100 "$mb_from_arg"; then
     TARGET_MB_PER_HOUR="$mb_from_arg"
   else
     load_target_mb_config
@@ -225,7 +274,6 @@ daemon_loop() {
   fi
 
   echo "$$" > "$PID_FILE"
-  # 退出时清理 PID 文件
   trap 'rm -f "$PID_FILE"' EXIT INT TERM
 
   print_ok "流量消耗守护进程已启动，PID=$$，目标=${TARGET_MB_PER_HOUR}MB/小时"
@@ -252,19 +300,21 @@ daemon_loop() {
 # ---- 开启 ----
 
 start_consumer() {
-  local mb_input="${1:-}"
-
-  if ! is_positive_int "$mb_input"; then
-    if [ -t 0 ]; then
-      mb_input="$(prompt_target_mb)"
-    else
-      load_target_mb_config
-      mb_input="$TARGET_MB_PER_HOUR"
-    fi
+  # 运行前检查并安装依赖
+  print_info "检查依赖..."
+  if ! check_and_install_deps; then
+    print_err "依赖检查失败，无法启动。"
+    return 1
   fi
+  echo ""
+
+  local mb_input
+  mb_input="$(prompt_target_mb)"
 
   TARGET_MB_PER_HOUR="$mb_input"
   save_target_mb_config "$TARGET_MB_PER_HOUR"
+
+  local times=$((TARGET_MB_PER_HOUR / CHUNK_MB))
 
   cleanup_stale_pid
   if is_running; then
@@ -274,19 +324,21 @@ start_consumer() {
     return 0
   fi
 
-  need_cmd nohup || return 1
-
   nohup bash "$SCRIPT_PATH" daemon "$TARGET_MB_PER_HOUR" >> "$LOG_FILE" 2>&1 &
-  sleep 1
+  sleep 2
 
   if is_running; then
     local pid
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     print_ok "已开启流量消耗器（PID: ${pid}）。"
-    print_info "当前目标流量：${TARGET_MB_PER_HOUR}MB/小时"
+    print_info "目标流量：${TARGET_MB_PER_HOUR}MB/小时（每小时 ${times} 次，每次 100MB）"
     print_info "日志文件：${LOG_FILE}"
   else
     print_err "启动失败，请检查日志：${LOG_FILE}"
+    if [ -f "$LOG_FILE" ]; then
+      echo "--- 最后 5 行日志 ---"
+      tail -n 5 "$LOG_FILE" 2>/dev/null || true
+    fi
     return 1
   fi
 }
@@ -295,7 +347,6 @@ start_consumer() {
 
 kill_process_tree() {
   local pid="$1"
-  # 杀掉整个进程组，确保 curl 等子进程也被终止
   local pgid
   pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
 
@@ -362,7 +413,6 @@ uninstall_systemd_service() {
 # ---- 开机自启 ----
 
 install_systemd_service() {
-  # 如果当前有配置，先保存到 config 以便 daemon 读取
   load_target_mb_config
 
   if [[ "$SCRIPT_PATH" == *" "* ]]; then
@@ -377,7 +427,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash ${SCRIPT_PATH} daemon
+ExecStart=/bin/bash ${SCRIPT_PATH} daemon ${TARGET_MB_PER_HOUR}
 Restart=always
 RestartSec=10
 
@@ -392,7 +442,7 @@ EOF_SERVICE
   sudo systemctl enable "$SERVICE_NAME"
 
   print_ok "开机自启已启用：${SERVICE_NAME}"
-  print_info "当前目标流量：${TARGET_MB_PER_HOUR}MB/小时（从配置文件读取）"
+  print_info "目标流量：${TARGET_MB_PER_HOUR}MB/小时"
   print_info "如需立即启动可执行：sudo systemctl start ${SERVICE_NAME}"
 }
 
@@ -400,6 +450,7 @@ EOF_SERVICE
 
 show_status() {
   load_target_mb_config
+  local times=$((TARGET_MB_PER_HOUR / CHUNK_MB))
 
   echo ""
   echo "==================== 状态 ===================="
@@ -422,7 +473,17 @@ show_status() {
     print_warn "未检测到 systemctl，无法查询自启状态"
   fi
 
-  print_info "目标流量：${TARGET_MB_PER_HOUR}MB/小时"
+  echo ""
+  echo "--- 依赖 ---"
+  if command -v curl >/dev/null 2>&1; then
+    print_ok "curl：已安装"
+  else
+    print_err "curl：未安装（必需）"
+  fi
+
+  echo ""
+  print_info "目标流量：${TARGET_MB_PER_HOUR}MB/小时（每小时 ${times} 次，每次 100MB）"
+  print_info "下载源：${DOWNLOAD_URLS[0]}"
   print_info "PID 文件：${PID_FILE}"
   print_info "日志文件：${LOG_FILE}"
   print_info "配置文件：${CONFIG_FILE}"
@@ -435,26 +496,6 @@ show_status() {
     print_info "暂无日志文件。"
   fi
   echo "================================================="
-}
-
-# ---- 帮助 ----
-
-show_usage() {
-  cat <<'EOF_USAGE'
-用法：
-  ./traffic_consumer.sh                # 交互式菜单 UI
-  ./traffic_consumer.sh start [MB]     # 开启（可指定每小时MB，不指定则交互输入）
-  ./traffic_consumer.sh stop           # 关闭并清理全部文件（含systemd）
-  ./traffic_consumer.sh enable-auto    # 开机自启（systemd）
-  ./traffic_consumer.sh disable-auto   # 关闭自启并清理全部文件（含systemd）
-  ./traffic_consumer.sh status         # 查看状态
-
-可选依赖：
-  speedtest-cli    # pip install speedtest-cli（优先使用，失败自动回退 curl）
-
-必需依赖：
-  curl, bash, nohup
-EOF_USAGE
 }
 
 # ---- 菜单 UI ----
@@ -485,11 +526,7 @@ run_ui() {
     read -r choice
 
     case "${choice:-}" in
-      1)
-        local mb
-        mb="$(prompt_target_mb)"
-        start_consumer "$mb" || true
-        ;;
+      1) start_consumer || true ;;
       2) stop_consumer || true ;;
       3) install_systemd_service || true ;;
       4) uninstall_systemd_service || true ;;
@@ -514,17 +551,8 @@ main() {
   local cmd="${1:-}"
 
   case "$cmd" in
-    "")          run_ui ;;
-    daemon)      daemon_loop "${2:-}" ;;
-    start)       start_consumer "${2:-}" ;;
-    stop)        stop_consumer ;;
-    enable-auto) install_systemd_service ;;
-    disable-auto) uninstall_systemd_service ;;
-    status)      show_status ;;
-    *)
-      show_usage
-      exit 1
-      ;;
+    daemon) daemon_loop "${2:-}" ;;
+    *)      run_ui ;;
   esac
 }
 
