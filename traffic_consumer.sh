@@ -102,21 +102,11 @@ check_and_install_deps() {
     fi
   fi
 
-  # 测试网络连通性
+  # 测试网络连通性（复用统一 URL 轮询函数）
   print_info "测试网络连通性..."
-  local test_ok=0
-  local test_url
-  for test_url in "${DOWNLOAD_URLS[@]}"; do
-    local http_code
-    http_code="$(timeout 15 curl -sL -o /dev/null -w '%{http_code}' --range '0-1023' "$test_url" 2>/dev/null || echo '000')"
-    if [ "$http_code" = "200" ] || [ "$http_code" = "206" ]; then
-      print_ok "网络连通：$test_url（HTTP $http_code）"
-      test_ok=1
-      break
-    fi
-  done
-
-  if [ "$test_ok" -eq 0 ]; then
+  if try_download_from_urls 20 15 0; then
+    print_ok "网络连通性正常。"
+  else
     print_warn "所有下载源连通性测试失败，流量消耗可能无法正常工作。请检查网络。"
   fi
 
@@ -181,65 +171,84 @@ cleanup_stale_pid() {
   fi
 }
 
-# ---- 流量消耗核心 ----
+# ---- 日志管理 ----
 
-# 下载一次 100MB 文件，返回实际下载字节数
-download_100mb() {
-  local url dl_bytes
+# 日志文件超过 5MB 时自动截断，保留最后 500 行
+truncate_log() {
+  if [ -f "$LOG_FILE" ]; then
+    local log_size
+    log_size="$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)"
+    if [ "$log_size" -gt 5242880 ] 2>/dev/null; then
+      local tmp_log="${LOG_FILE}.tmp"
+      tail -n 500 "$LOG_FILE" > "$tmp_log" 2>/dev/null
+      mv -f "$tmp_log" "$LOG_FILE" 2>/dev/null || true
+      print_info "日志文件已截断（保留最后 500 行）。"
+    fi
+  fi
+}
+
+# 统一的 URL 轮询下载函数
+# 参数：
+#   $1: timeout 总超时秒数
+#   $2: curl --max-time 秒数
+#   $3: 是否打印单个 URL 失败日志（1=打印, 0=不打印）
+try_download_from_urls() {
+  local timeout_s="$1"
+  local max_time_s="$2"
+  local log_each_fail="${3:-1}"
+  local url
 
   for url in "${DOWNLOAD_URLS[@]}"; do
-    dl_bytes="$(timeout 300 curl -L -s \
-      --max-time 240 \
+    if timeout "$timeout_s" curl -L -s \
+      --max-time "$max_time_s" \
       --output /dev/null \
-      -w '%{size_download}' \
-      "$url" 2>/dev/null || echo '0')"
-
-    dl_bytes="${dl_bytes%%.*}"
-    dl_bytes="${dl_bytes:-0}"
-
-    # 至少下载了 50MB 算成功
-    if [ "$dl_bytes" -gt 52428800 ] 2>/dev/null; then
-      echo "$dl_bytes"
+      "$url" 2>/dev/null; then
       return 0
+    fi
+
+    if [ "$log_each_fail" = "1" ]; then
+      print_warn "下载失败：$url" >&2
     fi
   done
 
-  echo "0"
   return 1
+}
+
+# ---- 流量消耗核心 ----
+
+# 下载一次 100MB 文件
+# 直接拉取，成功返回 0，失败返回 1
+download_100mb() {
+  try_download_from_urls 300 240 1
 }
 
 consume_once() {
   local target_mb="$TARGET_MB_PER_HOUR"
   local times=$((target_mb / CHUNK_MB))
   local interval=$((3600 / times))
-  local total_downloaded=0
+  local success_count=0
+  local start_ts accumulated_mb
+  local i now elapsed remaining_time wait_s
 
-  local start_ts
   start_ts="$(date +%s)"
 
-  print_info "本轮目标：${target_mb}MB，拆分为 ${times} 次下载（每次 100MB），间隔约 ${interval} 秒。"
+  print_info "本轮目标：${target_mb}MB，拆分为 ${times} 次下载（每次计 100MB），间隔约 ${interval} 秒。"
 
-  local i
   for ((i = 1; i <= times; i++)); do
     print_info "第 ${i}/${times} 次下载开始..."
 
-    local dl_bytes
-    dl_bytes="$(download_100mb)"
-
-    if [ "$dl_bytes" -gt 0 ] 2>/dev/null; then
-      local dl_mb=$((dl_bytes / 1024 / 1024))
-      total_downloaded=$((total_downloaded + dl_mb))
-      print_ok "第 ${i}/${times} 次完成，本次 ${dl_mb}MB，累计 ${total_downloaded}MB。"
+    if download_100mb; then
+      success_count=$((success_count + 1))
+      accumulated_mb=$((success_count * 100))
+      print_ok "第 ${i}/${times} 次完成，累计 ${accumulated_mb}MB（${success_count} 次成功）。"
     else
       print_warn "第 ${i}/${times} 次所有下载源均失败。"
     fi
 
     # 如果不是最后一次，等待间隔时间
     if [ "$i" -lt "$times" ]; then
-      local now elapsed remaining_time wait_s
       now="$(date +%s)"
       elapsed=$((now - start_ts))
-      # 计算理想的下一次开始时间
       remaining_time=$(( i * interval - elapsed ))
       if [ "$remaining_time" -gt 0 ]; then
         wait_s="$remaining_time"
@@ -253,7 +262,8 @@ consume_once() {
 
   local end_ts
   end_ts="$(date +%s)"
-  print_ok "本轮完成。目标 ${target_mb}MB，实际约 ${total_downloaded}MB，耗时 $((end_ts - start_ts)) 秒。"
+  accumulated_mb=$((success_count * 100))
+  print_ok "本轮完成。目标 ${target_mb}MB，实际 ${accumulated_mb}MB（${success_count}/${times} 次成功），耗时 $((end_ts - start_ts)) 秒。"
 }
 
 # ---- 守护进程 ----
@@ -282,6 +292,7 @@ daemon_loop() {
     local round_start now elapsed sleep_s
     round_start="$(date +%s)"
 
+    truncate_log
     print_info "======= 新一轮开始：$(date '+%F %T') ======="
     consume_once || true
 
@@ -383,15 +394,7 @@ full_cleanup() {
   local was_running=0
 
   cleanup_stale_pid
-  if is_running; then
-    was_running=1
-    local pid
-    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ]; then
-      kill_process_tree "$pid"
-      print_ok "已停止流量消耗器（PID: ${pid}）及其子进程。"
-    fi
-  fi
+  stop_runtime_process && was_running=1
 
   remove_systemd_service
   cleanup_generated_files
@@ -400,6 +403,19 @@ full_cleanup() {
     print_info "进程原本未运行。"
   fi
   print_ok "已完成关闭与清理（含自启、systemd 文件、配置和日志）。"
+}
+
+stop_runtime_process() {
+  if is_running; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      kill_process_tree "$pid"
+      print_ok "已停止流量消耗器（PID: ${pid}）及其子进程。"
+      return 0
+    fi
+  fi
+  return 1
 }
 
 stop_consumer() {
@@ -520,17 +536,21 @@ show_menu() {
 }
 
 run_ui() {
+  safe_run() {
+    "$@" || true
+  }
+
   while true; do
     show_banner
     show_menu
     read -r choice
 
     case "${choice:-}" in
-      1) start_consumer || true ;;
-      2) stop_consumer || true ;;
-      3) install_systemd_service || true ;;
-      4) uninstall_systemd_service || true ;;
-      5) show_status || true ;;
+      1) safe_run start_consumer ;;
+      2) safe_run stop_consumer ;;
+      3) safe_run install_systemd_service ;;
+      4) safe_run uninstall_systemd_service ;;
+      5) safe_run show_status ;;
       0)
         print_ok "已退出。"
         exit 0
