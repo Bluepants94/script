@@ -2,7 +2,7 @@
 
 # ============================================================
 #  iptables 端口转发管理脚本（增强版）
-#  功能: 添加/删除/查看/重启 iptables 端口转发规则
+#  功能: 添加/删除/重启 iptables 端口转发规则
 #  支持: 单端口、端口段、一一对应端口段、监听IP区分
 #  持久化: systemd 开机自启 + 规则配置文件
 # ============================================================
@@ -28,6 +28,8 @@ rules_src_port=()
 rules_dst_ip=()
 rules_dst_port=()
 rules_proto=()
+LAST_RESULT_TYPE=""
+LAST_RESULT_MSG=""
 
 # ---------- 工具函数 ----------
 print_banner() {
@@ -35,7 +37,6 @@ print_banner() {
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════╗"
     echo "║      iptables 端口转发管理工具 (增强版)      ║"
-    echo "║   支持监听IP区分 + 端口段一一对应转发        ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -45,10 +46,31 @@ print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
-press_any_key() {
+set_last_result() {
+    LAST_RESULT_TYPE="$1"
+    LAST_RESULT_MSG="$2"
+}
+
+show_last_result() {
+    [[ -z "$LAST_RESULT_MSG" ]] && return
+    case "$LAST_RESULT_TYPE" in
+        success) print_success "$LAST_RESULT_MSG" ;;
+        warn) print_warn "$LAST_RESULT_MSG" ;;
+        error) print_error "$LAST_RESULT_MSG" ;;
+        *) print_info "$LAST_RESULT_MSG" ;;
+    esac
     echo ""
-    read -n 1 -s -r -p "按任意键返回主菜单..."
-    echo ""
+    LAST_RESULT_TYPE=""
+    LAST_RESULT_MSG=""
+}
+
+proto_to_label() {
+    case "$1" in
+        tcp) echo "TCP" ;;
+        udp) echo "UDP" ;;
+        both) echo "TCP+UDP" ;;
+        *) echo "$1" ;;
+    esac
 }
 
 repeat_char() {
@@ -190,8 +212,8 @@ choose_listen_ip() {
     detect_public_ip
 
     echo ""
-    echo -e "${CYAN}请选择监听IP（用于区分公网/内网入口）:${NC}"
-    echo "  1) 0.0.0.0 (所有IP，公网+内网都匹配，默认)"
+    echo -e "${CYAN}请选择监听IP（公网/内网）:${NC}"
+    echo "  1) 0.0.0.0 (公网+内网，默认)"
 
     local next_idx=2
 
@@ -218,10 +240,15 @@ choose_listen_ip() {
 
     local manual_idx=$next_idx
     echo "  ${manual_idx}) 手动输入IP"
+    echo -e "  ${NC}0) 返回主菜单${NC}"
 
     local choice
-    read -r -p "请选择 [1-${manual_idx}]（默认: 1）: " choice
+    read -r -p "请选择 [0-${manual_idx}]（默认: 1）: " choice
     choice=${choice:-1}
+
+    if [[ "$choice" == "0" ]]; then
+        return 1
+    fi
 
     if [[ "$choice" == "1" ]]; then
         SELECTED_LISTEN_IP="0.0.0.0"
@@ -306,36 +333,18 @@ EOF_CONF
 }
 
 # ---------- 应用 iptables 规则 ----------
+apply_rules_core() {
+    [[ -x "$SCRIPT_INSTALL_PATH" ]] || create_apply_script
+    "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
+}
+
 apply_rules() {
-    iptables -t nat -F PREROUTING 2>/dev/null
-    iptables -t nat -F POSTROUTING 2>/dev/null
-    iptables -t nat -A POSTROUTING -j MASQUERADE
-
-    for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local listen_ip="${rules_listen_ip[$i]}"
-        local src="${rules_src_port[$i]}"
-        local dst_ip="${rules_dst_ip[$i]}"
-        local dst_port="${rules_dst_port[$i]}"
-        local proto="${rules_proto[$i]}"
-
-        local dport
-        dport=$(to_iptables_dport "$src")
-
-        local dst_addr="${dst_ip}:${dst_port}"
-        local match_dst=""
-        if [[ "$listen_ip" != "0.0.0.0" ]]; then
-            match_dst="-d ${listen_ip}"
-        fi
-
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p tcp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p udp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
-        fi
-    done
-
-    print_success "iptables 规则已应用 (共 ${#rules_src_port[@]} 条转发)"
+    if apply_rules_core; then
+        print_success "iptables 规则已应用 (共 ${#rules_src_port[@]} 条转发)"
+        return 0
+    fi
+    print_error "iptables 规则应用失败，请检查系统环境或规则配置"
+    return 1
 }
 
 # ---------- 创建应用规则脚本（供 systemd 调用） ----------
@@ -405,7 +414,8 @@ SCRIPT_EOF
 create_service() {
     create_apply_script
 
-    cat > "$SERVICE_FILE" <<EOF_SVC
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        cat > "$SERVICE_FILE" <<EOF_SVC
 [Unit]
 Description=iptables Port Forwarding Rules
 After=network.target network-online.target
@@ -420,17 +430,25 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_SVC
 
-    systemctl daemon-reload
-    systemctl enable iptables-forward.service 2>/dev/null
+        systemctl daemon-reload
+    fi
+
+    if ! systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
+        systemctl enable iptables-forward.service 2>/dev/null
+    fi
     print_success "已创建 systemd 服务并设置开机自启"
 }
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
     save_rules
-    apply_rules
     create_apply_script
-    print_success "规则已自动保存并应用！"
+    if apply_rules; then
+        print_success "规则已自动保存并应用！"
+        return 0
+    fi
+    print_error "规则已保存，但应用失败，请检查 iptables 环境"
+    return 1
 }
 
 # ---------- 打印规则表格 ----------
@@ -445,13 +463,8 @@ print_rules_table() {
         local idx=$((i + 1))
         local idx_len=$(( ${#idx} + 2 ))
         local dst_str="${rules_dst_ip[$i]}:${rules_dst_port[$i]}"
-        local proto_str=""
-        case "${rules_proto[$i]}" in
-            tcp) proto_str="TCP" ;;
-            udp) proto_str="UDP" ;;
-            both) proto_str="TCP+UDP" ;;
-            *) proto_str="${rules_proto[$i]}" ;;
-        esac
+        local proto_str
+        proto_str=$(proto_to_label "${rules_proto[$i]}")
 
         (( idx_len > w_idx )) && w_idx=$idx_len
         (( ${#rules_listen_ip[$i]} > w_lip )) && w_lip=${#rules_listen_ip[$i]}
@@ -471,13 +484,8 @@ print_rules_table() {
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local idx=$((i + 1))
         local dst_str="${rules_dst_ip[$i]}:${rules_dst_port[$i]}"
-        local proto_str=""
-        case "${rules_proto[$i]}" in
-            tcp) proto_str="TCP" ;;
-            udp) proto_str="UDP" ;;
-            both) proto_str="TCP+UDP" ;;
-            *) proto_str="${rules_proto[$i]}" ;;
-        esac
+        local proto_str
+        proto_str=$(proto_to_label "${rules_proto[$i]}")
 
         local col_idx col_lip col_src col_dst col_proto
         col_idx=$(printf "%-${w_idx}s" "[$idx]")
@@ -491,6 +499,21 @@ print_rules_table() {
     echo ""
 }
 
+# ---------- 按首页样式打印规则 ----------
+print_rules_home_style() {
+    if [[ ${#rules_src_port[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}(暂无转发规则)${NC}"
+        return
+    fi
+
+    for ((i=0; i<${#rules_src_port[@]}; i++)); do
+        local proto_str
+        proto_str=$(proto_to_label "${rules_proto[$i]}")
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})"
+    done
+    echo ""
+}
+
 # ---------- 添加转发规则 ----------
 do_add() {
     print_banner
@@ -500,17 +523,21 @@ do_add() {
     load_rules
     if [[ ${#rules_src_port[@]} -gt 0 ]]; then
         echo -e "${BOLD}${BLUE}当前已有规则:${NC}"
-        print_rules_table
+        print_rules_home_style
     fi
 
     while true; do
         echo ""
         echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
 
+        # 选择监听IP
         local listen_ip
-        choose_listen_ip
+        if ! choose_listen_ip; then
+            return
+        fi
         listen_ip="$SELECTED_LISTEN_IP"
 
+        # 输入源端口
         local src_port src_meta src_type src_start src_end
         while true; do
             read -r -p "请输入源端口（单端口如 8080，端口段如 8000-9000）: " src_port
@@ -522,6 +549,7 @@ do_add() {
             break
         done
 
+        # 输入目标IP
         local dst_ip
         while true; do
             read -r -p "请输入目标IP（可内网IP，如 192.168.1.100）: " dst_ip
@@ -531,6 +559,7 @@ do_add() {
             print_error "IP格式错误"
         done
 
+        # 输入目标端口
         local dst_port_input dst_port dst_meta dst_type dst_start dst_end
         while true; do
             read -r -p "请输入目标端口（单端口/端口段，回车=与源端口相同）: " dst_port_input
@@ -562,6 +591,7 @@ do_add() {
             print_error "单端口必须对应单端口；端口段必须对应端口段"
         done
 
+        # 选择协议
         local proto proto_choice
         echo ""
         echo -e "${CYAN}选择转发协议:${NC}"
@@ -576,11 +606,7 @@ do_add() {
         esac
 
         local proto_display
-        case "$proto" in
-            tcp) proto_display="TCP" ;;
-            udp) proto_display="UDP" ;;
-            both) proto_display="TCP+UDP" ;;
-        esac
+        proto_display=$(proto_to_label "$proto")
 
         echo ""
         echo -e "${GREEN}即将添加转发:${NC}"
@@ -600,11 +626,9 @@ do_add() {
         echo ""
         read -r -p "是否继续添加？[y/N]: " continue_add
         if [[ "$continue_add" != "y" && "$continue_add" != "Y" ]]; then
-            break
+            return
         fi
     done
-
-    press_any_key
 }
 
 # ---------- 删除转发规则 ----------
@@ -616,12 +640,11 @@ do_delete() {
     load_rules
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
         print_warn "当前没有转发规则"
-        press_any_key
         return
     fi
 
     echo -e "${BOLD}${BLUE}当前转发规则:${NC}"
-    print_rules_table
+    print_rules_home_style
 
     while true; do
         echo ""
@@ -629,7 +652,7 @@ do_delete() {
         read -r -p "请选择: " del_input
 
         if [[ "$del_input" == "0" ]]; then
-            break
+            return
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
@@ -640,7 +663,7 @@ do_delete() {
             rules_proto=()
             auto_save_and_apply
             print_success "已删除全部转发规则！"
-            break
+            return
         fi
 
         if [[ ! "$del_input" =~ ^[0-9]+$ ]] || [[ "$del_input" -lt 1 ]] || [[ "$del_input" -gt ${#rules_src_port[@]} ]]; then
@@ -670,87 +693,35 @@ do_delete() {
 
         echo ""
         echo -e "${BOLD}${BLUE}剩余规则:${NC}"
-        print_rules_table
+        print_rules_home_style
 
         read -r -p "是否继续删除？[y/N]: " continue_del
         if [[ "$continue_del" != "y" && "$continue_del" != "Y" ]]; then
-            break
+            return
         fi
     done
-
-    press_any_key
-}
-
-# ---------- 查看当前规则 ----------
-do_list() {
-    print_banner
-    echo -e "${BOLD}${BLUE}[ 当前转发规则 ]${NC}"
-    echo ""
-
-    load_rules
-    print_rules_table
-
-    echo -e "${BOLD}${BLUE}[ 本机IP（公网/内网） ]${NC}"
-    detect_public_ip
-    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" ]]; then
-        echo -e "  - ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
-    else
-        echo -e "  - ${RED}公网IP检测失败${NC}"
-    fi
-    get_local_ipv4_list
-    if [[ ${#local_ips[@]} -eq 0 ]]; then
-        echo "  (未检测到本机网卡IPv4地址)"
-    else
-        for ((i=0; i<${#local_ips[@]}; i++)); do
-            local tag="公网"
-            if is_private_ip "${local_ips[$i]}"; then
-                tag="内网"
-            fi
-            echo "  - ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
-        done
-    fi
-
-    echo ""
-    echo -e "${BOLD}${BLUE}[ iptables NAT 表规则 ]${NC}"
-    iptables -t nat -L PREROUTING -n --line-numbers 2>/dev/null | head -50
-    echo ""
-
-    local ip_forward
-    ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)
-    if [[ "$ip_forward" == "1" ]]; then
-        echo -e "  IP 转发状态: ${GREEN}已开启${NC}"
-    else
-        echo -e "  IP 转发状态: ${RED}未开启${NC}"
-    fi
-
-    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
-        echo -e "  开机自启:     ${GREEN}已启用${NC}"
-    else
-        echo -e "  开机自启:     ${YELLOW}未启用${NC}"
-    fi
-
-    echo ""
-    press_any_key
 }
 
 # ---------- 重启 iptables 转发 ----------
 do_restart() {
-    print_banner
-    echo -e "${BOLD}${BLUE}[ 重启 iptables 转发 ]${NC}"
-    echo ""
-
     load_rules
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        print_warn "当前没有转发规则，清除 NAT 规则"
-        iptables -t nat -F PREROUTING 2>/dev/null
-        iptables -t nat -F POSTROUTING 2>/dev/null
-        iptables -t nat -A POSTROUTING -j MASQUERADE
-        print_success "NAT 规则已清空"
+        if iptables -t nat -F PREROUTING 2>/dev/null \
+            && iptables -t nat -F POSTROUTING 2>/dev/null \
+            && iptables -t nat -A POSTROUTING -j MASQUERADE; then
+            set_last_result "success" "重启完成：当前无转发规则，NAT 已清空"
+        else
+            set_last_result "error" "重启失败：清理 NAT 规则时发生错误"
+        fi
     else
-        apply_rules
+        if apply_rules_core; then
+            set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则"
+        else
+            set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
+        fi
     fi
 
-    press_any_key
+    return
 }
 
 # ---------- 管理开机自启 ----------
@@ -794,12 +765,13 @@ do_autostart() {
         esac
     fi
 
-    press_any_key
+    return
 }
 
 # ---------- 主菜单 ----------
 show_menu() {
     print_banner
+    show_last_result
 
     load_rules
     local rule_count=${#rules_src_port[@]}
@@ -828,27 +800,17 @@ show_menu() {
 
     if [[ $rule_count -gt 0 ]]; then
         echo -e "${BOLD}${BLUE}当前转发:${NC}"
-        for ((i=0; i<${#rules_src_port[@]}; i++)); do
-            local proto_str=""
-            case "${rules_proto[$i]}" in
-                tcp) proto_str="TCP" ;;
-                udp) proto_str="UDP" ;;
-                both) proto_str="TCP+UDP" ;;
-            esac
-            echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})"
-        done
-        echo ""
+        print_rules_home_style
     fi
 
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
-    echo -e "  ${BLUE}3)${NC} 查看当前规则"
-    echo -e "  ${CYAN}4)${NC} 重启 iptables 转发"
-    echo -e "  ${YELLOW}5)${NC} 开机自启管理"
+    echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
+    echo -e "  ${YELLOW}4)${NC} 开机自启管理"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    read -r -p "请选择操作 [0-5]: " choice
+    read -r -p "请选择操作 [0-4]: " choice
 }
 
 # ---------- 主入口 ----------
@@ -862,16 +824,15 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_list ;;
-            4) do_restart ;;
-            5) do_autostart ;;
+            3) do_restart ;;
+            4) do_autostart ;;
             0)
                 echo ""
                 print_info "再见！"
                 exit 0
                 ;;
             *)
-                print_error "无效选择，请输入 0-5"
+                print_error "无效选择，请输入 0-4"
                 sleep 1
                 ;;
         esac
