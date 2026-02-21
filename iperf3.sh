@@ -159,7 +159,8 @@ select_listen_ip() {
   local ips ip
   local private_ips=()
   local public_ip=""
-  local options=()
+  local private_choice="---.---.---.---"
+  local public_choice="---.---.---.---"
 
   mapfile -t ips < <(collect_local_ipv4)
 
@@ -171,43 +172,51 @@ select_listen_ip() {
 
   public_ip="$(detect_public_ipv4)"
 
+  if [ "${#private_ips[@]}" -gt 0 ]; then
+    private_choice="${private_ips[0]}"
+  fi
+
+  if [ -n "$public_ip" ]; then
+    public_choice="$public_ip"
+  fi
+
   echo ""
   echo "请选择监听 IP："
 
-  if [ "${#private_ips[@]}" -gt 0 ]; then
-    for ip in "${private_ips[@]}"; do
-      options+=("$ip")
-      echo "  ${#options[@]}) ${ip} (内网IP)"
-    done
-  else
-    echo "  - 内网IP: 无"
-  fi
-
-  options+=("127.0.0.1")
-  echo "  ${#options[@]}) 127.0.0.1"
-
-  options+=("0.0.0.0")
-  echo "  ${#options[@]}) 0.0.0.0"
-
-  if [ -n "$public_ip" ]; then
-    options+=("$public_ip")
-    echo "  ${#options[@]}) ${public_ip} (公网IP)"
-  else
-    echo "  - 公网IP: 无"
-  fi
-
-  if [ "${#options[@]}" -eq 0 ]; then
-    err "无可选监听地址。"
-    return 1
-  fi
+  echo "  1) 127.0.0.1"
+  echo "  2) 0.0.0.0"
+  echo "  3) ${private_choice} (内网IP)"
+  echo "  4) ${public_choice} (公网IP)"
 
   read -r -p "输入选项编号: " ip_choice
-  if ! [[ "$ip_choice" =~ ^[0-9]+$ ]] || [ "$ip_choice" -lt 1 ] || [ "$ip_choice" -gt "${#options[@]}" ]; then
+  if ! [[ "$ip_choice" =~ ^[0-9]+$ ]] || [ "$ip_choice" -lt 1 ] || [ "$ip_choice" -gt 4 ]; then
     err "无效选项。"
     return 1
   fi
 
-  LISTEN_IP="${options[$((ip_choice - 1))]}"
+  case "$ip_choice" in
+    1)
+      LISTEN_IP="127.0.0.1"
+      ;;
+    2)
+      LISTEN_IP="0.0.0.0"
+      ;;
+    3)
+      if [ "$private_choice" = "---.---.---.---" ]; then
+        err "当前无可用内网IP，请选择其他选项。"
+        return 1
+      fi
+      LISTEN_IP="$private_choice"
+      ;;
+    4)
+      if [ "$public_choice" = "---.---.---.---" ]; then
+        err "当前无可用公网IP，请选择其他选项。"
+        return 1
+      fi
+      LISTEN_IP="$public_choice"
+      ;;
+  esac
+
   LISTEN_PORT="$DEFAULT_PORT"
 
   save_selected_config
