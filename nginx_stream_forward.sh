@@ -47,6 +47,10 @@ print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
+is_yes() {
+    [[ "$1" == "y" || "$1" == "Y" ]]
+}
+
 set_last_result() {
     LAST_RESULT_TYPE="$1"
     LAST_RESULT_MSG="$2"
@@ -409,6 +413,49 @@ remove_backup() {
     [[ -f "$BACKUP_FILE" ]] && rm -f "$BACKUP_FILE"
 }
 
+# ---------- 添加失败后的统一回滚 ----------
+rollback_to_previous_or_default() {
+    local had_config_before="$1"
+
+    if [[ "$had_config_before" == "true" ]]; then
+        restore_config
+    else
+        if ! download_default_proxy_conf; then
+            write_base_config_header
+        fi
+        remove_backup
+    fi
+}
+
+# ---------- 清理多余空行 ----------
+tidy_config_spacing() {
+    [[ ! -f "$CONFIG_FILE" ]] && return 0
+
+    local temp_file="${CONFIG_FILE}.tidy"
+    awk '
+    BEGIN { blank=0; started=0 }
+    {
+        line=$0
+        sub(/[[:space:]]+$/, "", line)
+
+        if (line ~ /^[[:space:]]*$/) {
+            if (!started) next
+            blank++
+            if (blank > 1) next
+            print ""
+            next
+        }
+
+        started=1
+        blank=0
+        print line
+    }
+    ' "$CONFIG_FILE" > "$temp_file" || return 1
+
+    mv "$temp_file" "$CONFIG_FILE" || return 1
+    return 0
+}
+
 # ---------- 打印规则列表（首页样式） ----------
 print_rules_home_style() {
     if [[ ${#rule_nodes[@]} -eq 0 ]]; then
@@ -425,32 +472,6 @@ print_rules_home_style() {
         echo -e "  ${GREEN}[$((i+1))]${NC} ${GREEN}${rule_nodes[$i]}${NC} ${YELLOW}${rule_ports[$i]}${NC} → ${CYAN}${rule_targets[$i]}${NC} ${YELLOW}(TCP+UDP)${NC}${wl_info}"
     done
     echo ""
-}
-
-# ---------- 打印规则详情 ----------
-print_rules_detail() {
-    if [[ ${#rule_nodes[@]} -eq 0 ]]; then
-        echo -e "  ${YELLOW}(暂无转发规则)${NC}"
-        return
-    fi
-
-    for ((i=0; i<${#rule_nodes[@]}; i++)); do
-        echo -e "${BOLD}${CYAN}规则 #$((i+1))${NC}"
-        echo -e "  节点名称: ${GREEN}${rule_nodes[$i]}${NC}"
-        echo -e "  转发目标: ${GREEN}${rule_targets[$i]}${NC}"
-        echo -e "  监听端口: ${YELLOW}${rule_ports[$i]}${NC} (TCP+UDP)"
-        
-        if [[ -n "${rule_whitelists[$i]}" ]]; then
-            echo -e "  白名单:"
-            IFS=',' read -ra ADDR <<< "${rule_whitelists[$i]}"
-            for ip in "${ADDR[@]}"; do
-                echo -e "    ${GREEN}✓${NC} $ip"
-            done
-        else
-            echo -e "  白名单: ${YELLOW}未配置${NC}"
-        fi
-        echo ""
-    done
 }
 
 # ---------- 删除指定规则 ----------
@@ -622,7 +643,7 @@ do_add() {
     read -r -p "是否配置白名单？[Y/N]: " setup_whitelist
     
     local whitelist=""
-    if [[ "$setup_whitelist" == "y" || "$setup_whitelist" == "Y" ]]; then
+    if is_yes "$setup_whitelist"; then
         echo -e "${CYAN}请输入白名单 IP/网段:${NC}"
         local wl_count=1
         while true; do
@@ -647,7 +668,7 @@ do_add() {
 
             local add_more
             read -r -p "是否继续添加 allow？[Y/N]: " add_more
-            if [[ "$add_more" == "n" || "$add_more" == "N" ]]; then
+            if ! is_yes "$add_more"; then
                 break
             fi
         done
@@ -672,7 +693,7 @@ do_add() {
     
     echo ""
     read -r -p "确认添加？[Y/N]: " confirm
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    if ! is_yes "$confirm"; then
         print_warn "已取消添加"
         return
     fi
@@ -691,15 +712,14 @@ do_add() {
 
     # 添加规则
     if ! add_forwarding_rule "$node" "$target" "$port" "$whitelist"; then
-        if $had_config_before; then
-            restore_config
-        else
-            if ! download_default_proxy_conf; then
-                write_base_config_header
-            fi
-            remove_backup
-        fi
+        rollback_to_previous_or_default "$had_config_before"
         set_last_result "error" "写入 proxy.conf 失败，请检查文件权限"
+        return
+    fi
+
+    if ! tidy_config_spacing; then
+        rollback_to_previous_or_default "$had_config_before"
+        set_last_result "error" "整理 proxy.conf 空行失败，配置已回滚"
         return
     fi
 
@@ -708,15 +728,8 @@ do_add() {
         remove_backup
         set_last_result "success" "转发规则添加成功！"
     else
-        if $had_config_before; then
-            restore_config
-        else
-            if ! download_default_proxy_conf; then
-                write_base_config_header
-            fi
-            remove_backup
-            print_warn "配置已回滚"
-        fi
+        rollback_to_previous_or_default "$had_config_before"
+        print_warn "配置已回滚"
         set_last_result "error" "添加失败，配置已回滚"
     fi
 }
@@ -748,12 +761,17 @@ do_delete() {
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
             read -r -p "确认删除全部规则？[Y/N]: " confirm
-            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+            if is_yes "$confirm"; then
                 backup_config
 
                 # 实际删除全部规则
                 if [[ -f "$CONFIG_FILE" ]]; then
                     delete_all_rules_from_config
+                    if ! tidy_config_spacing; then
+                        restore_config
+                        set_last_result "error" "整理空行失败，配置已回滚"
+                        return
+                    fi
                 fi
 
                 if test_and_reload_nginx; then
@@ -779,7 +797,7 @@ do_delete() {
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
         read -r -p "确认删除？[Y/N]: " confirm
-        if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        if ! is_yes "$confirm"; then
             print_warn "已取消删除"
             continue
         fi
@@ -789,6 +807,11 @@ do_delete() {
 
         # 删除规则
         delete_rule_from_config "$del_idx"
+        if ! tidy_config_spacing; then
+            restore_config
+            set_last_result "error" "整理空行失败，配置已回滚"
+            return
+        fi
 
         # 测试并重载
         if test_and_reload_nginx; then
@@ -802,24 +825,6 @@ do_delete() {
         # 删除一条后直接返回首页
         return
     done
-}
-
-# ---------- 查看规则详情 ----------
-do_view() {
-    print_banner
-    echo -e "${BOLD}${BLUE}[ 查看规则详情 ]${NC}"
-    echo ""
-
-    parse_config
-    
-    if [[ ${#rule_nodes[@]} -eq 0 ]]; then
-        print_warn "当前没有转发规则"
-    else
-        print_rules_detail
-    fi
-
-    echo ""
-    read -r -p "按回车返回主菜单..."
 }
 
 # ---------- 重载 Nginx ----------
