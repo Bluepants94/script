@@ -217,9 +217,29 @@ load_selected_config() {
   fi
 }
 
+is_saved_config_complete() {
+  [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ] && [ -n "${RUN_INTERVAL_HOURS:-}" ]
+}
+
+ensure_log_file() {
+  touch "$LOG_FILE"
+  chmod 644 "$LOG_FILE"
+}
+
+update_last_run_result() {
+  local exit_code="$1"
+  LAST_RUN_TIME="$(date '+%Y/%m/%d %H:%M')"
+  if [ "$exit_code" -eq 0 ]; then
+    LAST_RUN_STATUS="success"
+  else
+    LAST_RUN_STATUS="failure"
+  fi
+  save_selected_config
+}
+
 has_saved_config() {
   load_selected_config
-  if [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ] && [ -n "${RUN_INTERVAL_HOURS:-}" ]; then
+  if is_saved_config_complete; then
     return 0
   fi
   return 1
@@ -331,29 +351,7 @@ configure_task_params() {
 }
 
 write_service_file() {
-  local iperf3_bin
-  local cmd
-
-  iperf3_bin="$(command -v iperf3 || true)"
-  if [ -z "$iperf3_bin" ]; then
-    err "未找到 iperf3 可执行文件。"
-    return 1
-  fi
-
-  cmd="${iperf3_bin} -c ${TARGET_IP} -p ${TARGET_PORT}"
-
-  if [ -n "$BANDWIDTH" ]; then
-    cmd="${cmd} -b ${BANDWIDTH}"
-  fi
-
-  if [ "$TRANSFER_MODE" = "-R" ]; then
-    cmd="${cmd} -R"
-  fi
-
-  cmd="${cmd} -t ${DURATION_SEC}"
-
-  touch "$LOG_FILE"
-  chmod 644 "$LOG_FILE"
+  ensure_log_file
 
   cat > "$SERVICE_FILE" <<EOF_SVC
 [Unit]
@@ -400,8 +398,7 @@ run_once_with_saved_config() {
   fi
   cmd+=(-t "$DURATION_SEC")
 
-  touch "$LOG_FILE"
-  chmod 644 "$LOG_FILE"
+  ensure_log_file
 
   info "开始运行："
   info "目标=${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
@@ -410,13 +407,7 @@ run_once_with_saved_config() {
   "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
   exit_code=${PIPESTATUS[0]}
 
-  LAST_RUN_TIME="$(date '+%Y/%m/%d %H:%M')"
-  if [ "$exit_code" -eq 0 ]; then
-    LAST_RUN_STATUS="success"
-  else
-    LAST_RUN_STATUS="failure"
-  fi
-  save_selected_config
+  update_last_run_result "$exit_code"
 
   echo ""
   if [ "$exit_code" -eq 0 ]; then
