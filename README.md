@@ -28,3 +28,7 @@ bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/traffic_consumer.sh)
 ```
+# iperf3 监听
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iperf3.sh)
+```
