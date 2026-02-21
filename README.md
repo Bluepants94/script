@@ -40,3 +40,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install_nginx.sh)
 ```
+# acme 证书申请
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install_acme.sh)
+```
