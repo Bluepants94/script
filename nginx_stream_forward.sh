@@ -177,7 +177,7 @@ parse_config() {
         fi
 
         # 匹配白名单
-        if $in_server && [[ "$line" =~ ^allow[[:space:]]+([^;]+); ]]; then
+        if $in_server && [[ "$line" =~ ^allow[[:space:]]+([^;]+)\; ]]; then
             local allow_ip="${BASH_REMATCH[1]}"
             if [[ -n "$current_whitelist" ]]; then
                 current_whitelist="${current_whitelist},${allow_ip}"
@@ -390,6 +390,7 @@ delete_rule_from_config() {
     
     # 创建临时文件
     local temp_file="${CONFIG_FILE}.tmp"
+    : > "$temp_file"
     
     # 标记要删除的块
     local skip_upstream=false
@@ -397,8 +398,11 @@ delete_rule_from_config() {
     local in_target_upstream=false
     
     while IFS= read -r line; do
+        local trimmed
+        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
         # 检测是否是目标 upstream 块
-        if [[ "$line" =~ ^upstream[[:space:]]+backend_stream_${node}[[:space:]]*\{ ]]; then
+        if [[ "$trimmed" == "upstream backend_stream_${node} {" ]]; then
             skip_upstream=true
             in_target_upstream=true
             continue
@@ -406,7 +410,7 @@ delete_rule_from_config() {
         
         # 如果在要删除的 upstream 块内
         if $skip_upstream; then
-            if [[ "$line" == "}" ]]; then
+            if [[ "$trimmed" == "}" ]]; then
                 skip_upstream=false
                 continue
             fi
@@ -414,14 +418,14 @@ delete_rule_from_config() {
         fi
         
         # 检测是否是与目标节点对应的 server 块
-        if [[ "$line" =~ ^server[[:space:]]*\{ ]] && $in_target_upstream; then
+        if [[ "$trimmed" == "server {" ]] && $in_target_upstream; then
             skip_server=true
             continue
         fi
         
         # 如果在要删除的 server 块内
         if $skip_server; then
-            if [[ "$line" == "}" ]]; then
+            if [[ "$trimmed" == "}" ]]; then
                 skip_server=false
                 in_target_upstream=false
                 continue
@@ -434,6 +438,53 @@ delete_rule_from_config() {
     done < "$CONFIG_FILE"
     
     # 替换原文件
+    mv "$temp_file" "$CONFIG_FILE"
+}
+
+# ---------- 删除全部规则（保留非规则内容） ----------
+delete_all_rules_from_config() {
+    local temp_file="${CONFIG_FILE}.tmp"
+    : > "$temp_file"
+
+    local skip_upstream=false
+    local skip_server=false
+    local pending_server=false
+
+    while IFS= read -r line; do
+        local trimmed
+        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+        # 识别脚本管理的 upstream
+        if [[ "$trimmed" =~ ^upstream[[:space:]]+backend_stream_.*[[:space:]]*\{$ ]]; then
+            skip_upstream=true
+            pending_server=true
+            continue
+        fi
+
+        if $skip_upstream; then
+            if [[ "$trimmed" == "}" ]]; then
+                skip_upstream=false
+            fi
+            continue
+        fi
+
+        # 跳过紧随其后的 server 块
+        if $pending_server && [[ "$trimmed" == "server {" ]]; then
+            skip_server=true
+            pending_server=false
+            continue
+        fi
+
+        if $skip_server; then
+            if [[ "$trimmed" == "}" ]]; then
+                skip_server=false
+            fi
+            continue
+        fi
+
+        echo "$line" >> "$temp_file"
+    done < "$CONFIG_FILE"
+
     mv "$temp_file" "$CONFIG_FILE"
 }
 
@@ -545,6 +596,9 @@ do_add() {
         return
     fi
 
+    local had_config_before=false
+    [[ -f "$CONFIG_FILE" ]] && had_config_before=true
+
     # 备份配置
     backup_config
 
@@ -559,7 +613,13 @@ do_add() {
         remove_backup
         set_last_result "success" "转发规则添加成功！"
     else
-        restore_config
+        if $had_config_before; then
+            restore_config
+        else
+            rm -f "$CONFIG_FILE"
+            remove_backup
+            print_warn "配置已回滚：已删除新建的配置文件"
+        fi
         set_last_result "error" "添加失败，配置已回滚"
     fi
 }
@@ -593,7 +653,12 @@ do_delete() {
             read -r -p "确认删除全部规则？[y/N]: " confirm
             if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
                 backup_config
-                create_config_if_not_exists
+
+                # 实际删除全部规则
+                if [[ -f "$CONFIG_FILE" ]]; then
+                    delete_all_rules_from_config
+                fi
+
                 if test_and_reload_nginx; then
                     remove_backup
                     set_last_result "success" "已删除全部转发规则！"
