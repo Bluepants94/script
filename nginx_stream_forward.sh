@@ -228,14 +228,34 @@ check_port_exists() {
 
 # ---------- 创建配置文件（如果不存在） ----------
 create_config_if_not_exists() {
+    mkdir -p "$NGINX_STREAM_DIR" || {
+        print_error "创建目录失败: $NGINX_STREAM_DIR"
+        return 1
+    }
+
     if [[ ! -f "$CONFIG_FILE" ]]; then
         cat > "$CONFIG_FILE" <<'EOF'
 resolver 8.8.8.8 1.1.1.1 valid=300s;
 resolver_timeout 5s;
 
 EOF
+        if [[ $? -ne 0 ]]; then
+            print_error "创建配置文件失败: $CONFIG_FILE"
+            return 1
+        fi
         print_success "已创建配置文件: $CONFIG_FILE"
     fi
+
+    return 0
+}
+
+# ---------- 写入基础配置头 ----------
+write_base_config_header() {
+    cat > "$CONFIG_FILE" <<'EOF'
+resolver 8.8.8.8 1.1.1.1 valid=300s;
+resolver_timeout 5s;
+
+EOF
 }
 
 # ---------- 添加转发规则 ----------
@@ -603,7 +623,10 @@ do_add() {
     backup_config
 
     # 确保配置文件存在
-    create_config_if_not_exists
+    if ! create_config_if_not_exists; then
+        set_last_result "error" "创建配置文件失败，请检查目录权限"
+        return
+    fi
 
     # 添加规则
     add_forwarding_rule "$node" "$target" "$port" "$whitelist"
@@ -616,9 +639,9 @@ do_add() {
         if $had_config_before; then
             restore_config
         else
-            rm -f "$CONFIG_FILE"
+            write_base_config_header
             remove_backup
-            print_warn "配置已回滚：已删除新建的配置文件"
+            print_warn "配置已回滚：已保留新建的 proxy.conf 基础文件"
         fi
         set_last_result "error" "添加失败，配置已回滚"
     fi
