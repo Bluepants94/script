@@ -217,7 +217,7 @@ confirm_reconfigure_if_exists() {
 
   if has_saved_config; then
     warn "检测到参数已添加：${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
-    read -r -p "是否需要重新修改添加？[y/N]: " choice
+    read -r -p "是否需要重新修改添加？[Y/N]: " choice
     case "$choice" in
       y|Y|yes|YES)
         return 0
