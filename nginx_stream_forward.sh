@@ -358,20 +358,34 @@ EOF
 
 # ---------- 测试并重载 Nginx ----------
 test_and_reload_nginx() {
-    print_info "正在测试 Nginx 配置..."
+    local silent="${1:-false}"
+
+    if [[ "$silent" != "true" ]]; then
+        print_info "正在测试 Nginx 配置..."
+    fi
+
     if nginx -t 2>&1 | grep -q "successful"; then
-        print_success "配置测试通过"
-        print_info "正在重载 Nginx..."
+        if [[ "$silent" != "true" ]]; then
+            print_success "配置测试通过"
+            print_info "正在重载 Nginx..."
+        fi
+
         if nginx -s reload 2>/dev/null; then
-            print_success "Nginx 已成功重载"
+            if [[ "$silent" != "true" ]]; then
+                print_success "Nginx 已成功重载"
+            fi
             return 0
         else
-            print_error "Nginx 重载失败"
+            if [[ "$silent" != "true" ]]; then
+                print_error "Nginx 重载失败"
+            fi
             return 1
         fi
     else
-        print_error "Nginx 配置测试失败！"
-        nginx -t 2>&1 | tail -5
+        if [[ "$silent" != "true" ]]; then
+            print_error "Nginx 配置测试失败！"
+            nginx -t 2>&1 | tail -5
+        fi
         return 1
     fi
 }
@@ -606,7 +620,7 @@ do_add() {
     # 配置白名单
     echo ""
     local setup_whitelist
-    read -r -p "是否配置白名单？[y/N]: " setup_whitelist
+    read -r -p "是否配置白名单？[Y/N]: " setup_whitelist
     
     local whitelist=""
     if [[ "$setup_whitelist" == "y" || "$setup_whitelist" == "Y" ]]; then
@@ -633,7 +647,7 @@ do_add() {
             wl_count=$((wl_count + 1))
 
             local add_more
-            read -r -p "是否继续添加 allow？[Y/n]: " add_more
+            read -r -p "是否继续添加 allow？[Y/N]: " add_more
             if [[ "$add_more" == "n" || "$add_more" == "N" ]]; then
                 break
             fi
@@ -658,7 +672,7 @@ do_add() {
     fi
     
     echo ""
-    read -r -p "确认添加？[y/N]: " confirm
+    read -r -p "确认添加？[Y/N]: " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         print_warn "已取消添加"
         return
@@ -734,7 +748,7 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            read -r -p "确认删除全部规则？[y/N]: " confirm
+            read -r -p "确认删除全部规则？[Y/N]: " confirm
             if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
                 backup_config
 
@@ -765,7 +779,7 @@ do_delete() {
 
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
-        read -r -p "确认删除？[y/N]: " confirm
+        read -r -p "确认删除？[Y/N]: " confirm
         if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
             print_warn "已取消删除"
             continue
@@ -786,20 +800,7 @@ do_delete() {
             set_last_result "error" "删除失败，配置已回滚"
         fi
 
-        # 询问是否继续删除
-        read -r -p "是否继续删除其他规则？[y/N]: " continue_del
-        if [[ "$continue_del" == "y" || "$continue_del" == "Y" ]]; then
-            parse_config
-            if [[ ${#rule_nodes[@]} -eq 0 ]]; then
-                return
-            fi
-            print_banner
-            show_last_result
-            echo -e "${BOLD}${BLUE}当前转发规则:${NC}"
-            print_rules_home_style
-            continue
-        fi
-
+        # 删除一条后直接返回首页
         return
     done
 }
@@ -825,7 +826,7 @@ do_view() {
 # ---------- 重载 Nginx ----------
 do_reload() {
     parse_config
-    if test_and_reload_nginx; then
+    if test_and_reload_nginx true; then
         set_last_result "success" "Nginx 重载完成（当前 ${#rule_nodes[@]} 条规则）"
     else
         set_last_result "error" "Nginx 重载失败，请检查配置"
