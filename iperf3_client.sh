@@ -3,9 +3,10 @@
 # ============================================
 #  iperf3 客户端整点定时任务管理工具
 #  功能：
-#    1) 启用整点定时连接（systemd timer）
-#    2) 关闭整点定时连接
-#    3) 启动
+#    1) 填写/修改参数
+#    2) 启用整点定时连接（systemd timer）
+#    3) 关闭整点定时连接
+#    4) 启动
 #    0) 退出
 # ============================================
 
@@ -203,6 +204,34 @@ load_selected_config() {
   fi
 }
 
+has_saved_config() {
+  load_selected_config
+  if [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ]; then
+    return 0
+  fi
+  return 1
+}
+
+confirm_reconfigure_if_exists() {
+  local choice
+
+  if has_saved_config; then
+    warn "检测到参数已添加：${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
+    read -r -p "是否需要重新修改添加？[y/N]: " choice
+    case "$choice" in
+      y|Y|yes|YES)
+        return 0
+        ;;
+      *)
+        info "保留原有参数，不做修改。"
+        return 1
+        ;;
+    esac
+  fi
+
+  return 0
+}
+
 write_runner_file() {
   cat > "$RUNNER_FILE" <<'EOF_RUNNER'
 #!/bin/bash
@@ -267,6 +296,8 @@ EOF_RUNNER
 }
 
 configure_task_params() {
+  confirm_reconfigure_if_exists || return 0
+
   prompt_target_ip || return 1
   prompt_port_with_default || return 1
   prompt_bandwidth_optional || return 1
@@ -403,7 +434,10 @@ enable_autostart() {
   fi
 
   check_or_install_iperf3 || return 1
-  configure_task_params || return 1
+  if ! has_saved_config; then
+    err "未检测到已保存参数，请先选择“1) 填写/修改参数”。"
+    return 1
+  fi
   write_runner_file || return 1
   write_service_file || return 1
   write_timer_file || return 1
@@ -502,25 +536,29 @@ show_status() {
 show_menu() {
   echo ""
   echo "╔══════════════════════════════════════════════╗"
-  echo "║    iperf3 客户端整点任务管理工具 (Linux)      ║"
+  echo "║    iperf3 客户端整点任务管理工具 (Linux)     ║"
   echo "╚══════════════════════════════════════════════╝"
   show_status
   echo ""
-  echo "  1) 启用整点定时 + 开机自启"
-  echo "  2) 关闭整点定时 + 关闭自启"
-  echo "  3) 启动"
+  echo "  1) 填写/修改参数"
+  echo "  2) 启用整点定时 + 开机自启"
+  echo "  3) 关闭整点定时 + 关闭自启"
+  echo "  4) 启动"
   echo "  0) 退出"
   echo ""
-  read -r -p "请选择操作 [0-3]: " choice
+  read -r -p "请选择操作 [0-4]: " choice
 
   case "$choice" in
     1)
-      enable_autostart || true
+      configure_task_params || true
       ;;
     2)
-      disable_autostart || true
+      enable_autostart || true
       ;;
     3)
+      disable_autostart || true
+      ;;
+    4)
       run_once_with_saved_config || true
       ;;
     0)
@@ -528,7 +566,7 @@ show_menu() {
       exit 0
       ;;
     *)
-      err "无效选项，请输入 0-3。"
+      err "无效选项，请输入 0-4。"
       ;;
   esac
 
