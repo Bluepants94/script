@@ -4,7 +4,7 @@
 #  iperf3 开机自启管理工具
 #  功能：
 #    1) 检测并安装 iperf3（默认自动安装，无需确认）
-#    2) 检测本地 IP，区分内网/公网并自动选择监听 IP
+#    2) 检测本地/公网 IP，并由用户选择监听 IP
 #    3) 开启开机自启（systemd）
 #    4) 关闭开机自启
 #    0) 退出
@@ -124,6 +124,23 @@ collect_local_ipv4() {
   ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u
 }
 
+detect_public_ipv4() {
+  local pub=""
+
+  if command -v curl >/dev/null 2>&1; then
+    pub="$(curl -4 -s --max-time 4 https://api.ipify.org 2>/dev/null || true)"
+    if [ -z "$pub" ]; then
+      pub="$(curl -4 -s --max-time 4 https://ifconfig.me 2>/dev/null || true)"
+    fi
+  fi
+
+  if [[ "$pub" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "$pub"
+  else
+    echo ""
+  fi
+}
+
 save_selected_config() {
   cat > "$STATE_FILE" <<EOF_CFG
 LISTEN_IP="${LISTEN_IP}"
@@ -138,60 +155,59 @@ load_selected_config() {
   fi
 }
 
-auto_detect_listen_ip() {
+select_listen_ip() {
   local ips ip
   local private_ips=()
-  local public_ips=()
+  local public_ip=""
+  local options=()
 
   mapfile -t ips < <(collect_local_ipv4)
-  if [ "${#ips[@]}" -eq 0 ]; then
-    warn "未检测到可用 IPv4 地址，将监听 0.0.0.0"
-    LISTEN_IP="0.0.0.0"
-    LISTEN_PORT="$DEFAULT_PORT"
-    save_selected_config
-    return 0
-  fi
 
   for ip in "${ips[@]}"; do
     if is_private_ipv4 "$ip"; then
       private_ips+=("$ip")
-    else
-      public_ips+=("$ip")
     fi
   done
 
+  public_ip="$(detect_public_ipv4)"
+
   echo ""
-  echo "检测到以下本地 IPv4："
+  echo "请选择监听 IP："
+
   if [ "${#private_ips[@]}" -gt 0 ]; then
-    echo "  内网 IP:"
     for ip in "${private_ips[@]}"; do
-      echo "    - $ip"
+      options+=("$ip")
+      echo "  ${#options[@]}) ${ip} (内网IP)"
     done
   else
-    echo "  内网 IP: (无)"
+    echo "  - 内网IP: 无"
   fi
 
-  if [ "${#public_ips[@]}" -gt 0 ]; then
-    echo "  公网 IP:"
-    for ip in "${public_ips[@]}"; do
-      echo "    - $ip"
-    done
+  options+=("127.0.0.1")
+  echo "  ${#options[@]}) 127.0.0.1"
+
+  options+=("0.0.0.0")
+  echo "  ${#options[@]}) 0.0.0.0"
+
+  if [ -n "$public_ip" ]; then
+    options+=("$public_ip")
+    echo "  ${#options[@]}) ${public_ip} (公网IP)"
   else
-    echo "  公网 IP: (无)"
+    echo "  - 公网IP: 无"
   fi
 
-  # 自动选择策略：公网IP优先，其次内网IP，最后0.0.0.0
-  if [ "${#public_ips[@]}" -gt 0 ]; then
-    LISTEN_IP="${public_ips[0]}"
-    info "自动选择公网 IP 作为监听地址：${LISTEN_IP}"
-  elif [ "${#private_ips[@]}" -gt 0 ]; then
-    LISTEN_IP="${private_ips[0]}"
-    info "自动选择内网 IP 作为监听地址：${LISTEN_IP}"
-  else
-    LISTEN_IP="0.0.0.0"
-    info "未识别到可用地址，自动监听：${LISTEN_IP}"
+  if [ "${#options[@]}" -eq 0 ]; then
+    err "无可选监听地址。"
+    return 1
   fi
 
+  read -r -p "输入选项编号: " ip_choice
+  if ! [[ "$ip_choice" =~ ^[0-9]+$ ]] || [ "$ip_choice" -lt 1 ] || [ "$ip_choice" -gt "${#options[@]}" ]; then
+    err "无效选项。"
+    return 1
+  fi
+
+  LISTEN_IP="${options[$((ip_choice - 1))]}"
   LISTEN_PORT="$DEFAULT_PORT"
 
   save_selected_config
@@ -225,7 +241,7 @@ EOF_SVC
 
 enable_autostart() {
   check_or_install_iperf3 || return 1
-  auto_detect_listen_ip || return 1
+  select_listen_ip || return 1
 
   write_service_file || return 1
 
@@ -294,7 +310,7 @@ show_menu() {
   echo "╚══════════════════════════════════════════════╝"
   show_status
   echo ""
-  echo "  1) 开机自启（自动检测IP并自动安装）"
+  echo "  1) 开机自启（自动安装 + 选择监听IP）"
   echo "  2) 关闭自启"
   echo "  0) 退出"
   echo ""
