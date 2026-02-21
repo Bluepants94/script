@@ -132,6 +132,19 @@ validate_ip_cidr() {
     return 1
 }
 
+# ---------- 生成安全的 zone 名称 ----------
+build_zone_name() {
+    local node="$1"
+    local safe
+    safe=$(echo "$node" | sed 's/[^a-zA-Z0-9_]/_/g')
+    echo "backend_zone_${safe}"
+}
+
+# ---------- 转义正则特殊字符 ----------
+escape_regex() {
+    echo "$1" | sed -e 's/[.[\*^$()+?{|]/\\&/g'
+}
+
 # ---------- 解析现有配置文件 ----------
 parse_config() {
     rule_nodes=()
@@ -286,20 +299,22 @@ add_forwarding_rule() {
     local target="$2"
     local port="$3"
     local whitelist="$4"
+    local zone_name
+    zone_name=$(build_zone_name "$node")
 
     # 生成 upstream 块
-    cat >> "$CONFIG_FILE" <<EOF
+    cat >> "$CONFIG_FILE" <<EOF || return 1
 
 # Stream_${node}
 upstream backend_stream_${node} {
-    zone backend_zone 64k;
+    zone ${zone_name} 64k;
     server ${target} resolve;
 }
 
 EOF
 
     # 生成 server 块
-    cat >> "$CONFIG_FILE" <<EOF
+    cat >> "$CONFIG_FILE" <<EOF || return 1
 server {
     # --- TCP 监听 ---
     listen ${port} reuseport;
@@ -313,18 +328,18 @@ EOF
 
     # 如果有白名单，添加白名单规则
     if [[ -n "$whitelist" ]]; then
-        cat >> "$CONFIG_FILE" <<EOF
+        cat >> "$CONFIG_FILE" <<EOF || return 1
     # --- 白名单设置 ---
 EOF
         IFS=',' read -ra ADDR <<< "$whitelist"
         for ip in "${ADDR[@]}"; do
-            echo "    allow ${ip};" >> "$CONFIG_FILE"
+            echo "    allow ${ip};" >> "$CONFIG_FILE" || return 1
         done
-        echo "    deny all;" >> "$CONFIG_FILE"
+        echo "    deny all;" >> "$CONFIG_FILE" || return 1
     fi
 
     # 添加 proxy_pass 和优化配置
-    cat >> "$CONFIG_FILE" <<EOF
+    cat >> "$CONFIG_FILE" <<EOF || return 1
     proxy_pass      backend_stream_${node};
 
     # 针对 TCP 的优化
@@ -429,6 +444,8 @@ print_rules_detail() {
 delete_rule_from_config() {
     local index="$1"
     local node="${rule_nodes[$index]}"
+    local node_regex
+    node_regex=$(escape_regex "$node")
     
     # 创建临时文件
     local temp_file="${CONFIG_FILE}.tmp"
@@ -444,7 +461,7 @@ delete_rule_from_config() {
         trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
         # 检测是否是目标 upstream 块
-        if [[ "$trimmed" == "upstream backend_stream_${node} {" ]]; then
+        if [[ "$trimmed" =~ ^upstream[[:space:]]+backend_stream_${node_regex}[[:space:]]*\{$ ]]; then
             skip_upstream=true
             in_target_upstream=true
             continue
@@ -460,7 +477,7 @@ delete_rule_from_config() {
         fi
         
         # 检测是否是与目标节点对应的 server 块
-        if [[ "$trimmed" == "server {" ]] && $in_target_upstream; then
+        if [[ "$trimmed" =~ ^server[[:space:]]*\{$ ]] && $in_target_upstream; then
             skip_server=true
             continue
         fi
@@ -593,12 +610,15 @@ do_add() {
     
     local whitelist=""
     if [[ "$setup_whitelist" == "y" || "$setup_whitelist" == "Y" ]]; then
-        echo -e "${CYAN}请输入白名单 IP/网段（逐行输入，空行结束）:${NC}"
+        echo -e "${CYAN}请输入白名单 IP/网段:${NC}"
         local wl_count=1
         while true; do
             local wl_ip
             read -r -p "  允许 IP/网段 #${wl_count}: " wl_ip
-            [[ -z "$wl_ip" ]] && break
+            [[ -z "$wl_ip" ]] && {
+                print_warn "IP/网段不能为空"
+                continue
+            }
             
             if ! validate_ip_cidr "$wl_ip"; then
                 print_error "IP/CIDR 格式错误，请重新输入"
@@ -611,6 +631,12 @@ do_add() {
                 whitelist="$wl_ip"
             fi
             wl_count=$((wl_count + 1))
+
+            local add_more
+            read -r -p "是否继续添加 allow？[Y/n]: " add_more
+            if [[ "$add_more" == "n" || "$add_more" == "N" ]]; then
+                break
+            fi
         done
     fi
 
@@ -651,7 +677,18 @@ do_add() {
     fi
 
     # 添加规则
-    add_forwarding_rule "$node" "$target" "$port" "$whitelist"
+    if ! add_forwarding_rule "$node" "$target" "$port" "$whitelist"; then
+        if $had_config_before; then
+            restore_config
+        else
+            if ! download_default_proxy_conf; then
+                write_base_config_header
+            fi
+            remove_backup
+        fi
+        set_last_result "error" "写入 proxy.conf 失败，请检查文件权限"
+        return
+    fi
 
     # 测试并重载
     if test_and_reload_nginx; then
@@ -749,19 +786,21 @@ do_delete() {
             set_last_result "error" "删除失败，配置已回滚"
         fi
 
-        # 重新解析配置
-        parse_config
-        
-        [[ ${#rule_nodes[@]} -eq 0 ]] && break
-
-        echo ""
-        echo -e "${BOLD}${BLUE}剩余规则:${NC}"
-        print_rules_home_style
-
-        read -r -p "是否继续删除？[y/N]: " continue_del
-        if [[ "$continue_del" != "y" && "$continue_del" != "Y" ]]; then
-            return
+        # 询问是否继续删除
+        read -r -p "是否继续删除其他规则？[y/N]: " continue_del
+        if [[ "$continue_del" == "y" || "$continue_del" == "Y" ]]; then
+            parse_config
+            if [[ ${#rule_nodes[@]} -eq 0 ]]; then
+                return
+            fi
+            print_banner
+            show_last_result
+            echo -e "${BOLD}${BLUE}当前转发规则:${NC}"
+            print_rules_home_style
+            continue
         fi
+
+        return
     done
 }
 
@@ -819,12 +858,11 @@ show_menu() {
 
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
-    echo -e "  ${CYAN}3)${NC} 查看规则详情"
-    echo -e "  ${YELLOW}4)${NC} 重载 Nginx"
+    echo -e "  ${YELLOW}3)${NC} 重载 Nginx"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    read -r -p "请选择操作 [0-4]: " choice
+    read -r -p "请选择操作 [0-3]: " choice
 }
 
 # ---------- 主入口 ----------
@@ -837,15 +875,14 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_view ;;
-            4) do_reload ;;
+            3) do_reload ;;
             0)
                 echo ""
                 print_info "再见！"
                 exit 0
                 ;;
             *)
-                set_last_result "error" "无效选择，请输入 0-4"
+                set_last_result "error" "无效选择，请输入 0-3"
                 ;;
         esac
     done
