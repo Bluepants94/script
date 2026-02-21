@@ -5,7 +5,7 @@
 #  功能：
 #    1) 启用整点定时连接（systemd timer）
 #    2) 关闭整点定时连接
-#    3) 启动（按已设参数立即运行一次）
+#    3) 启动
 #    0) 退出
 # ============================================
 
@@ -18,6 +18,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 TIMER_FILE="/etc/systemd/system/${TIMER_NAME}"
 STATE_FILE="/etc/iperf3-client-hourly.conf"
 LOG_FILE="/var/log/iperf3-client-hourly.log"
+RUNNER_FILE="/usr/local/bin/iperf3-client-hourly-runner.sh"
 
 DEFAULT_PORT="5201"
 
@@ -190,6 +191,8 @@ TARGET_PORT="${TARGET_PORT}"
 BANDWIDTH="${BANDWIDTH}"
 TRANSFER_MODE="${TRANSFER_MODE}"
 DURATION_SEC="${DURATION_SEC}"
+LAST_RUN_TIME="${LAST_RUN_TIME:-}"
+LAST_RUN_STATUS="${LAST_RUN_STATUS:-}"
 EOF_CFG
 }
 
@@ -198,6 +201,69 @@ load_selected_config() {
     # shellcheck source=/dev/null
     source "$STATE_FILE"
   fi
+}
+
+write_runner_file() {
+  cat > "$RUNNER_FILE" <<'EOF_RUNNER'
+#!/bin/bash
+
+set -u
+
+STATE_FILE="/etc/iperf3-client-hourly.conf"
+LOG_FILE="/var/log/iperf3-client-hourly.log"
+
+if [ ! -f "$STATE_FILE" ]; then
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$STATE_FILE"
+
+if [ -z "${TARGET_IP:-}" ] || [ -z "${TARGET_PORT:-}" ] || [ -z "${DURATION_SEC:-}" ]; then
+  exit 1
+fi
+
+iperf3_bin="$(command -v iperf3 || true)"
+if [ -z "$iperf3_bin" ]; then
+  exit 1
+fi
+
+cmd=("$iperf3_bin" -c "$TARGET_IP" -p "$TARGET_PORT")
+if [ -n "${BANDWIDTH:-}" ]; then
+  cmd+=(-b "$BANDWIDTH")
+fi
+if [ "${TRANSFER_MODE:-}" = "-R" ]; then
+  cmd+=(-R)
+fi
+cmd+=(-t "$DURATION_SEC")
+
+touch "$LOG_FILE"
+chmod 644 "$LOG_FILE"
+
+"${cmd[@]}" >> "$LOG_FILE" 2>&1
+exit_code=$?
+
+LAST_RUN_TIME="$(date '+%Y/%m/%d %H:%M')"
+if [ "$exit_code" -eq 0 ]; then
+  LAST_RUN_STATUS="success"
+else
+  LAST_RUN_STATUS="failure"
+fi
+
+cat > "$STATE_FILE" <<EOF_CFG
+TARGET_IP="${TARGET_IP}"
+TARGET_PORT="${TARGET_PORT}"
+BANDWIDTH="${BANDWIDTH:-}"
+TRANSFER_MODE="${TRANSFER_MODE:-}"
+DURATION_SEC="${DURATION_SEC}"
+LAST_RUN_TIME="${LAST_RUN_TIME}"
+LAST_RUN_STATUS="${LAST_RUN_STATUS}"
+EOF_CFG
+
+exit "$exit_code"
+EOF_RUNNER
+
+  chmod 755 "$RUNNER_FILE"
 }
 
 configure_task_params() {
@@ -249,7 +315,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -lc '${cmd}'
+ExecStart=${RUNNER_FILE}
 StandardOutput=append:${LOG_FILE}
 StandardError=append:${LOG_FILE}
 
@@ -289,18 +355,26 @@ run_once_with_saved_config() {
   touch "$LOG_FILE"
   chmod 644 "$LOG_FILE"
 
-  info "开始按已设参数立即运行一次："
+  info "开始运行："
   info "目标=${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
   echo ""
 
   "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
   exit_code=${PIPESTATUS[0]}
 
+  LAST_RUN_TIME="$(date '+%Y/%m/%d %H:%M')"
+  if [ "$exit_code" -eq 0 ]; then
+    LAST_RUN_STATUS="success"
+  else
+    LAST_RUN_STATUS="failure"
+  fi
+  save_selected_config
+
   echo ""
   if [ "$exit_code" -eq 0 ]; then
-    ok "iperf3 运行完成，返回码=0（看起来运行正常）。"
+    ok "iperf3 正常运行。"
   else
-    err "iperf3 运行失败，返回码=${exit_code}。请结合上方输出和日志排查。"
+    err "iperf3 运行失败。请结合上方输出和日志排查。"
   fi
 
   return "$exit_code"
@@ -330,6 +404,7 @@ enable_autostart() {
 
   check_or_install_iperf3 || return 1
   configure_task_params || return 1
+  write_runner_file || return 1
   write_service_file || return 1
   write_timer_file || return 1
 
@@ -363,6 +438,11 @@ disable_autostart() {
   if [ -f "$SERVICE_FILE" ]; then
     rm -f "$SERVICE_FILE"
     ok "服务文件已删除：${SERVICE_FILE}"
+  fi
+
+  if [ -f "$RUNNER_FILE" ]; then
+    rm -f "$RUNNER_FILE"
+    ok "运行脚本已删除：${RUNNER_FILE}"
   fi
 
   systemctl daemon-reload
@@ -404,10 +484,16 @@ show_status() {
     warn "定时器运行：未运行"
   fi
 
-  if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
-    ok "最近任务执行：执行中"
+  if [ -n "${LAST_RUN_TIME:-}" ] && [ -n "${LAST_RUN_STATUS:-}" ]; then
+    if [ "$LAST_RUN_STATUS" = "success" ]; then
+      echo -e "${GREEN}[INFO]${NC} 上次运行：${LAST_RUN_TIME} 成功"
+    elif [ "$LAST_RUN_STATUS" = "failure" ]; then
+      echo -e "${RED}[INFO]${NC} 上次运行：${LAST_RUN_TIME} 失败"
+    else
+      warn "上次运行：状态未知"
+    fi
   else
-    info "最近任务执行：非执行中（整点触发时会短暂运行）"
+    warn "上次运行：暂无记录"
   fi
 
   info "日志文件：${LOG_FILE}"
@@ -422,7 +508,7 @@ show_menu() {
   echo ""
   echo "  1) 启用整点定时 + 开机自启"
   echo "  2) 关闭整点定时 + 关闭自启"
-  echo "  3) 启动（按已设参数立即运行一次）"
+  echo "  3) 启动"
   echo "  0) 退出"
   echo ""
   read -r -p "请选择操作 [0-3]: " choice
