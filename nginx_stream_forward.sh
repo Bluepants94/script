@@ -20,6 +20,7 @@ NC='\033[0m'
 NGINX_STREAM_DIR="/etc/nginx/stream"
 CONFIG_FILE="${NGINX_STREAM_DIR}/proxy.conf"
 BACKUP_FILE="${CONFIG_FILE}.backup"
+DEFAULT_PROXY_CONF_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/proxy.conf"
 
 # ---------- 全局变量 ----------
 LAST_RESULT_TYPE=""
@@ -86,6 +87,12 @@ init_env() {
         print_error "nginx 未安装！请先安装 nginx"
         exit 1
     fi
+
+    # 首次运行自动准备 proxy.conf（静默）
+    if ! create_config_if_not_exists; then
+        print_error "初始化 proxy.conf 失败，请检查网络和目录权限"
+        exit 1
+    fi
 }
 
 # ---------- 验证端口格式 ----------
@@ -144,6 +151,9 @@ parse_config() {
     while IFS= read -r line; do
         # 清除首尾空格
         line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+
+        # 跳过注释行（示例注释不参与规则识别）
+        [[ "$line" =~ ^# ]] && continue
 
         # 匹配 upstream 块
         if [[ "$line" =~ ^upstream[[:space:]]+backend_stream_(.+)[[:space:]]*\{ ]]; then
@@ -234,18 +244,30 @@ create_config_if_not_exists() {
     }
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat > "$CONFIG_FILE" <<'EOF'
-resolver 8.8.8.8 1.1.1.1 valid=300s;
-resolver_timeout 5s;
-
-EOF
-        if [[ $? -ne 0 ]]; then
-            print_error "创建配置文件失败: $CONFIG_FILE"
+        if ! download_default_proxy_conf; then
+            print_error "下载默认配置失败: $CONFIG_FILE"
             return 1
         fi
-        print_success "已创建配置文件: $CONFIG_FILE"
     fi
 
+    return 0
+}
+
+# ---------- 下载默认 proxy.conf（静默） ----------
+download_default_proxy_conf() {
+    local tmp_file="${CONFIG_FILE}.download"
+    rm -f "$tmp_file"
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$DEFAULT_PROXY_CONF_URL" -o "$tmp_file" >/dev/null 2>&1 || return 1
+    elif command -v wget &>/dev/null; then
+        wget -q -O "$tmp_file" "$DEFAULT_PROXY_CONF_URL" >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+
+    [[ -s "$tmp_file" ]] || return 1
+    mv "$tmp_file" "$CONFIG_FILE" || return 1
     return 0
 }
 
@@ -639,9 +661,11 @@ do_add() {
         if $had_config_before; then
             restore_config
         else
-            write_base_config_header
+            if ! download_default_proxy_conf; then
+                write_base_config_header
+            fi
             remove_backup
-            print_warn "配置已回滚：已保留新建的 proxy.conf 基础文件"
+            print_warn "配置已回滚"
         fi
         set_last_result "error" "添加失败，配置已回滚"
     fi
