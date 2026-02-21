@@ -217,7 +217,12 @@ select_listen_ip() {
       ;;
   esac
 
-  LISTEN_PORT="$DEFAULT_PORT"
+  read -r -p "请输入监听端口 (默认 ${DEFAULT_PORT}): " input_port
+  LISTEN_PORT="${input_port:-$DEFAULT_PORT}"
+  if ! [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    err "端口无效：${LISTEN_PORT}"
+    return 1
+  fi
 
   save_selected_config
   ok "监听配置已保存：IP=${LISTEN_IP}, PORT=${LISTEN_PORT}"
