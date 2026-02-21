@@ -3,10 +3,10 @@
 # ============================================
 #  iperf3 开机自启管理工具
 #  功能：
-#    1) 检测并安装 iperf3（默认自动安装，无需确认）
-#    2) 检测本地/公网 IP，并由用户选择监听 IP
-#    3) 开启开机自启（systemd）
-#    4) 关闭开机自启
+#    1) 填写/修改监听参数
+#    2) 开启开机自启（systemd）
+#    3) 关闭开机自启
+#    4) 启动
 #    0) 退出
 # ============================================
 
@@ -182,6 +182,38 @@ load_selected_config() {
   fi
 }
 
+is_saved_config_complete() {
+  [ -n "${LISTEN_IP:-}" ] && [ -n "${LISTEN_PORT:-}" ]
+}
+
+has_saved_config() {
+  load_selected_config
+  if is_saved_config_complete; then
+    return 0
+  fi
+  return 1
+}
+
+confirm_reconfigure_if_exists() {
+  local choice
+
+  if has_saved_config; then
+    warn "检测到监听参数已添加：${LISTEN_IP}:${LISTEN_PORT}"
+    read -r -p "是否需要重新修改添加？[Y/N]: " choice
+    case "$choice" in
+      y|Y|yes|YES)
+        return 0
+        ;;
+      *)
+        info "保留原有监听参数，不做修改。"
+        return 1
+        ;;
+    esac
+  fi
+
+  return 0
+}
+
 select_listen_ip() {
   local ips ip
   local private_ip=""
@@ -248,6 +280,13 @@ select_listen_ip() {
   ok "监听配置已保存：IP=${LISTEN_IP}, PORT=${LISTEN_PORT}"
 }
 
+configure_server_params() {
+  confirm_reconfigure_if_exists || return 0
+
+  check_or_install_iperf3 || return 1
+  select_listen_ip || return 1
+}
+
 write_service_file() {
   local iperf3_bin
   iperf3_bin="$(command -v iperf3 || true)"
@@ -290,7 +329,10 @@ enable_autostart() {
   fi
 
   check_or_install_iperf3 || return 1
-  select_listen_ip || return 1
+  if ! has_saved_config; then
+    err "未检测到已保存监听参数，请先选择“1) 填写/修改监听参数”。"
+    return 1
+  fi
 
   write_service_file || return 1
 
@@ -303,6 +345,29 @@ enable_autostart() {
     echo "  监听: ${LISTEN_IP}:${LISTEN_PORT}"
   else
     err "开机自启开启失败，请检查 systemctl 状态。"
+    return 1
+  fi
+}
+
+run_once_with_saved_config() {
+  check_or_install_iperf3 || return 1
+
+  if ! has_saved_config; then
+    err "未检测到已保存监听参数，请先选择“1) 填写/修改监听参数”。"
+    return 1
+  fi
+
+  write_service_file || return 1
+
+  systemctl daemon-reload
+  systemctl start "$SERVICE_NAME"
+
+  if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+    ok "服务已启动。"
+    echo "  服务: ${SERVICE_NAME}"
+    echo "  监听: ${LISTEN_IP}:${LISTEN_PORT}"
+  else
+    err "启动失败，请执行：systemctl status ${SERVICE_NAME} 查看原因。"
     return 1
   fi
 }
@@ -359,25 +424,33 @@ show_menu() {
   echo "╚══════════════════════════════════════════════╝"
   show_status
   echo ""
-  echo "  1) 开机自启"
-  echo "  2) 关闭自启"
+  echo "  1) 填写/修改监听参数"
+  echo "  2) 启用开机自启"
+  echo "  3) 关闭开机自启"
+  echo "  4) 启动"
   echo "  0) 退出"
   echo ""
-  read -r -p "请选择操作 [0-2]: " choice
+  read -r -p "请选择操作 [0-4]: " choice
 
   case "$choice" in
     1)
-      enable_autostart || true
+      configure_server_params || true
       ;;
     2)
+      enable_autostart || true
+      ;;
+    3)
       disable_autostart || true
+      ;;
+    4)
+      run_once_with_saved_config || true
       ;;
     0)
       ok "已退出。"
       exit 0
       ;;
     *)
-      err "无效选项，请输入 0-2。"
+      err "无效选项，请输入 0-4。"
       ;;
   esac
 
@@ -388,7 +461,6 @@ show_menu() {
 
 main() {
   check_root
-  check_or_install_iperf3 || true
   while true; do
     clear
     show_menu
