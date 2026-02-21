@@ -28,7 +28,11 @@ bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/
 ```
 bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/traffic_consumer.sh)
 ```
-# iperf3 监听
+# iperf3 服务端
 ```
-bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iperf3.sh)
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iperf3_server.sh)
+```
+# iperf3 客户端
+```
+bash <(curl -sL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iperf3_client.sh)
 ```
