@@ -599,7 +599,7 @@ do_add() {
     # 输入节点名称
     local node
     while true; do
-        read -r -p "请输入节点名称（如 HK_BoilCloud_17.HKT）: " node
+        read -r -p "请输入节点名称（如 HKG_01）: " node
         if [[ -z "$node" ]]; then
             print_error "节点名称不能为空"
             continue
@@ -614,7 +614,7 @@ do_add() {
     # 输入转发目标
     local target
     while true; do
-        read -r -p "请输入转发目标（格式: IP/域名:端口，如 node.example.com:30002）: " target
+        read -r -p "请输入转发目标（格式: IP/域名:端口，如 node.example.com:9090）: " target
         if ! validate_target "$target"; then
             print_error "格式错误，请使用 IP/域名:端口 格式"
             continue
