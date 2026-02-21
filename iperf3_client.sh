@@ -22,6 +22,7 @@ LOG_FILE="/var/log/iperf3-client-hourly.log"
 RUNNER_FILE="/usr/local/bin/iperf3-client-hourly-runner.sh"
 
 DEFAULT_PORT="5201"
+DEFAULT_INTERVAL_HOURS="1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -185,6 +186,17 @@ prompt_duration_sec() {
   DURATION_SEC="$input_sec"
 }
 
+prompt_interval_hours() {
+  local input_hours
+  read -r -p "请输入运行间隔小时数(例如 1=每小时整点，2=每2小时整点，默认 ${DEFAULT_INTERVAL_HOURS}): " input_hours
+  RUN_INTERVAL_HOURS="${input_hours:-$DEFAULT_INTERVAL_HOURS}"
+
+  if ! [[ "$RUN_INTERVAL_HOURS" =~ ^[0-9]+$ ]] || [ "$RUN_INTERVAL_HOURS" -le 0 ]; then
+    err "运行间隔小时数必须为正整数。"
+    return 1
+  fi
+}
+
 save_selected_config() {
   cat > "$STATE_FILE" <<EOF_CFG
 TARGET_IP="${TARGET_IP}"
@@ -192,6 +204,7 @@ TARGET_PORT="${TARGET_PORT}"
 BANDWIDTH="${BANDWIDTH}"
 TRANSFER_MODE="${TRANSFER_MODE}"
 DURATION_SEC="${DURATION_SEC}"
+RUN_INTERVAL_HOURS="${RUN_INTERVAL_HOURS:-$DEFAULT_INTERVAL_HOURS}"
 LAST_RUN_TIME="${LAST_RUN_TIME:-}"
 LAST_RUN_STATUS="${LAST_RUN_STATUS:-}"
 EOF_CFG
@@ -206,7 +219,7 @@ load_selected_config() {
 
 has_saved_config() {
   load_selected_config
-  if [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ]; then
+  if [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ] && [ -n "${RUN_INTERVAL_HOURS:-}" ]; then
     return 0
   fi
   return 1
@@ -216,7 +229,7 @@ confirm_reconfigure_if_exists() {
   local choice
 
   if has_saved_config; then
-    warn "检测到参数已添加：${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
+    warn "检测到参数已添加：${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}, 间隔=${RUN_INTERVAL_HOURS}小时"
     read -r -p "是否需要重新修改添加？[Y/N]: " choice
     case "$choice" in
       y|Y|yes|YES)
@@ -252,6 +265,8 @@ if [ -z "${TARGET_IP:-}" ] || [ -z "${TARGET_PORT:-}" ] || [ -z "${DURATION_SEC:
   exit 1
 fi
 
+RUN_INTERVAL_HOURS="${RUN_INTERVAL_HOURS:-1}"
+
 iperf3_bin="$(command -v iperf3 || true)"
 if [ -z "$iperf3_bin" ]; then
   exit 1
@@ -285,6 +300,7 @@ TARGET_PORT="${TARGET_PORT}"
 BANDWIDTH="${BANDWIDTH:-}"
 TRANSFER_MODE="${TRANSFER_MODE:-}"
 DURATION_SEC="${DURATION_SEC}"
+RUN_INTERVAL_HOURS="${RUN_INTERVAL_HOURS}"
 LAST_RUN_TIME="${LAST_RUN_TIME}"
 LAST_RUN_STATUS="${LAST_RUN_STATUS}"
 EOF_CFG
@@ -303,9 +319,10 @@ configure_task_params() {
   prompt_bandwidth_optional || return 1
   prompt_transfer_mode_optional || return 1
   prompt_duration_sec || return 1
+  prompt_interval_hours || return 1
   save_selected_config
 
-  ok "配置已保存：IP=${TARGET_IP}, PORT=${TARGET_PORT}, MODE=${TRANSFER_MODE:-normal}, DURATION=${DURATION_SEC}s"
+  ok "配置已保存：IP=${TARGET_IP}, PORT=${TARGET_PORT}, MODE=${TRANSFER_MODE:-normal}, DURATION=${DURATION_SEC}s, INTERVAL=${RUN_INTERVAL_HOURS}h"
   if [ -n "$BANDWIDTH" ]; then
     info "限速：${BANDWIDTH}"
   else
@@ -417,7 +434,7 @@ write_timer_file() {
 Description=Run iperf3 client at every hour
 
 [Timer]
-OnCalendar=*-*-* *:00:00
+OnCalendar=*-*-* 0/${RUN_INTERVAL_HOURS}:00:00
 Persistent=true
 AccuracySec=1s
 Unit=${SERVICE_NAME}
@@ -448,7 +465,7 @@ enable_autostart() {
   if systemctl is-enabled "$TIMER_NAME" >/dev/null 2>&1; then
     ok "已启用开机自启与整点任务。"
     echo "  Timer : ${TIMER_NAME}"
-    echo "  每小时整点自动执行一次。"
+    echo "  每${RUN_INTERVAL_HOURS}小时整点自动执行一次。"
     echo "  日志 : ${LOG_FILE}"
   else
     err "启用失败，请检查 systemctl 状态。"
@@ -494,8 +511,10 @@ show_status() {
 
   load_selected_config
   if [ -n "${TARGET_IP:-}" ] && [ -n "${TARGET_PORT:-}" ] && [ -n "${DURATION_SEC:-}" ]; then
+    RUN_INTERVAL_HOURS="${RUN_INTERVAL_HOURS:-$DEFAULT_INTERVAL_HOURS}"
     info "目标：${TARGET_IP}:${TARGET_PORT}"
     info "持续：${DURATION_SEC}s"
+    info "运行间隔：每${RUN_INTERVAL_HOURS}小时整点"
     info "模式：${TRANSFER_MODE:-normal}"
     if [ -n "${BANDWIDTH:-}" ]; then
       info "限速：${BANDWIDTH}"
