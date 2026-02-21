@@ -5,7 +5,7 @@
 #  功能：
 #    1) 启用整点定时连接（systemd timer）
 #    2) 关闭整点定时连接
-#    3) 查看状态
+#    3) 启动（按已设参数立即运行一次）
 #    0) 退出
 # ============================================
 
@@ -258,6 +258,54 @@ WantedBy=multi-user.target
 EOF_SVC
 }
 
+run_once_with_saved_config() {
+  local iperf3_bin
+  local -a cmd
+  local exit_code
+
+  check_or_install_iperf3 || return 1
+  load_selected_config
+
+  if [ -z "${TARGET_IP:-}" ] || [ -z "${TARGET_PORT:-}" ] || [ -z "${DURATION_SEC:-}" ]; then
+    err "未找到已保存参数，请先执行“启用整点定时 + 开机自启”完成配置。"
+    return 1
+  fi
+
+  iperf3_bin="$(command -v iperf3 || true)"
+  if [ -z "$iperf3_bin" ]; then
+    err "未找到 iperf3 可执行文件。"
+    return 1
+  fi
+
+  cmd=("$iperf3_bin" -c "$TARGET_IP" -p "$TARGET_PORT")
+  if [ -n "${BANDWIDTH:-}" ]; then
+    cmd+=(-b "$BANDWIDTH")
+  fi
+  if [ "${TRANSFER_MODE:-}" = "-R" ]; then
+    cmd+=(-R)
+  fi
+  cmd+=(-t "$DURATION_SEC")
+
+  touch "$LOG_FILE"
+  chmod 644 "$LOG_FILE"
+
+  info "开始按已设参数立即运行一次："
+  info "目标=${TARGET_IP}:${TARGET_PORT}, 模式=${TRANSFER_MODE:-normal}, 时长=${DURATION_SEC}s, 限速=${BANDWIDTH:-不限速}"
+  echo ""
+
+  "${cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+  exit_code=${PIPESTATUS[0]}
+
+  echo ""
+  if [ "$exit_code" -eq 0 ]; then
+    ok "iperf3 运行完成，返回码=0（看起来运行正常）。"
+  else
+    err "iperf3 运行失败，返回码=${exit_code}。请结合上方输出和日志排查。"
+  fi
+
+  return "$exit_code"
+}
+
 write_timer_file() {
   cat > "$TIMER_FILE" <<EOF_TMR
 [Unit]
@@ -374,9 +422,10 @@ show_menu() {
   echo ""
   echo "  1) 启用整点定时 + 开机自启"
   echo "  2) 关闭整点定时 + 关闭自启"
+  echo "  3) 启动（按已设参数立即运行一次）"
   echo "  0) 退出"
   echo ""
-  read -r -p "请选择操作 [0-2]: " choice
+  read -r -p "请选择操作 [0-3]: " choice
 
   case "$choice" in
     1)
@@ -385,12 +434,15 @@ show_menu() {
     2)
       disable_autostart || true
       ;;
+    3)
+      run_once_with_saved_config || true
+      ;;
     0)
       ok "已退出。"
       exit 0
       ;;
     *)
-      err "无效选项，请输入 0-2。"
+      err "无效选项，请输入 0-3。"
       ;;
   esac
 
