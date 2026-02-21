@@ -305,7 +305,6 @@ add_forwarding_rule() {
     # 生成 upstream 块
     cat >> "$CONFIG_FILE" <<EOF || return 1
 
-# Stream_${node}
 upstream backend_stream_${node} {
     zone ${zone_name} 64k;
     server ${target} resolve;
