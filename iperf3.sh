@@ -274,6 +274,21 @@ EOF_SVC
 }
 
 enable_autostart() {
+  if systemctl is-enabled "$SERVICE_NAME" >/dev/null 2>&1; then
+    ok "检测到 iperf3 开机自启已启用，无需重复设置。"
+    if systemctl is-active "$SERVICE_NAME" >/dev/null 2>&1; then
+      info "当前服务状态：运行中"
+    else
+      warn "当前服务状态：未运行"
+    fi
+
+    load_selected_config
+    if [ -n "${LISTEN_IP:-}" ] && [ -n "${LISTEN_PORT:-}" ]; then
+      info "当前监听：${LISTEN_IP}:${LISTEN_PORT}"
+    fi
+    return 0
+  fi
+
   check_or_install_iperf3 || return 1
   select_listen_ip || return 1
 
@@ -367,7 +382,8 @@ show_menu() {
   esac
 
   echo ""
-  read -r -p "按 Enter 返回菜单..." _
+  read -r -n 1 -s -p "按任意键返回菜单..." _
+  echo ""
 }
 
 main() {
