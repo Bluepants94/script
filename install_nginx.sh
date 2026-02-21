@@ -7,7 +7,7 @@ error_exit() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ $1" >&2; exit 1; }
 
 # ========== 定义Nginx下载页面和配置文件下载链接 ==========
 NGINX_DOWNLOAD_PAGE="http://nginx.org/download/"
-NGINX_CONF_URL="https://bluepants.oss-cn-hangzhou.aliyuncs.com/shell/nginx/nginx.conf"
+NGINX_CONF_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/nginx.conf"
 
 # ========== 获取最新版本号 ==========
 log "正在从 $NGINX_DOWNLOAD_PAGE 获取最新版本..."
