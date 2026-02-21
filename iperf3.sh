@@ -16,6 +16,7 @@ SERVICE_NAME="iperf3-server-custom.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 STATE_FILE="/etc/iperf3-server-manager.conf"
 DEFAULT_PORT="5201"
+PLACEHOLDER_IP="---.---.---.---"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -141,6 +142,32 @@ detect_public_ipv4() {
   fi
 }
 
+prompt_choice_in_range() {
+  local prompt="$1"
+  local min="$2"
+  local max="$3"
+  local choice
+
+  read -r -p "$prompt" choice
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt "$min" ] || [ "$choice" -gt "$max" ]; then
+    err "无效选项。"
+    return 1
+  fi
+
+  echo "$choice"
+}
+
+prompt_port_with_default() {
+  local input_port
+  read -r -p "请输入监听端口 (默认 ${DEFAULT_PORT}): " input_port
+  LISTEN_PORT="${input_port:-$DEFAULT_PORT}"
+
+  if ! [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
+    err "端口无效：${LISTEN_PORT}"
+    return 1
+  fi
+}
+
 save_selected_config() {
   cat > "$STATE_FILE" <<EOF_CFG
 LISTEN_IP="${LISTEN_IP}"
@@ -157,23 +184,25 @@ load_selected_config() {
 
 select_listen_ip() {
   local ips ip
-  local private_ips=()
+  local private_ip=""
   local public_ip=""
-  local private_choice="---.---.---.---"
-  local public_choice="---.---.---.---"
+  local private_choice="$PLACEHOLDER_IP"
+  local public_choice="$PLACEHOLDER_IP"
+  local ip_choice
 
   mapfile -t ips < <(collect_local_ipv4)
 
   for ip in "${ips[@]}"; do
     if is_private_ipv4 "$ip"; then
-      private_ips+=("$ip")
+      private_ip="$ip"
+      break
     fi
   done
 
   public_ip="$(detect_public_ipv4)"
 
-  if [ "${#private_ips[@]}" -gt 0 ]; then
-    private_choice="${private_ips[0]}"
+  if [ -n "$private_ip" ]; then
+    private_choice="$private_ip"
   fi
 
   if [ -n "$public_ip" ]; then
@@ -188,11 +217,7 @@ select_listen_ip() {
   echo "  3) ${private_choice} (内网IP)"
   echo "  4) ${public_choice} (公网IP)"
 
-  read -r -p "输入选项编号: " ip_choice
-  if ! [[ "$ip_choice" =~ ^[0-9]+$ ]] || [ "$ip_choice" -lt 1 ] || [ "$ip_choice" -gt 4 ]; then
-    err "无效选项。"
-    return 1
-  fi
+  ip_choice="$(prompt_choice_in_range "输入选项编号: " 1 4)" || return 1
 
   case "$ip_choice" in
     1)
@@ -202,14 +227,14 @@ select_listen_ip() {
       LISTEN_IP="0.0.0.0"
       ;;
     3)
-      if [ "$private_choice" = "---.---.---.---" ]; then
+      if [ "$private_choice" = "$PLACEHOLDER_IP" ]; then
         err "当前无可用内网IP，请选择其他选项。"
         return 1
       fi
       LISTEN_IP="$private_choice"
       ;;
     4)
-      if [ "$public_choice" = "---.---.---.---" ]; then
+      if [ "$public_choice" = "$PLACEHOLDER_IP" ]; then
         err "当前无可用公网IP，请选择其他选项。"
         return 1
       fi
@@ -217,12 +242,7 @@ select_listen_ip() {
       ;;
   esac
 
-  read -r -p "请输入监听端口 (默认 ${DEFAULT_PORT}): " input_port
-  LISTEN_PORT="${input_port:-$DEFAULT_PORT}"
-  if ! [[ "$LISTEN_PORT" =~ ^[0-9]+$ ]] || [ "$LISTEN_PORT" -lt 1 ] || [ "$LISTEN_PORT" -gt 65535 ]; then
-    err "端口无效：${LISTEN_PORT}"
-    return 1
-  fi
+  prompt_port_with_default || return 1
 
   save_selected_config
   ok "监听配置已保存：IP=${LISTEN_IP}, PORT=${LISTEN_PORT}"
@@ -324,7 +344,7 @@ show_menu() {
   echo "╚══════════════════════════════════════════════╝"
   show_status
   echo ""
-  echo "  1) 开机自启（自动安装 + 选择监听IP）"
+  echo "  1) 开机自启"
   echo "  2) 关闭自启"
   echo "  0) 退出"
   echo ""
