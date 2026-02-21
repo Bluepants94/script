@@ -423,7 +423,7 @@ print_rules_home_style() {
             local wl_count=$(echo "${rule_whitelists[$i]}" | tr ',' '\n' | wc -l)
             wl_info=" ${GREEN}[白名单: ${wl_count}条]${NC}"
         fi
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}\"${rule_nodes[$i]}\"${NC} ${YELLOW}${rule_ports[$i]}${NC} → ${CYAN}${rule_targets[$i]}${NC} ${YELLOW}(TCP+UDP)${NC}${wl_info}"
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${GREEN}${rule_nodes[$i]}${NC} ${YELLOW}${rule_ports[$i]}${NC} → ${CYAN}${rule_targets[$i]}${NC} ${YELLOW}(TCP+UDP)${NC}${wl_info}"
     done
     echo ""
 }
@@ -775,7 +775,7 @@ do_delete() {
 
         local del_idx=$((del_input - 1))
         local del_node="${rule_nodes[$del_idx]}"
-        local del_info="\"${del_node}\" ${rule_ports[$del_idx]} → ${rule_targets[$del_idx]} (TCP+UDP)"
+        local del_info="${del_node} ${rule_ports[$del_idx]} → ${rule_targets[$del_idx]} (TCP+UDP)"
 
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
