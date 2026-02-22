@@ -662,6 +662,7 @@ do_add() {
     echo ""
     local setup_whitelist
     read -r -p "是否配置白名单？[Y/N]: " setup_whitelist
+    setup_whitelist=${setup_whitelist:-N}
     
     local whitelist=""
     if is_yes "$setup_whitelist"; then
@@ -714,6 +715,7 @@ do_add() {
     
     echo ""
     read -r -p "确认添加？[Y/N]: " confirm
+    confirm=${confirm:-Y}
     if ! is_yes "$confirm"; then
         print_warn "已取消添加"
         return
@@ -782,6 +784,7 @@ do_delete() {
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
             read -r -p "确认删除全部规则？[Y/N]: " confirm
+            confirm=${confirm:-N}
             if is_yes "$confirm"; then
                 backup_config
 
@@ -818,9 +821,10 @@ do_delete() {
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
         read -r -p "确认删除？[Y/N]: " confirm
+        confirm=${confirm:-N}
         if ! is_yes "$confirm"; then
-            print_warn "已取消删除"
-            continue
+            set_last_result "warn" "已取消删除"
+            return
         fi
 
         # 备份配置
