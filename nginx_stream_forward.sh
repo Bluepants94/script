@@ -74,7 +74,7 @@ ask_yes_no() {
                 return 0
                 ;;
             *)
-                print_warn "输入无效，请仅输入 Y 或 N"
+                print_warn "输入无效，请重新输入！"
                 ;;
         esac
     done
