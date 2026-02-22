@@ -138,10 +138,7 @@ validate_ip_cidr() {
 
 # ---------- 生成安全的 zone 名称 ----------
 build_zone_name() {
-    local node="$1"
-    local safe
-    safe=$(echo "$node" | sed 's/[^a-zA-Z0-9_]/_/g')
-    echo "backend_zone_${safe}"
+    echo "backend_zone"
 }
 
 # ---------- 转义正则特殊字符 ----------
