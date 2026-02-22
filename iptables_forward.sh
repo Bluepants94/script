@@ -57,6 +57,10 @@ print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
+is_yes() {
+    [[ "$1" == "y" || "$1" == "Y" ]]
+}
+
 clear_rules_arrays() {
     rules_listen_ip=()
     rules_src_port=()
@@ -849,138 +853,141 @@ do_add() {
         print_rules_home_style
     fi
 
+    echo ""
+    echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
+
+    # 选择监听IP
+    local listen_ip
+    if ! choose_listen_ip; then
+        return
+    fi
+    listen_ip="$SELECTED_LISTEN_IP"
+
+    # 输入源端口
+    local src_port src_meta src_type src_start src_end
     while true; do
-        echo ""
-        echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
-
-        # 选择监听IP
-        local listen_ip
-        if ! choose_listen_ip; then
-            return
-        fi
-        listen_ip="$SELECTED_LISTEN_IP"
-
-        # 输入源端口
-        local src_port src_meta src_type src_start src_end
-        while true; do
-            read -r -p "请输入源端口（单端口如 8080，端口段如 8000-9000）: " src_port
-            src_meta=$(parse_port_expr "$src_port") || {
-                print_error "端口格式错误，范围需在 1-65535"
-                continue
-            }
-            IFS='|' read -r src_type src_start src_end <<< "$src_meta"
-            break
-        done
-
-        # 输入目标IP/域名
-        local dst_host resolved_ip is_domain check_interval
-        while true; do
-            read -r -p "请输入目标IP/域名（如 192.168.1.100 或 example.com）: " dst_host
-            if is_ipv4 "$dst_host"; then
-                resolved_ip="$dst_host"
-                is_domain="0"
-                check_interval="0"
-                break
-            fi
-            if [[ "$dst_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
-                resolved_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
-                if is_ipv4 "$resolved_ip"; then
-                    is_domain="1"
-                    while true; do
-                        read -r -p "请输入检测间隔秒（默认300，仅域名生效）: " check_interval
-                        check_interval=${check_interval:-300}
-                        if [[ "$check_interval" =~ ^[0-9]+$ ]] && [[ "$check_interval" -ge 60 ]]; then
-                            break
-                        fi
-                        print_error "检测间隔至少为 60 秒"
-                    done
-                    break
-                fi
-            fi
-            print_error "目标格式错误或域名解析失败"
-        done
-
-        # 输入目标端口
-        local dst_port_input dst_port dst_meta dst_type dst_start dst_end
-        while true; do
-            read -r -p "请输入目标端口（单端口/端口段，回车=与源端口相同）: " dst_port_input
-            dst_port_input=${dst_port_input:-$src_port}
-
-            dst_meta=$(parse_port_expr "$dst_port_input") || {
-                print_error "目标端口格式错误"
-                continue
-            }
-            IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
-
-            if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
-                dst_port="$dst_port_input"
-                break
-            fi
-
-            if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
-                local src_len dst_len
-                src_len=$(get_range_len "$src_start" "$src_end")
-                dst_len=$(get_range_len "$dst_start" "$dst_end")
-                if [[ "$src_len" -ne "$dst_len" ]]; then
-                    print_error "端口段长度不一致，无法一一对应转发（源:${src_len} 目标:${dst_len}）"
-                    continue
-                fi
-                dst_port="$dst_port_input"
-                break
-            fi
-
-            print_error "单端口必须对应单端口；端口段必须对应端口段"
-        done
-
-        # 选择协议
-        local proto proto_choice
-        echo ""
-        echo -e "${CYAN}选择转发协议:${NC}"
-        echo "  1) TCP+UDP（默认）"
-        echo "  2) 仅 TCP"
-        echo "  3) 仅 UDP"
-        read -r -p "请选择 [1-3]（默认: 1）: " proto_choice
-        case "$proto_choice" in
-            2) proto="tcp" ;;
-            3) proto="udp" ;;
-            *) proto="both" ;;
-        esac
-
-        local proto_display
-        proto_display=$(proto_to_label "$proto")
-
-        echo ""
-        echo -e "${GREEN}即将添加转发:${NC}"
-        echo -e "  监听IP:   ${CYAN}${listen_ip}${NC}"
-        echo -e "  源端口:   ${CYAN}${src_port}${NC}"
-        if [[ "$is_domain" == "1" ]]; then
-            echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC} (解析IP: ${CYAN}${resolved_ip}${NC}, 间隔: ${CYAN}${check_interval}s${NC})"
-        else
-            echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC}"
-        fi
-        echo -e "  协议:     ${CYAN}${proto_display}${NC}"
-
-        local now_ts
-        now_ts=$(date +%s)
-        rules_listen_ip+=("$listen_ip")
-        rules_src_port+=("$src_port")
-        rules_dst_host+=("$dst_host")
-        rules_dst_ip+=("$resolved_ip")
-        rules_dst_port+=("$dst_port")
-        rules_proto+=("$proto")
-        rules_resolved_ip+=("$resolved_ip")
-        rules_check_interval+=("$check_interval")
-        rules_last_check_ts+=("$now_ts")
-        rules_is_domain+=("$is_domain")
-
-        auto_save_and_apply
-
-        echo ""
-        read -r -p "是否继续添加？[y/N]: " continue_add
-        if [[ "$continue_add" != "y" && "$continue_add" != "Y" ]]; then
-            return
-        fi
+        read -r -p "请输入源端口（单端口如 8080，端口段如 8000-9000）: " src_port
+        src_meta=$(parse_port_expr "$src_port") || {
+            print_error "端口格式错误，范围需在 1-65535"
+            continue
+        }
+        IFS='|' read -r src_type src_start src_end <<< "$src_meta"
+        break
     done
+
+    # 输入目标IP/域名
+    local dst_host resolved_ip is_domain check_interval
+    while true; do
+        read -r -p "请输入目标IP/域名（如 192.168.1.100 或 example.com）: " dst_host
+        if is_ipv4 "$dst_host"; then
+            resolved_ip="$dst_host"
+            is_domain="0"
+            check_interval="0"
+            break
+        fi
+        if [[ "$dst_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+            resolved_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
+            if is_ipv4 "$resolved_ip"; then
+                is_domain="1"
+                while true; do
+                    read -r -p "请输入检测间隔秒（默认300，仅域名生效）: " check_interval
+                    check_interval=${check_interval:-300}
+                    if [[ "$check_interval" =~ ^[0-9]+$ ]] && [[ "$check_interval" -ge 60 ]]; then
+                        break
+                    fi
+                    print_error "检测间隔至少为 60 秒"
+                done
+                break
+            fi
+        fi
+        print_error "目标格式错误或域名解析失败"
+    done
+
+    # 输入目标端口
+    local dst_port_input dst_port dst_meta dst_type dst_start dst_end
+    while true; do
+        read -r -p "请输入目标端口（单端口/端口段，回车=与源端口相同）: " dst_port_input
+        dst_port_input=${dst_port_input:-$src_port}
+
+        dst_meta=$(parse_port_expr "$dst_port_input") || {
+            print_error "目标端口格式错误"
+            continue
+        }
+        IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
+
+        if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
+            dst_port="$dst_port_input"
+            break
+        fi
+
+        if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+            local src_len dst_len
+            src_len=$(get_range_len "$src_start" "$src_end")
+            dst_len=$(get_range_len "$dst_start" "$dst_end")
+            if [[ "$src_len" -ne "$dst_len" ]]; then
+                print_error "端口段长度不一致，无法一一对应转发（源:${src_len} 目标:${dst_len}）"
+                continue
+            fi
+            dst_port="$dst_port_input"
+            break
+        fi
+
+        print_error "单端口必须对应单端口；端口段必须对应端口段"
+    done
+
+    # 选择协议
+    local proto proto_choice
+    echo ""
+    echo -e "${CYAN}选择转发协议:${NC}"
+    echo "  1) TCP+UDP（默认）"
+    echo "  2) 仅 TCP"
+    echo "  3) 仅 UDP"
+    read -r -p "请选择 [1-3]（默认: 1）: " proto_choice
+    case "$proto_choice" in
+        2) proto="tcp" ;;
+        3) proto="udp" ;;
+        *) proto="both" ;;
+    esac
+
+    local proto_display
+    proto_display=$(proto_to_label "$proto")
+
+    echo ""
+    echo -e "${GREEN}即将添加转发:${NC}"
+    echo -e "  监听IP:   ${CYAN}${listen_ip}${NC}"
+    echo -e "  源端口:   ${CYAN}${src_port}${NC}"
+    if [[ "$is_domain" == "1" ]]; then
+        echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC} (解析IP: ${CYAN}${resolved_ip}${NC}, 间隔: ${CYAN}${check_interval}s${NC})"
+    else
+        echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC}"
+    fi
+    echo -e "  协议:     ${CYAN}${proto_display}${NC}"
+    echo ""
+
+    read -r -p "确认添加？[Y/N]: " confirm
+    if ! is_yes "$confirm"; then
+        set_last_result "warn" "已取消添加"
+        return
+    fi
+
+    local now_ts
+    now_ts=$(date +%s)
+    rules_listen_ip+=("$listen_ip")
+    rules_src_port+=("$src_port")
+    rules_dst_host+=("$dst_host")
+    rules_dst_ip+=("$resolved_ip")
+    rules_dst_port+=("$dst_port")
+    rules_proto+=("$proto")
+    rules_resolved_ip+=("$resolved_ip")
+    rules_check_interval+=("$check_interval")
+    rules_last_check_ts+=("$now_ts")
+    rules_is_domain+=("$is_domain")
+
+    if auto_save_and_apply >/dev/null 2>&1; then
+        set_last_result "success" "转发规则添加成功并已自动重载 iptables"
+    else
+        set_last_result "error" "规则已保存，但自动重载失败，请检查 iptables 环境"
+    fi
 }
 
 # ---------- 删除转发规则 ----------
@@ -1008,9 +1015,17 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
+            read -r -p "确认删除全部规则？[Y/N]: " confirm
+            if ! is_yes "$confirm"; then
+                set_last_result "warn" "已取消删除"
+                return
+            fi
             clear_rules_arrays
-            auto_save_and_apply
-            print_success "已删除全部转发规则！"
+            if auto_save_and_apply >/dev/null 2>&1; then
+                set_last_result "success" "已删除全部转发规则并自动重载"
+            else
+                set_last_result "error" "规则已清空，但自动重载失败"
+            fi
             return
         fi
 
@@ -1044,8 +1059,11 @@ do_delete() {
         rules_last_check_ts=("${rules_last_check_ts[@]}")
         rules_is_domain=("${rules_is_domain[@]}")
 
-        auto_save_and_apply
-        print_success "已删除转发: ${del_info}"
+        if auto_save_and_apply >/dev/null 2>&1; then
+            set_last_result "success" "已删除转发: ${del_info}（并自动重载）"
+        else
+            set_last_result "error" "已删除转发，但自动重载失败: ${del_info}"
+        fi
 
         [[ ${#rules_src_port[@]} -eq 0 ]] && break
 
@@ -1053,10 +1071,7 @@ do_delete() {
         echo -e "${BOLD}${BLUE}剩余规则:${NC}"
         print_rules_home_style
 
-        read -r -p "是否继续删除？[y/N]: " continue_del
-        if [[ "$continue_del" != "y" && "$continue_del" != "Y" ]]; then
-            return
-        fi
+        return
     done
 }
 
@@ -1109,12 +1124,18 @@ do_autostart() {
 
     case "$choice" in
         1)
-            enable_autostart_units
-            print_success "已开启开机自启"
+            if enable_autostart_units; then
+                set_last_result "success" "已开启开机自启"
+            else
+                set_last_result "error" "开启失败，请检查 systemd 环境"
+            fi
             ;;
         2)
-            disable_autostart_units
-            print_success "已关闭开机自启"
+            if disable_autostart_units; then
+                set_last_result "success" "已关闭开机自启"
+            else
+                set_last_result "error" "关闭失败，请检查 systemd 环境"
+            fi
             ;;
         *)
             return
@@ -1193,8 +1214,7 @@ main() {
                 exit 0
                 ;;
             *)
-                print_error "无效选择，请输入 0-4"
-                sleep 1
+                set_last_result "error" "无效选择，请输入 0-4"
                 ;;
         esac
     done
