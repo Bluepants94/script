@@ -227,23 +227,34 @@ resolve_domain_ipv4() {
     local domain="$1"
     local ip=""
 
-    if command -v getent >/dev/null 2>&1; then
-        ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
-        if is_ipv4 "$ip"; then
-            echo "$ip"
-            return 0
-        fi
-    fi
-
     if command -v dig >/dev/null 2>&1; then
-        ip=$(dig +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @1.0.0.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.4.4 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
         if is_ipv4 "$ip"; then
             echo "$ip"
             return 0
         fi
     fi
 
-    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+    ip=$(curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null \
         | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
         | head -n 1 \
         | sed -E 's/"data":"([0-9.]+)"/\1/')
@@ -252,8 +263,7 @@ resolve_domain_ipv4() {
         return 0
     fi
 
-    ip=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${domain}&type=A" \
-        -H 'accept: application/dns-json' 2>/dev/null \
+    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
         | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
         | head -n 1 \
         | sed -E 's/"data":"([0-9.]+)"/\1/')
@@ -617,8 +627,7 @@ create_service() {
     create_apply_script
     create_watch_script
 
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        cat > "$SERVICE_FILE" <<EOF_SVC
+    cat > "$SERVICE_FILE" <<EOF_SVC
 [Unit]
 Description=iptables Port Forwarding Rules
 After=network.target network-online.target
@@ -633,12 +642,8 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_SVC
 
-        systemctl daemon-reload
-    fi
-
-    if ! systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
-        systemctl enable iptables-forward.service 2>/dev/null
-    fi
+    systemctl daemon-reload
+    systemctl enable iptables-forward.service >/dev/null 2>&1
 
     create_watch_service
     print_success "已创建 systemd 服务并设置开机自启"
@@ -664,23 +669,34 @@ resolve_domain_ipv4() {
     local domain="$1"
     local ip=""
 
-    if command -v getent >/dev/null 2>&1; then
-        ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
-        if is_ipv4 "$ip"; then
-            echo "$ip"
-            return 0
-        fi
-    fi
-
     if command -v dig >/dev/null 2>&1; then
-        ip=$(dig +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @1.0.0.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.4.4 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
         if is_ipv4 "$ip"; then
             echo "$ip"
             return 0
         fi
     fi
 
-    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+    ip=$(curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null \
         | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
         | head -n 1 \
         | sed -E 's/"data":"([0-9.]+)"/\1/')
@@ -689,8 +705,7 @@ resolve_domain_ipv4() {
         return 0
     fi
 
-    ip=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${domain}&type=A" \
-        -H 'accept: application/dns-json' 2>/dev/null \
+    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
         | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
         | head -n 1 \
         | sed -E 's/"data":"([0-9.]+)"/\1/')
@@ -758,8 +773,7 @@ SCRIPT_EOF
 }
 
 create_watch_service() {
-    if [[ ! -f "$WATCH_SERVICE_FILE" ]]; then
-        cat > "$WATCH_SERVICE_FILE" <<EOF_SVC
+    cat > "$WATCH_SERVICE_FILE" <<EOF_SVC
 [Unit]
 Description=iptables Forward Domain Watcher
 After=network.target network-online.target
@@ -769,10 +783,8 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=${WATCH_SCRIPT_INSTALL_PATH}
 EOF_SVC
-    fi
 
-    if [[ ! -f "$WATCH_TIMER_FILE" ]]; then
-        cat > "$WATCH_TIMER_FILE" <<EOF_TIMER
+    cat > "$WATCH_TIMER_FILE" <<EOF_TIMER
 [Unit]
 Description=Run iptables forward domain watcher every minute
 
@@ -785,11 +797,10 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF_TIMER
-    fi
 
     systemctl daemon-reload
     systemctl enable iptables-forward-watch.timer >/dev/null 2>&1
-    systemctl start iptables-forward-watch.timer >/dev/null 2>&1
+    systemctl restart iptables-forward-watch.timer >/dev/null 2>&1
 }
 
 # ---------- 自动保存并应用 ----------
