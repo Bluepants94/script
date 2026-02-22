@@ -21,15 +21,26 @@ CONFIG_DIR="/etc/iptables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward-apply"
+WATCH_SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward-watch"
+WATCH_SERVICE_FILE="/etc/systemd/system/iptables-forward-watch.service"
+WATCH_TIMER_FILE="/etc/systemd/system/iptables-forward-watch.timer"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
 rules_src_port=()
+rules_dst_host=()
 rules_dst_ip=()
 rules_dst_port=()
 rules_proto=()
+rules_resolved_ip=()
+rules_check_interval=()
+rules_last_check_ts=()
+rules_is_domain=()
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
+AUTOSTART_SERVICE_ENABLED=false
+AUTOSTART_TIMER_ENABLED=false
+AUTOSTART_FULL_ENABLED=false
 
 # ---------- 工具函数 ----------
 print_banner() {
@@ -45,6 +56,46 @@ print_info()    { echo -e "${GREEN}[信息]${NC} $1"; }
 print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
+
+clear_rules_arrays() {
+    rules_listen_ip=()
+    rules_src_port=()
+    rules_dst_host=()
+    rules_dst_ip=()
+    rules_dst_port=()
+    rules_proto=()
+    rules_resolved_ip=()
+    rules_check_interval=()
+    rules_last_check_ts=()
+    rules_is_domain=()
+}
+
+refresh_autostart_state() {
+    AUTOSTART_SERVICE_ENABLED=false
+    AUTOSTART_TIMER_ENABLED=false
+    AUTOSTART_FULL_ENABLED=false
+
+    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
+        AUTOSTART_SERVICE_ENABLED=true
+    fi
+    if systemctl is-enabled --quiet iptables-forward-watch.timer 2>/dev/null; then
+        AUTOSTART_TIMER_ENABLED=true
+    fi
+
+    if $AUTOSTART_SERVICE_ENABLED && $AUTOSTART_TIMER_ENABLED; then
+        AUTOSTART_FULL_ENABLED=true
+    fi
+}
+
+enable_autostart_units() {
+    create_service
+}
+
+disable_autostart_units() {
+    systemctl disable iptables-forward.service 2>/dev/null
+    systemctl disable iptables-forward-watch.timer 2>/dev/null
+    systemctl stop iptables-forward-watch.timer 2>/dev/null
+}
 
 set_last_result() {
     LAST_RESULT_TYPE="$1"
@@ -126,6 +177,59 @@ get_range_len() {
     local start="$1"
     local end="$2"
     echo $(( end - start + 1 ))
+}
+
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+resolve_domain_ipv4() {
+    local domain="$1"
+    local ip=""
+
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    ip=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${domain}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    return 1
 }
 
 # ---------- 检查 root 权限 ----------
@@ -213,9 +317,10 @@ choose_listen_ip() {
 
     echo ""
     echo -e "${CYAN}请选择监听IP（公网/内网）:${NC}"
-    echo "  1) 0.0.0.0 (公网+内网，默认)"
+    echo "  1) 0.0.0.0 (默认)"
+    echo "  2) 127.0.0.1 (本机)"
 
-    local next_idx=2
+    local next_idx=3
 
     # 如果检测到公网IP，显示为选项
     local has_public_ip=false
@@ -223,7 +328,7 @@ choose_listen_ip() {
     if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
         has_public_ip=true
         public_ip_idx=$next_idx
-        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
+        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP)"
         next_idx=$((next_idx + 1))
     fi
 
@@ -252,6 +357,11 @@ choose_listen_ip() {
 
     if [[ "$choice" == "1" ]]; then
         SELECTED_LISTEN_IP="0.0.0.0"
+        return 0
+    fi
+
+    if [[ "$choice" == "2" ]]; then
+        SELECTED_LISTEN_IP="127.0.0.1"
         return 0
     fi
 
@@ -285,35 +395,79 @@ choose_listen_ip() {
 }
 
 # ---------- 加载规则配置 ----------
-# 新格式: 监听IP|源端口|目标IP|目标端口|协议
-# 旧格式: 源端口|目标IP|目标端口|协议  (自动兼容为监听IP=0.0.0.0)
+# 新格式:
+# 监听IP|源端口|目标主机(IP/域名)|目标端口|协议|解析IP|检测间隔秒|上次检测时间戳|是否域名(0/1)
+# 兼容旧格式:
+# 1) 监听IP|源端口|目标IP|目标端口|协议
+# 2) 源端口|目标IP|目标端口|协议
 load_rules() {
-    rules_listen_ip=()
-    rules_src_port=()
-    rules_dst_ip=()
-    rules_dst_port=()
-    rules_proto=()
+    clear_rules_arrays
 
     [[ -f "$CONFIG_FILE" ]] || return
 
-    while IFS='|' read -r c1 c2 c3 c4 c5; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
 
-        if [[ -n "$c5" ]]; then
-            # 新格式
-            rules_listen_ip+=("$c1")
-            rules_src_port+=("$c2")
-            rules_dst_ip+=("$c3")
-            rules_dst_port+=("$c4")
-            rules_proto+=("$c5")
+        local listen_ip src_port dst_host dst_port proto resolved_ip check_interval last_check_ts is_domain
+
+        if [[ -n "$c9" ]]; then
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c6"
+            check_interval="$c7"
+            last_check_ts="$c8"
+            is_domain="$c9"
+        elif [[ -n "$c5" ]]; then
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c3"
+            check_interval="0"
+            last_check_ts="0"
+            is_domain="0"
         else
-            # 旧格式兼容
-            rules_listen_ip+=("0.0.0.0")
-            rules_src_port+=("$c1")
-            rules_dst_ip+=("$c2")
-            rules_dst_port+=("$c3")
-            rules_proto+=("$c4")
+            listen_ip="0.0.0.0"
+            src_port="$c1"
+            dst_host="$c2"
+            dst_port="$c3"
+            proto="$c4"
+            resolved_ip="$c2"
+            check_interval="0"
+            last_check_ts="0"
+            is_domain="0"
         fi
+
+        [[ -z "$dst_host" ]] && dst_host="$resolved_ip"
+        if [[ "$is_domain" != "1" ]]; then
+            if is_ipv4 "$dst_host"; then
+                is_domain="0"
+            else
+                is_domain="1"
+            fi
+        fi
+
+        if [[ "$is_domain" == "1" ]] && ! is_ipv4 "$resolved_ip"; then
+            resolved_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
+        fi
+        [[ -z "$resolved_ip" ]] && resolved_ip="$dst_host"
+        [[ "$check_interval" =~ ^[0-9]+$ ]] || check_interval="0"
+        [[ "$last_check_ts" =~ ^[0-9]+$ ]] || last_check_ts="0"
+
+        rules_listen_ip+=("$listen_ip")
+        rules_src_port+=("$src_port")
+        rules_dst_host+=("$dst_host")
+        rules_dst_ip+=("$resolved_ip")
+        rules_dst_port+=("$dst_port")
+        rules_proto+=("$proto")
+        rules_resolved_ip+=("$resolved_ip")
+        rules_check_interval+=("$check_interval")
+        rules_last_check_ts+=("$last_check_ts")
+        rules_is_domain+=("$is_domain")
     done < "$CONFIG_FILE"
 }
 
@@ -321,14 +475,14 @@ load_rules() {
 save_rules() {
     cat > "$CONFIG_FILE" <<EOF_CONF
 # iptables 端口转发规则配置
-# 格式: 监听IP|源端口|目标IP|目标端口|协议(tcp/udp/both)
-# 示例: 0.0.0.0|8080|127.0.0.1|1080|both
-# 端口段: 10.0.0.1|8000-9000|192.168.1.10|18000-19000|tcp
+# 格式: 监听IP|源端口|目标主机(IP/域名)|目标端口|协议|解析IP|检测间隔秒|上次检测时间戳|是否域名
+# 示例(IP): 0.0.0.0|8080|127.0.0.1|1080|both|127.0.0.1|0|0|0
+# 示例(域名): 0.0.0.0|443|example.com|8443|tcp|93.184.216.34|300|1700000000|1
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}" >> "$CONFIG_FILE"
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_host[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${rules_resolved_ip[$i]}|${rules_check_interval[$i]}|${rules_last_check_ts[$i]}|${rules_is_domain[$i]}" >> "$CONFIG_FILE"
     done
 }
 
@@ -364,31 +518,43 @@ to_iptables_dport() {
 }
 
 if [[ -f "$CONFIG_FILE" ]]; then
-    while IFS='|' read -r c1 c2 c3 c4 c5; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
 
         listen_ip=""
         src_port=""
-        dst_ip=""
+        dst_host=""
+        resolved_ip=""
         dst_port=""
         proto=""
 
-        if [[ -n "$c5" ]]; then
+        if [[ -n "$c9" ]]; then
             listen_ip="$c1"
             src_port="$c2"
-            dst_ip="$c3"
+            dst_host="$c3"
             dst_port="$c4"
             proto="$c5"
+            resolved_ip="$c6"
+        elif [[ -n "$c5" ]]; then
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c3"
         else
             listen_ip="0.0.0.0"
             src_port="$c1"
-            dst_ip="$c2"
+            dst_host="$c2"
             dst_port="$c3"
             proto="$c4"
+            resolved_ip="$c2"
         fi
 
+        [[ -z "$resolved_ip" ]] && resolved_ip="$dst_host"
+
         dport=$(to_iptables_dport "$src_port")
-        dst_addr="${dst_ip}:${dst_port}"
+        dst_addr="${resolved_ip}:${dst_port}"
 
         match_dst=""
         if [[ "$listen_ip" != "0.0.0.0" ]]; then
@@ -413,6 +579,7 @@ SCRIPT_EOF
 # ---------- 创建 systemd 服务 ----------
 create_service() {
     create_apply_script
+    create_watch_script
 
     if [[ ! -f "$SERVICE_FILE" ]]; then
         cat > "$SERVICE_FILE" <<EOF_SVC
@@ -436,7 +603,157 @@ EOF_SVC
     if ! systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
         systemctl enable iptables-forward.service 2>/dev/null
     fi
+
+    create_watch_service
     print_success "已创建 systemd 服务并设置开机自启"
+}
+
+create_watch_script() {
+    cat > "$WATCH_SCRIPT_INSTALL_PATH" <<'SCRIPT_EOF'
+#!/bin/bash
+CONFIG_FILE="/etc/iptables-forward/rules.conf"
+APPLY_SCRIPT="/usr/local/bin/iptables-forward-apply"
+
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+resolve_domain_ipv4() {
+    local domain="$1"
+    local ip=""
+
+    if command -v getent >/dev/null 2>&1; then
+        ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    ip=$(curl -s --max-time 5 "https://1.1.1.1/dns-query?name=${domain}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
+[[ -f "$CONFIG_FILE" ]] || exit 0
+tmp_file=$(mktemp)
+now=$(date +%s)
+changed=0
+
+while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    if [[ -z "$c1" || "$c1" == \#* ]]; then
+        echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
+        continue
+    fi
+
+    listen_ip="$c1"
+    src_port="$c2"
+    dst_host="$c3"
+    dst_port="$c4"
+    proto="$c5"
+    resolved_ip="$c6"
+    check_interval="$c7"
+    last_check_ts="$c8"
+    is_domain="$c9"
+
+    [[ "$check_interval" =~ ^[0-9]+$ ]] || check_interval=0
+    [[ "$last_check_ts" =~ ^[0-9]+$ ]] || last_check_ts=0
+
+    if [[ "$is_domain" == "1" ]]; then
+        [[ "$check_interval" -le 0 ]] && check_interval=300
+        if (( now - last_check_ts >= check_interval )); then
+            new_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
+            if is_ipv4 "$new_ip"; then
+                if [[ "$new_ip" != "$resolved_ip" ]]; then
+                    resolved_ip="$new_ip"
+                    changed=1
+                fi
+                last_check_ts="$now"
+            fi
+        fi
+    fi
+
+    echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}" >> "$tmp_file"
+done < "$CONFIG_FILE"
+
+if ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
+    cp "$tmp_file" "$CONFIG_FILE"
+fi
+
+rm -f "$tmp_file"
+
+if [[ "$changed" -eq 1 ]]; then
+    "$APPLY_SCRIPT" >/dev/null 2>&1
+fi
+SCRIPT_EOF
+
+    chmod +x "$WATCH_SCRIPT_INSTALL_PATH"
+}
+
+create_watch_service() {
+    if [[ ! -f "$WATCH_SERVICE_FILE" ]]; then
+        cat > "$WATCH_SERVICE_FILE" <<EOF_SVC
+[Unit]
+Description=iptables Forward Domain Watcher
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${WATCH_SCRIPT_INSTALL_PATH}
+EOF_SVC
+    fi
+
+    if [[ ! -f "$WATCH_TIMER_FILE" ]]; then
+        cat > "$WATCH_TIMER_FILE" <<EOF_TIMER
+[Unit]
+Description=Run iptables forward domain watcher every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=iptables-forward-watch.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    fi
+
+    systemctl daemon-reload
+    systemctl enable iptables-forward-watch.timer >/dev/null 2>&1
+    systemctl start iptables-forward-watch.timer >/dev/null 2>&1
 }
 
 # ---------- 自动保存并应用 ----------
@@ -509,7 +826,13 @@ print_rules_home_style() {
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local proto_str
         proto_str=$(proto_to_label "${rules_proto[$i]}")
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})"
+        local host_show="${rules_dst_host[$i]}"
+        local resolved="${rules_resolved_ip[$i]}"
+        local extra=""
+        if [[ "${rules_is_domain[$i]}" == "1" ]]; then
+            extra=" [域名→${resolved}, 间隔:${rules_check_interval[$i]}s]"
+        fi
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${host_show}:${rules_dst_port[$i]}${NC} (${proto_str})${YELLOW}${extra}${NC}"
     done
     echo ""
 }
@@ -549,14 +872,32 @@ do_add() {
             break
         done
 
-        # 输入目标IP
-        local dst_ip
+        # 输入目标IP/域名
+        local dst_host resolved_ip is_domain check_interval
         while true; do
-            read -r -p "请输入目标IP（可内网IP，如 192.168.1.100）: " dst_ip
-            if [[ "$dst_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            read -r -p "请输入目标IP/域名（如 192.168.1.100 或 example.com）: " dst_host
+            if is_ipv4 "$dst_host"; then
+                resolved_ip="$dst_host"
+                is_domain="0"
+                check_interval="0"
                 break
             fi
-            print_error "IP格式错误"
+            if [[ "$dst_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+                resolved_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
+                if is_ipv4 "$resolved_ip"; then
+                    is_domain="1"
+                    while true; do
+                        read -r -p "请输入检测间隔秒（默认300，仅域名生效）: " check_interval
+                        check_interval=${check_interval:-300}
+                        if [[ "$check_interval" =~ ^[0-9]+$ ]] && [[ "$check_interval" -ge 60 ]]; then
+                            break
+                        fi
+                        print_error "检测间隔至少为 60 秒"
+                    done
+                    break
+                fi
+            fi
+            print_error "目标格式错误或域名解析失败"
         done
 
         # 输入目标端口
@@ -612,14 +953,25 @@ do_add() {
         echo -e "${GREEN}即将添加转发:${NC}"
         echo -e "  监听IP:   ${CYAN}${listen_ip}${NC}"
         echo -e "  源端口:   ${CYAN}${src_port}${NC}"
-        echo -e "  目标地址: ${CYAN}${dst_ip}:${dst_port}${NC}"
+        if [[ "$is_domain" == "1" ]]; then
+            echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC} (解析IP: ${CYAN}${resolved_ip}${NC}, 间隔: ${CYAN}${check_interval}s${NC})"
+        else
+            echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC}"
+        fi
         echo -e "  协议:     ${CYAN}${proto_display}${NC}"
 
+        local now_ts
+        now_ts=$(date +%s)
         rules_listen_ip+=("$listen_ip")
         rules_src_port+=("$src_port")
-        rules_dst_ip+=("$dst_ip")
+        rules_dst_host+=("$dst_host")
+        rules_dst_ip+=("$resolved_ip")
         rules_dst_port+=("$dst_port")
         rules_proto+=("$proto")
+        rules_resolved_ip+=("$resolved_ip")
+        rules_check_interval+=("$check_interval")
+        rules_last_check_ts+=("$now_ts")
+        rules_is_domain+=("$is_domain")
 
         auto_save_and_apply
 
@@ -656,11 +1008,7 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            rules_listen_ip=()
-            rules_src_port=()
-            rules_dst_ip=()
-            rules_dst_port=()
-            rules_proto=()
+            clear_rules_arrays
             auto_save_and_apply
             print_success "已删除全部转发规则！"
             return
@@ -672,19 +1020,29 @@ do_delete() {
         fi
 
         local del_idx=$((del_input - 1))
-        local del_info="${rules_listen_ip[$del_idx]} ${rules_src_port[$del_idx]} → ${rules_dst_ip[$del_idx]}:${rules_dst_port[$del_idx]}"
+        local del_info="${rules_listen_ip[$del_idx]} ${rules_src_port[$del_idx]} → ${rules_dst_host[$del_idx]}:${rules_dst_port[$del_idx]}"
 
         unset 'rules_listen_ip[del_idx]'
         unset 'rules_src_port[del_idx]'
+        unset 'rules_dst_host[del_idx]'
         unset 'rules_dst_ip[del_idx]'
         unset 'rules_dst_port[del_idx]'
         unset 'rules_proto[del_idx]'
+        unset 'rules_resolved_ip[del_idx]'
+        unset 'rules_check_interval[del_idx]'
+        unset 'rules_last_check_ts[del_idx]'
+        unset 'rules_is_domain[del_idx]'
 
         rules_listen_ip=("${rules_listen_ip[@]}")
         rules_src_port=("${rules_src_port[@]}")
+        rules_dst_host=("${rules_dst_host[@]}")
         rules_dst_ip=("${rules_dst_ip[@]}")
         rules_dst_port=("${rules_dst_port[@]}")
         rules_proto=("${rules_proto[@]}")
+        rules_resolved_ip=("${rules_resolved_ip[@]}")
+        rules_check_interval=("${rules_check_interval[@]}")
+        rules_last_check_ts=("${rules_last_check_ts[@]}")
+        rules_is_domain=("${rules_is_domain[@]}")
 
         auto_save_and_apply
         print_success "已删除转发: ${del_info}"
@@ -730,40 +1088,38 @@ do_autostart() {
     echo -e "${BOLD}${BLUE}[ 开机自启管理 ]${NC}"
     echo ""
 
-    local is_enabled=false
-    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
-        is_enabled=true
+    refresh_autostart_state
+
+    if $AUTOSTART_FULL_ENABLED; then
         echo -e "  当前状态: ${GREEN}已启用开机自启${NC}"
     else
+        if $AUTOSTART_SERVICE_ENABLED || $AUTOSTART_TIMER_ENABLED; then
+            echo -e "  当前状态: ${YELLOW}部分启用（将自动修复）${NC}"
+        else
         echo -e "  当前状态: ${YELLOW}未启用开机自启${NC}"
+        fi
     fi
     echo ""
 
-    if $is_enabled; then
-        echo -e "  ${RED}1)${NC} 关闭开机自启"
-        echo -e "  ${NC}0)${NC} 返回"
-        echo ""
-        read -r -p "请选择 [0-1]: " choice
-        case "$choice" in
-            1)
-                systemctl disable iptables-forward.service 2>/dev/null
-                print_success "已关闭开机自启"
-                ;;
-            *) return ;;
-        esac
-    else
-        echo -e "  ${GREEN}1)${NC} 开启开机自启"
-        echo -e "  ${NC}0)${NC} 返回"
-        echo ""
-        read -r -p "请选择 [0-1]: " choice
-        case "$choice" in
-            1)
-                create_service
-                print_success "已开启开机自启"
-                ;;
-            *) return ;;
-        esac
-    fi
+    echo -e "  ${GREEN}1)${NC} 开启自启"
+    echo -e "  ${RED}2)${NC} 关闭自启"
+    echo -e "  ${NC}0)${NC} 返回"
+    echo ""
+    read -r -p "请选择 [0-2]: " choice
+
+    case "$choice" in
+        1)
+            enable_autostart_units
+            print_success "已开启开机自启"
+            ;;
+        2)
+            disable_autostart_units
+            print_success "已关闭开机自启"
+            ;;
+        *)
+            return
+            ;;
+    esac
 
     return
 }
@@ -784,10 +1140,15 @@ show_menu() {
         echo -e "  IP 转发: ${RED}● 未开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     fi
 
-    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
+    refresh_autostart_state
+    if $AUTOSTART_FULL_ENABLED; then
         echo -e "  开机自启: ${GREEN}● 已启用${NC}"
     else
-        echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+        if $AUTOSTART_SERVICE_ENABLED || $AUTOSTART_TIMER_ENABLED; then
+            echo -e "  开机自启: ${YELLOW}● 部分启用（进入菜单可修复）${NC}"
+        else
+            echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+        fi
     fi
 
     detect_public_ip
