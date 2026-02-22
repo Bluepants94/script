@@ -642,10 +642,18 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF_SVC
 
-    systemctl daemon-reload
-    systemctl enable iptables-forward.service >/dev/null 2>&1
+    if ! systemctl daemon-reload; then
+        print_error "systemd 重载失败"
+        return 1
+    fi
+    if ! systemctl enable iptables-forward.service >/dev/null 2>&1; then
+        print_error "启用 iptables-forward.service 失败"
+        return 1
+    fi
 
-    create_watch_service
+    if ! create_watch_service; then
+        return 1
+    fi
     print_success "已创建 systemd 服务并设置开机自启"
 }
 
@@ -722,6 +730,10 @@ tmp_file=$(mktemp)
 now=$(date +%s)
 changed=0
 
+if command -v logger >/dev/null 2>&1; then
+    logger -t iptables-forward-watch "timer tick"
+fi
+
 while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
     if [[ -z "$c1" || "$c1" == \#* ]]; then
         echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
@@ -766,6 +778,9 @@ rm -f "$tmp_file"
 
 if [[ "$changed" -eq 1 ]]; then
     "$APPLY_SCRIPT" >/dev/null 2>&1
+    if command -v logger >/dev/null 2>&1; then
+        logger -t iptables-forward-watch "resolved ip changed, rules reapplied"
+    fi
 fi
 SCRIPT_EOF
 
@@ -798,9 +813,24 @@ Persistent=true
 WantedBy=timers.target
 EOF_TIMER
 
-    systemctl daemon-reload
-    systemctl enable iptables-forward-watch.timer >/dev/null 2>&1
-    systemctl restart iptables-forward-watch.timer >/dev/null 2>&1
+    if ! systemctl daemon-reload; then
+        print_error "systemd 重载失败"
+        return 1
+    fi
+
+    systemctl reset-failed iptables-forward-watch.service iptables-forward-watch.timer >/dev/null 2>&1
+
+    if ! systemctl enable --now iptables-forward-watch.timer; then
+        print_error "启用并启动 iptables-forward-watch.timer 失败"
+        return 1
+    fi
+
+    if ! systemctl is-active --quiet iptables-forward-watch.timer; then
+        print_error "iptables-forward-watch.timer 未处于 active 状态"
+        return 1
+    fi
+
+    return 0
 }
 
 # ---------- 自动保存并应用 ----------
