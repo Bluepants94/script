@@ -85,6 +85,14 @@ disable_autostart() {
     systemctl disable nginx >/dev/null 2>&1
 }
 
+start_nginx_service() {
+    systemctl start nginx >/dev/null 2>&1
+}
+
+stop_nginx_service() {
+    systemctl stop nginx >/dev/null 2>&1
+}
+
 # ---------- 检查 root 权限 ----------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -891,6 +899,46 @@ do_autostart() {
     esac
 }
 
+# ---------- 管理 Nginx 启动/关闭 ----------
+do_service_control() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ Nginx 启动/关闭 ]${NC}"
+    echo ""
+
+    if systemctl is-active --quiet nginx 2>/dev/null || pgrep nginx >/dev/null 2>&1; then
+        echo -e "  当前状态: ${GREEN}运行中${NC}"
+    else
+        echo -e "  当前状态: ${YELLOW}未运行${NC}"
+    fi
+    echo ""
+
+    echo -e "  ${GREEN}1)${NC} 启动 Nginx"
+    echo -e "  ${RED}2)${NC} 关闭 Nginx"
+    echo -e "  ${NC}0)${NC} 返回"
+    echo ""
+    read -r -p "请选择 [0-2]: " choice
+
+    case "$choice" in
+        1)
+            if start_nginx_service; then
+                set_last_result "success" "Nginx 已启动"
+            else
+                set_last_result "error" "启动失败，请检查 Nginx 配置或 systemd 日志"
+            fi
+            ;;
+        2)
+            if stop_nginx_service; then
+                set_last_result "success" "Nginx 已关闭"
+            else
+                set_last_result "error" "关闭失败，请检查 systemd 环境"
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
+}
+
 # ---------- 主菜单 ----------
 show_menu() {
     print_banner
@@ -926,10 +974,11 @@ show_menu() {
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${YELLOW}3)${NC} 重载 Nginx"
     echo -e "  ${CYAN}4)${NC} 开机自启管理"
+    echo -e "  ${BLUE}5)${NC} 启动/关闭 Nginx"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    read -r -p "请选择操作 [0-4]: " choice
+    read -r -p "请选择操作 [0-5]: " choice
 }
 
 # ---------- 主入口 ----------
@@ -944,13 +993,14 @@ main() {
             2) do_delete ;;
             3) do_reload ;;
             4) do_autostart ;;
+            5) do_service_control ;;
             0)
                 echo ""
                 print_info "再见！"
                 exit 0
                 ;;
             *)
-                set_last_result "error" "无效选择，请输入 0-4"
+                set_last_result "error" "无效选择，请输入 0-5"
                 ;;
         esac
     done
