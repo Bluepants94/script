@@ -379,7 +379,7 @@ run_once_with_saved_config() {
   load_selected_config
 
   if [ -z "${TARGET_IP:-}" ] || [ -z "${TARGET_PORT:-}" ] || [ -z "${DURATION_SEC:-}" ]; then
-    err "未找到已保存参数，请先执行“启用整点定时 + 开机自启”完成配置。"
+    err "未找到已保存参数，请先执行“开机自启”完成配置。"
     return 1
   fi
 
@@ -551,8 +551,8 @@ show_menu() {
   show_status
   echo ""
   echo "  1) 填写/修改参数"
-  echo "  2) 启用整点定时 + 开机自启"
-  echo "  3) 关闭整点定时 + 关闭自启"
+  echo "  2) 开机自启"
+  echo "  3) 关闭自启"
   echo "  4) 启动"
   echo "  0) 退出"
   echo ""
