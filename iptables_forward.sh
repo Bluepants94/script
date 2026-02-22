@@ -964,7 +964,8 @@ do_add() {
     echo -e "  协议:     ${CYAN}${proto_display}${NC}"
     echo ""
 
-    read -r -p "确认添加？[Y/N]: " confirm
+    read -r -p "确认添加？[Y/N]（默认Y）: " confirm
+    confirm=${confirm:-Y}
     if ! is_yes "$confirm"; then
         set_last_result "warn" "已取消添加"
         return
@@ -1015,7 +1016,8 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            read -r -p "确认删除全部规则？[Y/N]: " confirm
+            read -r -p "确认删除全部规则？[Y/N]（默认N）: " confirm
+            confirm=${confirm:-N}
             if ! is_yes "$confirm"; then
                 set_last_result "warn" "已取消删除"
                 return
@@ -1036,6 +1038,15 @@ do_delete() {
 
         local del_idx=$((del_input - 1))
         local del_info="${rules_listen_ip[$del_idx]} ${rules_src_port[$del_idx]} → ${rules_dst_host[$del_idx]}:${rules_dst_port[$del_idx]}"
+
+        echo ""
+        echo -e "${YELLOW}即将删除:${NC} ${del_info}"
+        read -r -p "确认删除？[Y/N]（默认N）: " confirm
+        confirm=${confirm:-N}
+        if ! is_yes "$confirm"; then
+            set_last_result "warn" "已取消删除"
+            return
+        fi
 
         unset 'rules_listen_ip[del_idx]'
         unset 'rules_src_port[del_idx]'
