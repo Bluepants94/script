@@ -25,6 +25,7 @@ DEFAULT_PROXY_CONF_URL="https://raw.githubusercontent.com/Bluepants94/script/ref
 # ---------- 全局变量 ----------
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
+AUTOSTART_ENABLED=false
 
 # 规则存储数组
 declare -a rule_nodes
@@ -67,6 +68,21 @@ show_last_result() {
     echo ""
     LAST_RESULT_TYPE=""
     LAST_RESULT_MSG=""
+}
+
+refresh_autostart_state() {
+    AUTOSTART_ENABLED=false
+    if systemctl is-enabled --quiet nginx 2>/dev/null; then
+        AUTOSTART_ENABLED=true
+    fi
+}
+
+enable_autostart() {
+    systemctl enable nginx >/dev/null 2>&1
+}
+
+disable_autostart() {
+    systemctl disable nginx >/dev/null 2>&1
 }
 
 # ---------- 检查 root 权限 ----------
@@ -834,6 +850,47 @@ do_reload() {
     fi
 }
 
+# ---------- 管理开机自启 ----------
+do_autostart() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ 开机自启管理 ]${NC}"
+    echo ""
+
+    refresh_autostart_state
+    if $AUTOSTART_ENABLED; then
+        echo -e "  当前状态: ${GREEN}已启用开机自启${NC}"
+    else
+        echo -e "  当前状态: ${YELLOW}未启用开机自启${NC}"
+    fi
+    echo ""
+
+    echo -e "  ${GREEN}1)${NC} 开启自启"
+    echo -e "  ${RED}2)${NC} 关闭自启"
+    echo -e "  ${NC}0)${NC} 返回"
+    echo ""
+    read -r -p "请选择 [0-2]: " choice
+
+    case "$choice" in
+        1)
+            if enable_autostart; then
+                set_last_result "success" "已开启 Nginx 开机自启"
+            else
+                set_last_result "error" "开启失败，请检查 systemd 环境"
+            fi
+            ;;
+        2)
+            if disable_autostart; then
+                set_last_result "success" "已关闭 Nginx 开机自启"
+            else
+                set_last_result "error" "关闭失败，请检查 systemd 环境"
+            fi
+            ;;
+        *)
+            return
+            ;;
+    esac
+}
+
 # ---------- 主菜单 ----------
 show_menu() {
     print_banner
@@ -851,6 +908,13 @@ show_menu() {
     else
         echo -e "  Nginx 状态: ${RED}● 未运行${NC}"
     fi
+
+    refresh_autostart_state
+    if $AUTOSTART_ENABLED; then
+        echo -e "  开机自启: ${GREEN}● 已启用${NC}"
+    else
+        echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+    fi
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
@@ -861,10 +925,11 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${YELLOW}3)${NC} 重载 Nginx"
+    echo -e "  ${CYAN}4)${NC} 开机自启管理"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    read -r -p "请选择操作 [0-3]: " choice
+    read -r -p "请选择操作 [0-4]: " choice
 }
 
 # ---------- 主入口 ----------
@@ -878,13 +943,14 @@ main() {
             1) do_add ;;
             2) do_delete ;;
             3) do_reload ;;
+            4) do_autostart ;;
             0)
                 echo ""
                 print_info "再见！"
                 exit 0
                 ;;
             *)
-                set_last_result "error" "无效选择，请输入 0-3"
+                set_last_result "error" "无效选择，请输入 0-4"
                 ;;
         esac
     done
