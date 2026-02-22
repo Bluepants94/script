@@ -47,6 +47,7 @@ print_info()    { echo -e "${GREEN}[信息]${NC} $1"; }
 print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
+print_invalid_input() { print_warn "输入无效，请重新输入！"; }
 
 is_yes() {
     [[ "$1" == "y" || "$1" == "Y" ]]
@@ -74,7 +75,7 @@ ask_yes_no() {
                 return 0
                 ;;
             *)
-                print_warn "输入无效，请重新输入！"
+                print_invalid_input
                 ;;
         esac
     done
@@ -665,7 +666,7 @@ do_add() {
     while true; do
         read -r -p "请输入转发目标（格式: IP/域名:端口，如 node.example.com:9090）: " target
         if ! validate_target "$target"; then
-            print_error "格式错误，请使用 IP/域名:端口 格式"
+            print_invalid_input
             continue
         fi
         break
@@ -676,7 +677,7 @@ do_add() {
     while true; do
         read -r -p "请输入监听端口（1-65535）: " port
         if ! validate_port "$port"; then
-            print_error "端口格式错误，范围需在 1-65535"
+            print_invalid_input
             continue
         fi
         if check_port_exists "$port"; then
@@ -699,12 +700,12 @@ do_add() {
             local wl_ip
             read -r -p "  允许 IP/网段 #${wl_count}: " wl_ip
             [[ -z "$wl_ip" ]] && {
-                print_warn "IP/网段不能为空"
+                print_invalid_input
                 continue
             }
             
             if ! validate_ip_cidr "$wl_ip"; then
-                print_error "IP/CIDR 格式错误，请重新输入"
+                print_invalid_input
                 continue
             fi
             
@@ -837,7 +838,7 @@ do_delete() {
         fi
 
         if [[ ! "$del_input" =~ ^[0-9]+$ ]] || [[ "$del_input" -lt 1 ]] || [[ "$del_input" -gt ${#rule_nodes[@]} ]]; then
-            print_error "序号无效！"
+            print_invalid_input
             continue
         fi
 
@@ -907,27 +908,34 @@ do_autostart() {
     echo -e "  ${RED}2)${NC} 关闭自启"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
-    read -r -p "请选择 [0-2]: " choice
+    while true; do
+        read -r -p "请选择 [0-2]: " choice
 
-    case "$choice" in
-        1)
-            if enable_autostart; then
-                set_last_result "success" "已开启 Nginx 开机自启"
-            else
-                set_last_result "error" "开启失败，请检查 systemd 环境"
-            fi
-            ;;
-        2)
-            if disable_autostart; then
-                set_last_result "success" "已关闭 Nginx 开机自启"
-            else
-                set_last_result "error" "关闭失败，请检查 systemd 环境"
-            fi
-            ;;
-        *)
-            return
-            ;;
-    esac
+        case "$choice" in
+            1)
+                if enable_autostart; then
+                    set_last_result "success" "已开启 Nginx 开机自启"
+                else
+                    set_last_result "error" "开启失败，请检查 systemd 环境"
+                fi
+                return
+                ;;
+            2)
+                if disable_autostart; then
+                    set_last_result "success" "已关闭 Nginx 开机自启"
+                else
+                    set_last_result "error" "关闭失败，请检查 systemd 环境"
+                fi
+                return
+                ;;
+            0)
+                return
+                ;;
+            *)
+                print_invalid_input
+                ;;
+        esac
+    done
 }
 
 # ---------- 管理 Nginx 启动/关闭 ----------
@@ -947,27 +955,34 @@ do_service_control() {
     echo -e "  ${RED}2)${NC} 关闭 Nginx"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
-    read -r -p "请选择 [0-2]: " choice
+    while true; do
+        read -r -p "请选择 [0-2]: " choice
 
-    case "$choice" in
-        1)
-            if start_nginx_service; then
-                set_last_result "success" "Nginx 已启动"
-            else
-                set_last_result "error" "启动失败，请检查 Nginx 配置或 systemd 日志"
-            fi
-            ;;
-        2)
-            if stop_nginx_service; then
-                set_last_result "success" "Nginx 已关闭"
-            else
-                set_last_result "error" "关闭失败，请检查 systemd 环境"
-            fi
-            ;;
-        *)
-            return
-            ;;
-    esac
+        case "$choice" in
+            1)
+                if start_nginx_service; then
+                    set_last_result "success" "Nginx 已启动"
+                else
+                    set_last_result "error" "启动失败，请检查 Nginx 配置或 systemd 日志"
+                fi
+                return
+                ;;
+            2)
+                if stop_nginx_service; then
+                    set_last_result "success" "Nginx 已关闭"
+                else
+                    set_last_result "error" "关闭失败，请检查 systemd 环境"
+                fi
+                return
+                ;;
+            0)
+                return
+                ;;
+            *)
+                print_invalid_input
+                ;;
+        esac
+    done
 }
 
 # ---------- 主菜单 ----------
@@ -1009,7 +1024,13 @@ show_menu() {
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    read -r -p "请选择操作 [0-5]: " choice
+    while true; do
+        read -r -p "请选择操作 [0-5]: " choice
+        if [[ "$choice" =~ ^[0-5]$ ]]; then
+            break
+        fi
+        print_invalid_input
+    done
 }
 
 # ---------- 主入口 ----------
@@ -1029,9 +1050,6 @@ main() {
                 echo ""
                 print_info "再见！"
                 exit 0
-                ;;
-            *)
-                set_last_result "error" "无效选择，请输入 0-5"
                 ;;
         esac
     done
