@@ -52,6 +52,34 @@ is_yes() {
     [[ "$1" == "y" || "$1" == "Y" ]]
 }
 
+ask_yes_no() {
+    local prompt="$1"
+    local default_value="$2"
+    local input
+
+    if [[ "$default_value" != "Y" && "$default_value" != "N" ]]; then
+        default_value="N"
+    fi
+
+    while true; do
+        read -r -p "${prompt} [Y/N]（默认${default_value}）: " input
+        input=${input:-$default_value}
+        case "$input" in
+            y|Y)
+                READ_YN_RESULT="Y"
+                return 0
+                ;;
+            n|N)
+                READ_YN_RESULT="N"
+                return 0
+                ;;
+            *)
+                print_warn "输入无效，请仅输入 Y 或 N"
+                ;;
+        esac
+    done
+}
+
 set_last_result() {
     LAST_RESULT_TYPE="$1"
     LAST_RESULT_MSG="$2"
@@ -660,9 +688,8 @@ do_add() {
 
     # 配置白名单
     echo ""
-    local setup_whitelist
-    read -r -p "是否配置白名单？[Y/N]: " setup_whitelist
-    setup_whitelist=${setup_whitelist:-N}
+    ask_yes_no "是否配置白名单？" "N"
+    local setup_whitelist="$READ_YN_RESULT"
     
     local whitelist=""
     if is_yes "$setup_whitelist"; then
@@ -688,8 +715,8 @@ do_add() {
             fi
             wl_count=$((wl_count + 1))
 
-            local add_more
-            read -r -p "是否继续添加 allow？[Y/N]: " add_more
+            ask_yes_no "是否继续添加 allow？" "N"
+            local add_more="$READ_YN_RESULT"
             if ! is_yes "$add_more"; then
                 break
             fi
@@ -714,8 +741,8 @@ do_add() {
     fi
     
     echo ""
-    read -r -p "确认添加？[Y/N]: " confirm
-    confirm=${confirm:-Y}
+    ask_yes_no "确认添加？" "Y"
+    local confirm="$READ_YN_RESULT"
     if ! is_yes "$confirm"; then
         print_warn "已取消添加"
         return
@@ -783,8 +810,8 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            read -r -p "确认删除全部规则？[Y/N]: " confirm
-            confirm=${confirm:-N}
+            ask_yes_no "确认删除全部规则？" "N"
+            local confirm="$READ_YN_RESULT"
             if is_yes "$confirm"; then
                 backup_config
 
@@ -820,8 +847,8 @@ do_delete() {
 
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
-        read -r -p "确认删除？[Y/N]: " confirm
-        confirm=${confirm:-N}
+        ask_yes_no "确认删除？" "N"
+        local confirm="$READ_YN_RESULT"
         if ! is_yes "$confirm"; then
             set_last_result "warn" "已取消删除"
             return
