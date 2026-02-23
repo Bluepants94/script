@@ -76,6 +76,41 @@ show_last_result() {
     LAST_RESULT_MSG=""
 }
 
+read_menu_choice() {
+    local prompt="$1"
+    local regex="$2"
+    local default_value="${3:-}"
+    local value
+
+    while true; do
+        read -r -p "$prompt" value
+        if [[ -z "$value" && -n "$default_value" ]]; then
+            value="$default_value"
+        fi
+        if [[ "$value" =~ $regex ]]; then
+            echo "$value"
+            return 0
+        fi
+        print_error "输入无效，请重新输入！"
+    done
+}
+
+read_confirm_yn_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local value
+
+    while true; do
+        read -r -p "$prompt" value
+        value=${value:-$default_value}
+        case "$value" in
+            Y|y) echo "Y"; return 0 ;;
+            N|n) echo "N"; return 0 ;;
+            *) print_error "输入无效，请重新输入！" ;;
+        esac
+    done
+}
+
 proto_to_label() {
     case "$1" in
         tcp) echo "TCP" ;;
@@ -412,7 +447,7 @@ choose_listen_ip() {
 
     echo ""
     echo -e "${CYAN}请选择监听IP（公网/内网）:${NC}"
-    echo "  1) 0.0.0.0 (默认)"
+    echo "  1) 0.0.0.0 (公网+内网，默认)"
 
     local next_idx=2
 
@@ -422,7 +457,7 @@ choose_listen_ip() {
     if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
         has_public_ip=true
         public_ip_idx=$next_idx
-        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网)"
+        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
         next_idx=$((next_idx + 1))
     fi
 
@@ -664,7 +699,7 @@ do_domain_watch_manage() {
     echo ""
 
     while true; do
-        read -r -p "请选择 [0-3]: " sub_choice
+        sub_choice=$(read_menu_choice "请选择 [0-3]: " '^[0-3]$')
         case "$sub_choice" in
             1)
                 if is_watch_enabled; then
@@ -683,12 +718,7 @@ do_domain_watch_manage() {
                     if remove_watch_cron_task; then
                         set_last_result "success" "Cron任务删除成功"
                     else
-                        rc=$?
-                        if [[ "$rc" -eq 2 ]]; then
-                            set_last_result "warn" "Cron任务不存在，无需重复删除"
-                        else
-                            set_last_result "error" "Cron任务删除失败"
-                        fi
+                        set_last_result "error" "Cron任务删除失败"
                     fi
                 else
                     if add_watch_cron_task; then
@@ -707,8 +737,8 @@ do_domain_watch_manage() {
             3)
                 local new_minutes
                 while true; do
-                    read -r -p "请输入域名监控间隔（分钟，默认: ${GLOBAL_WATCH_INTERVAL_MINUTES}）: " new_minutes
-                    new_minutes=${new_minutes:-$GLOBAL_WATCH_INTERVAL_MINUTES}
+                    read -r -p "请输入域名监控间隔（分钟，默认: 10）: " new_minutes
+                    new_minutes=${new_minutes:-5}
                     if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 1 ]] && [[ "$new_minutes" -le 59 ]]; then
                         GLOBAL_WATCH_INTERVAL_MINUTES="$new_minutes"
                         save_rules
@@ -945,22 +975,11 @@ do_add() {
     echo -e "  协议:     ${CYAN}${proto_display}${NC}"
 
     local confirm_add
-    while true; do
-        read -r -p "是否确认添加？[Y/N]（默认: Y）: " confirm_add
-        confirm_add=${confirm_add:-Y}
-        case "$confirm_add" in
-            Y|y)
-                break
-                ;;
-            N|n)
-                set_last_result "warn" "已取消添加"
-                return
-                ;;
-            *)
-                print_error "输入无效，请重新输入！"
-                ;;
-        esac
-    done
+    confirm_add=$(read_confirm_yn_default "是否确认添加？[Y/N]（默认: Y）: " "Y")
+    if [[ "$confirm_add" == "N" ]]; then
+        set_last_result "warn" "已取消添加"
+        return
+    fi
 
     rules_listen_ip+=("$listen_ip")
     rules_src_port+=("$src_port")
@@ -1002,18 +1021,11 @@ do_delete() {
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
             local confirm_delete_all
-            while true; do
-                read -r -p "确认删除全部规则？[Y/N]（默认: N）: " confirm_delete_all
-                confirm_delete_all=${confirm_delete_all:-N}
-                case "$confirm_delete_all" in
-                    Y|y) break ;;
-                    N|n)
-                        set_last_result "warn" "已取消删除"
-                        return
-                        ;;
-                    *) print_error "输入无效，请重新输入！" ;;
-                esac
-            done
+            confirm_delete_all=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
+            if [[ "$confirm_delete_all" == "N" ]]; then
+                set_last_result "warn" "已取消删除"
+                return
+            fi
 
             rules_listen_ip=()
             rules_src_port=()
@@ -1034,21 +1046,13 @@ do_delete() {
         fi
 
         local del_idx=$((del_input - 1))
-        local del_info="${rules_listen_ip[$del_idx]} ${rules_src_port[$del_idx]} → ${rules_dst_ip[$del_idx]}:${rules_dst_port[$del_idx]}"
 
         local confirm_delete_one
-        while true; do
-            read -r -p "确认删除该规则？[Y/N]（默认: N）: " confirm_delete_one
-            confirm_delete_one=${confirm_delete_one:-N}
-            case "$confirm_delete_one" in
-                Y|y) break ;;
-                N|n)
-                    set_last_result "warn" "已取消删除"
-                    return
-                    ;;
-                *) print_error "输入无效，请重新输入！" ;;
-            esac
-        done
+        confirm_delete_one=$(read_confirm_yn_default "确认删除该规则？[Y/N]（默认: N）: " "N")
+        if [[ "$confirm_delete_one" == "N" ]]; then
+            set_last_result "warn" "已取消删除"
+            return
+        fi
 
         unset 'rules_listen_ip[del_idx]'
         unset 'rules_src_port[del_idx]'
@@ -1116,48 +1120,38 @@ do_autostart() {
         echo -e "  ${RED}1)${NC} 关闭开机自启"
         echo -e "  ${NC}0)${NC} 返回"
         echo ""
-        while true; do
-            read -r -p "请选择 [0-1]: " choice
-            case "$choice" in
-                1)
-                    if systemctl disable iptables-forward.service 2>/dev/null; then
-                        set_last_result "success" "已关闭开机自启"
-                    else
-                        set_last_result "error" "关闭开机自启失败"
-                    fi
-                    return
-                    ;;
-                0)
-                    return
-                    ;;
-                *)
-                    print_error "输入无效，请重新输入！"
-                    ;;
-            esac
-        done
+        choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
+        case "$choice" in
+            1)
+                if systemctl disable iptables-forward.service 2>/dev/null; then
+                    set_last_result "success" "已关闭开机自启"
+                else
+                    set_last_result "error" "关闭开机自启失败"
+                fi
+                return
+                ;;
+            0)
+                return
+                ;;
+        esac
     else
         echo -e "  ${GREEN}1)${NC} 开启开机自启"
         echo -e "  ${NC}0)${NC} 返回"
         echo ""
-        while true; do
-            read -r -p "请选择 [0-1]: " choice
-            case "$choice" in
-                1)
-                    if create_service; then
-                        set_last_result "success" "已开启开机自启"
-                    else
-                        set_last_result "error" "开启开机自启失败，请检查网络或 systemd 状态"
-                    fi
-                    return
-                    ;;
-                0)
-                    return
-                    ;;
-                *)
-                    print_error "输入无效，请重新输入！"
-                    ;;
-            esac
-        done
+        choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
+        case "$choice" in
+            1)
+                if create_service; then
+                    set_last_result "success" "已开启开机自启"
+                else
+                    set_last_result "error" "开启开机自启失败，请检查网络或 systemd 状态"
+                fi
+                return
+                ;;
+            0)
+                return
+                ;;
+        esac
     fi
 
     return
@@ -1207,19 +1201,13 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
-    echo -e "  ${YELLOW}4)${NC} 开机自启管理"
-    echo -e "  ${BLUE}5)${NC} 更新脚本文件"
-    echo -e "  ${CYAN}6)${NC} 域名监控间隔"
+    echo -e "  ${CYAN}4)${NC} 域名监控间隔"
+    echo -e "  ${YELLOW}5)${NC} 开机自启管理"
+    echo -e "  ${BLUE}6)${NC} 更新脚本文件"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    while true; do
-        read -r -p "请选择操作 [0-6]: " choice
-        if [[ "$choice" =~ ^[0-6]$ ]]; then
-            break
-        fi
-        print_error "输入无效，请重新输入！"
-    done
+    choice=$(read_menu_choice "请选择操作 [0-6]: " '^[0-6]$')
 }
 
 # ---------- 主入口 ----------
