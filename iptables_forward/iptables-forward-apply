@@ -1,0 +1,67 @@
+#!/bin/bash
+CONFIG_FILE="/etc/iptables-forward/rules.conf"
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+
+iptables -t nat -F PREROUTING 2>/dev/null
+iptables -t nat -F POSTROUTING 2>/dev/null
+iptables -t nat -A POSTROUTING -j MASQUERADE
+
+to_iptables_dport() {
+    echo "$1" | sed 's/-/:/'
+}
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+        [[ -z "$c1" || "$c1" == \#* ]] && continue
+
+        listen_ip=""
+        src_port=""
+        dst_host=""
+        resolved_ip=""
+        dst_port=""
+        proto=""
+
+        if [[ -n "$c9" ]]; then
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c6"
+        elif [[ -n "$c5" ]]; then
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c3"
+        else
+            listen_ip="0.0.0.0"
+            src_port="$c1"
+            dst_host="$c2"
+            dst_port="$c3"
+            proto="$c4"
+            resolved_ip="$c2"
+        fi
+
+        [[ -z "$resolved_ip" ]] && resolved_ip="$dst_host"
+
+        dport=$(to_iptables_dport "$src_port")
+        dst_addr="${resolved_ip}:${dst_port}"
+
+        match_dst=""
+        if [[ "$listen_ip" != "0.0.0.0" ]]; then
+            match_dst="-d ${listen_ip}"
+        fi
+
+        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
+            iptables -t nat -A PREROUTING ${match_dst} -p tcp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
+        fi
+        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
+            iptables -t nat -A PREROUTING ${match_dst} -p udp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
+        fi
+    done < "$CONFIG_FILE"
+fi
+
+echo "[iptables-forward] 规则已应用"
