@@ -12,43 +12,31 @@ to_iptables_dport() {
 }
 
 if [[ -f "$CONFIG_FILE" ]]; then
-    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    while IFS='|' read -r c1 c2 c3 c4 c5; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
 
         listen_ip=""
         src_port=""
-        dst_host=""
-        resolved_ip=""
+        dst_ip=""
         dst_port=""
         proto=""
 
-        if [[ -n "$c9" ]]; then
+        if [[ -n "$c5" ]]; then
             listen_ip="$c1"
             src_port="$c2"
-            dst_host="$c3"
+            dst_ip="$c3"
             dst_port="$c4"
             proto="$c5"
-            resolved_ip="$c6"
-        elif [[ -n "$c5" ]]; then
-            listen_ip="$c1"
-            src_port="$c2"
-            dst_host="$c3"
-            dst_port="$c4"
-            proto="$c5"
-            resolved_ip="$c3"
         else
             listen_ip="0.0.0.0"
             src_port="$c1"
-            dst_host="$c2"
+            dst_ip="$c2"
             dst_port="$c3"
             proto="$c4"
-            resolved_ip="$c2"
         fi
 
-        [[ -z "$resolved_ip" ]] && resolved_ip="$dst_host"
-
         dport=$(to_iptables_dport "$src_port")
-        dst_addr="${resolved_ip}:${dst_port}"
+        dst_addr="${dst_ip}:${dst_port}"
 
         match_dst=""
         if [[ "$listen_ip" != "0.0.0.0" ]]; then
