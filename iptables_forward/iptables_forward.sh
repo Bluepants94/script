@@ -412,7 +412,7 @@ choose_listen_ip() {
 
     echo ""
     echo -e "${CYAN}请选择监听IP（公网/内网）:${NC}"
-    echo "  1) 0.0.0.0 (公网+内网，默认)"
+    echo "  1) 0.0.0.0 (默认)"
 
     local next_idx=2
 
@@ -422,7 +422,7 @@ choose_listen_ip() {
     if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
         has_public_ip=true
         public_ip_idx=$next_idx
-        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
+        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网)"
         next_idx=$((next_idx + 1))
     fi
 
@@ -1235,9 +1235,9 @@ main() {
             1) do_add ;;
             2) do_delete ;;
             3) do_restart ;;
-            4) do_autostart ;;
-            5) do_update ;;
-            6) do_domain_watch_manage ;;
+            4) do_domain_watch_manage ;;
+            5) do_autostart ;;
+            6) do_update ;;
             0)
                 echo ""
                 print_info "再见！"
