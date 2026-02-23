@@ -1,0 +1,123 @@
+#!/bin/bash
+CONFIG_FILE="/etc/iptables-forward/rules.conf"
+APPLY_SCRIPT="/usr/local/bin/iptables-forward-apply"
+
+is_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+resolve_domain_ipv4() {
+    local domain="$1"
+    local ip=""
+
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @1.0.0.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        ip=$(dig @8.8.4.4 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        if is_ipv4 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    fi
+
+    ip=$(curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" \
+        -H 'accept: application/dns-json' 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
+        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
+        | head -n 1 \
+        | sed -E 's/"data":"([0-9.]+)"/\1/')
+    if is_ipv4 "$ip"; then
+        echo "$ip"
+        return 0
+    fi
+
+    return 1
+}
+
+[[ -f "$CONFIG_FILE" ]] || exit 0
+tmp_file=$(mktemp)
+now=$(date +%s)
+changed=0
+
+if command -v logger >/dev/null 2>&1; then
+    logger -t iptables-forward-watch "timer tick"
+fi
+
+while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    if [[ -z "$c1" || "$c1" == \#* ]]; then
+        echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
+        continue
+    fi
+
+    listen_ip="$c1"
+    src_port="$c2"
+    dst_host="$c3"
+    dst_port="$c4"
+    proto="$c5"
+    resolved_ip="$c6"
+    check_interval="$c7"
+    last_check_ts="$c8"
+    is_domain="$c9"
+
+    [[ "$check_interval" =~ ^[0-9]+$ ]] || check_interval=0
+    [[ "$last_check_ts" =~ ^[0-9]+$ ]] || last_check_ts=0
+
+    if [[ "$is_domain" == "1" ]]; then
+        [[ "$check_interval" -le 0 ]] && check_interval=300
+        if (( now - last_check_ts >= check_interval )); then
+            new_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
+            if is_ipv4 "$new_ip"; then
+                if [[ "$new_ip" != "$resolved_ip" ]]; then
+                    resolved_ip="$new_ip"
+                    changed=1
+                fi
+                last_check_ts="$now"
+            fi
+        fi
+    fi
+
+    echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}" >> "$tmp_file"
+done < "$CONFIG_FILE"
+
+if ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
+    cp "$tmp_file" "$CONFIG_FILE"
+fi
+
+rm -f "$tmp_file"
+
+if [[ "$changed" -eq 1 ]]; then
+    "$APPLY_SCRIPT" >/dev/null 2>&1
+    if command -v logger >/dev/null 2>&1; then
+        logger -t iptables-forward-watch "resolved ip changed, rules reapplied"
+    fi
+fi
