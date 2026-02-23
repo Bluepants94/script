@@ -21,9 +21,12 @@ CONFIG_DIR="/etc/iptables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward-apply"
+WATCH_SCRIPT_PATH="/usr/local/bin/iptables-forward-watch"
 RAW_BASE_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward"
 RAW_APPLY_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward-apply"
 RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
+RAW_WATCH_URL="${RAW_BASE_URL}/iptables-forward-watch"
+WATCH_CRON_TAG="# iptables-forward-watch"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -31,6 +34,10 @@ rules_src_port=()
 rules_dst_ip=()
 rules_dst_port=()
 rules_proto=()
+rules_resolved_ip=()
+rules_check_interval=()
+rules_last_check_ts=()
+rules_is_domain=()
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
 
@@ -92,6 +99,84 @@ is_private_ip() {
     fi
     [[ "$ip" =~ ^127\. ]] && return 0
     return 1
+}
+
+is_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+is_valid_domain() {
+    local domain="$1"
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]] || return 1
+    return 0
+}
+
+resolve_domain_ipv4_once() {
+    local domain="$1"
+    local ip=""
+
+    if command -v dig >/dev/null 2>&1; then
+        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
+
+        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
+    fi
+
+    ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
+    is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
+
+    return 1
+}
+
+update_watch_cron() {
+    local has_domain=false
+    local min_interval_minutes=999999
+
+    for ((i=0; i<${#rules_src_port[@]}; i++)); do
+        if [[ "${rules_is_domain[$i]}" == "1" ]]; then
+            has_domain=true
+            local sec="${rules_check_interval[$i]}"
+            [[ "$sec" =~ ^[0-9]+$ ]] || sec=300
+            [[ "$sec" -le 0 ]] && sec=300
+            local minutes=$(( (sec + 59) / 60 ))
+            (( minutes < 1 )) && minutes=1
+            (( minutes > 59 )) && minutes=59
+            (( minutes < min_interval_minutes )) && min_interval_minutes=$minutes
+        fi
+    done
+
+    if ! command -v crontab >/dev/null 2>&1; then
+        return 1
+    fi
+
+    local current
+    current=$(crontab -l 2>/dev/null | grep -vF "$WATCH_CRON_TAG" || true)
+    local new_content="$current"
+
+    if $has_domain; then
+        local cron_line="*/${min_interval_minutes} * * * * ${WATCH_SCRIPT_PATH} >/dev/null 2>&1 ${WATCH_CRON_TAG}"
+        if [[ -n "$new_content" ]]; then
+            new_content="${new_content}"$'\n'"${cron_line}"
+        else
+            new_content="${cron_line}"
+        fi
+    fi
+
+    if [[ -n "$new_content" ]]; then
+        printf "%s\n" "$new_content" | crontab -
+    else
+        crontab -r 2>/dev/null || true
+    fi
+
+    return 0
 }
 
 parse_port_expr() {
@@ -162,6 +247,12 @@ sync_support_files() {
 
     if [[ "$force_update" == "true" || ! -s "$SERVICE_FILE" ]]; then
         download_file_silent "$RAW_SERVICE_URL" "$SERVICE_FILE" "644" || return 1
+    fi
+
+    if [[ "$force_update" == "true" || ! -s "$WATCH_SCRIPT_PATH" ]]; then
+        download_file_silent "$RAW_WATCH_URL" "$WATCH_SCRIPT_PATH" "755" || return 1
+    else
+        chmod 755 "$WATCH_SCRIPT_PATH" >/dev/null 2>&1
     fi
 
     return 0
@@ -336,34 +427,58 @@ choose_listen_ip() {
 }
 
 # ---------- 加载规则配置 ----------
-# 新格式: 监听IP|源端口|目标IP|目标端口|协议
-# 旧格式: 源端口|目标IP|目标端口|协议  (自动兼容为监听IP=0.0.0.0)
+# 新格式(9列): 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
+# 兼容格式(5列): 监听IP|源端口|目标IP|目标端口|协议
+# 旧格式(4列): 源端口|目标IP|目标端口|协议  (自动兼容为监听IP=0.0.0.0)
 load_rules() {
     rules_listen_ip=()
     rules_src_port=()
     rules_dst_ip=()
     rules_dst_port=()
     rules_proto=()
+    rules_resolved_ip=()
+    rules_check_interval=()
+    rules_last_check_ts=()
+    rules_is_domain=()
 
     [[ -f "$CONFIG_FILE" ]] || return
 
-    while IFS='|' read -r c1 c2 c3 c4 c5; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
 
-        if [[ -n "$c5" ]]; then
-            # 新格式
+        if [[ -n "$c9" ]]; then
+            # 9列格式
             rules_listen_ip+=("$c1")
             rules_src_port+=("$c2")
             rules_dst_ip+=("$c3")
             rules_dst_port+=("$c4")
             rules_proto+=("$c5")
+            rules_resolved_ip+=("$c6")
+            rules_check_interval+=("$c7")
+            rules_last_check_ts+=("$c8")
+            rules_is_domain+=("$c9")
+        elif [[ -n "$c5" ]]; then
+            # 5列格式
+            rules_listen_ip+=("$c1")
+            rules_src_port+=("$c2")
+            rules_dst_ip+=("$c3")
+            rules_dst_port+=("$c4")
+            rules_proto+=("$c5")
+            rules_resolved_ip+=("$c3")
+            rules_check_interval+=("0")
+            rules_last_check_ts+=("0")
+            rules_is_domain+=("0")
         else
-            # 旧格式兼容
+            # 4列旧格式兼容
             rules_listen_ip+=("0.0.0.0")
             rules_src_port+=("$c1")
             rules_dst_ip+=("$c2")
             rules_dst_port+=("$c3")
             rules_proto+=("$c4")
+            rules_resolved_ip+=("$c2")
+            rules_check_interval+=("0")
+            rules_last_check_ts+=("0")
+            rules_is_domain+=("0")
         fi
     done < "$CONFIG_FILE"
 }
@@ -372,14 +487,25 @@ load_rules() {
 save_rules() {
     cat > "$CONFIG_FILE" <<EOF_CONF
 # iptables 端口转发规则配置
-# 格式: 监听IP|源端口|目标IP|目标端口|协议(tcp/udp/both)
-# 示例: 0.0.0.0|8080|127.0.0.1|1080|both
-# 端口段: 10.0.0.1|8000-9000|192.168.1.10|18000-19000|tcp
+# 格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
+# 示例(IP): 0.0.0.0|8080|127.0.0.1|1080|both|127.0.0.1|0|0|0
+# 示例(域名): 0.0.0.0|8080|example.com|1080|tcp|93.184.216.34|300|1700000000|1
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}" >> "$CONFIG_FILE"
+        local d_host="${rules_dst_ip[$i]}"
+        local d_resolved="${rules_resolved_ip[$i]}"
+        local d_interval="${rules_check_interval[$i]}"
+        local d_last="${rules_last_check_ts[$i]}"
+        local d_is_domain="${rules_is_domain[$i]}"
+
+        [[ -n "$d_resolved" ]] || d_resolved="$d_host"
+        [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
+        [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
+        [[ "$d_is_domain" == "1" ]] || d_is_domain=0
+
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${d_host}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$CONFIG_FILE"
     done
 }
 
@@ -427,19 +553,29 @@ do_update() {
 auto_save_and_apply() {
     local success_msg="${1:-操作成功！}"
     local fail_msg="${2:-操作失败，请检查 iptables 环境}"
+    local cron_warn=""
 
     save_rules
+
+    if ! update_watch_cron; then
+        cron_warn="（定时任务配置失败）"
+    fi
+
     if ! create_apply_script; then
-        set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
+        set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址${cron_warn}"
         return 1
     fi
 
     if apply_rules; then
-        set_last_result "success" "$success_msg"
+        if [[ -n "$cron_warn" ]]; then
+            set_last_result "warn" "${success_msg}${cron_warn}"
+        else
+            set_last_result "success" "$success_msg"
+        fi
         return 0
     fi
 
-    set_last_result "error" "$fail_msg"
+    set_last_result "error" "${fail_msg}${cron_warn}"
     return 1
 }
 
@@ -501,7 +637,12 @@ print_rules_home_style() {
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local proto_str
         proto_str=$(proto_to_label "${rules_proto[$i]}")
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})"
+        local dst_host="${rules_dst_ip[$i]}"
+        local mark=""
+        if [[ "${rules_is_domain[$i]}" == "1" ]]; then
+            mark=" [域名→${rules_resolved_ip[$i]}]"
+        fi
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${dst_host}:${rules_dst_port[$i]}${NC} (${proto_str})${mark}"
     done
     echo ""
 }
@@ -540,13 +681,40 @@ do_add() {
         break
     done
 
-        # 输入目标IP
-    local dst_ip
+        # 输入目标地址（IP或域名）
+    local dst_host resolved_ip is_domain check_interval_seconds check_interval_minutes
     while true; do
-        read -r -p "请输入目标IP（可内网IP，如 192.168.1.100）: " dst_ip
-        if [[ "$dst_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        read -r -p "请输入目标地址（IPv4或域名）: " dst_host
+
+        if is_valid_ipv4 "$dst_host"; then
+            is_domain="0"
+            resolved_ip="$dst_host"
+            check_interval_seconds=0
             break
         fi
+
+        if is_valid_domain "$dst_host"; then
+            is_domain="1"
+
+            while true; do
+                read -r -p "请输入定时获取IP间隔（分钟，默认: 5）: " check_interval_minutes
+                check_interval_minutes=${check_interval_minutes:-5}
+                if [[ "$check_interval_minutes" =~ ^[0-9]+$ ]] && [[ "$check_interval_minutes" -ge 1 ]] && [[ "$check_interval_minutes" -le 59 ]]; then
+                    check_interval_seconds=$((check_interval_minutes * 60))
+                    break
+                fi
+                print_error "输入无效，请重新输入！"
+            done
+
+            resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
+            if ! is_valid_ipv4 "$resolved_ip"; then
+                print_error "输入无效，请重新输入！"
+                continue
+            fi
+
+            break
+        fi
+
         print_error "输入无效，请重新输入！"
     done
 
@@ -607,7 +775,11 @@ do_add() {
     echo -e "${GREEN}即将添加转发:${NC}"
     echo -e "  监听IP:   ${CYAN}${listen_ip}${NC}"
     echo -e "  源端口:   ${CYAN}${src_port}${NC}"
-    echo -e "  目标地址: ${CYAN}${dst_ip}:${dst_port}${NC}"
+    echo -e "  目标地址: ${CYAN}${dst_host}:${dst_port}${NC}"
+    if [[ "$is_domain" == "1" ]]; then
+        echo -e "  域名解析: ${CYAN}${resolved_ip}${NC}"
+        echo -e "  检测间隔: ${CYAN}${check_interval_minutes} 分钟${NC}"
+    fi
     echo -e "  协议:     ${CYAN}${proto_display}${NC}"
 
     local confirm_add
@@ -630,9 +802,13 @@ do_add() {
 
     rules_listen_ip+=("$listen_ip")
     rules_src_port+=("$src_port")
-    rules_dst_ip+=("$dst_ip")
+    rules_dst_ip+=("$dst_host")
     rules_dst_port+=("$dst_port")
     rules_proto+=("$proto")
+    rules_resolved_ip+=("$resolved_ip")
+    rules_check_interval+=("$check_interval_seconds")
+    rules_last_check_ts+=("0")
+    rules_is_domain+=("$is_domain")
 
     auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 iptables 环境"
     return
@@ -682,6 +858,10 @@ do_delete() {
             rules_dst_ip=()
             rules_dst_port=()
             rules_proto=()
+            rules_resolved_ip=()
+            rules_check_interval=()
+            rules_last_check_ts=()
+            rules_is_domain=()
             auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
             return
         fi
@@ -713,12 +893,20 @@ do_delete() {
         unset 'rules_dst_ip[del_idx]'
         unset 'rules_dst_port[del_idx]'
         unset 'rules_proto[del_idx]'
+        unset 'rules_resolved_ip[del_idx]'
+        unset 'rules_check_interval[del_idx]'
+        unset 'rules_last_check_ts[del_idx]'
+        unset 'rules_is_domain[del_idx]'
 
         rules_listen_ip=("${rules_listen_ip[@]}")
         rules_src_port=("${rules_src_port[@]}")
         rules_dst_ip=("${rules_dst_ip[@]}")
         rules_dst_port=("${rules_dst_port[@]}")
         rules_proto=("${rules_proto[@]}")
+        rules_resolved_ip=("${rules_resolved_ip[@]}")
+        rules_check_interval=("${rules_check_interval[@]}")
+        rules_last_check_ts=("${rules_last_check_ts[@]}")
+        rules_is_domain=("${rules_is_domain[@]}")
 
         auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
         return
