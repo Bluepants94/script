@@ -21,6 +21,9 @@ CONFIG_DIR="/etc/iptables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward-apply"
+RAW_BASE_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward"
+RAW_APPLY_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward-apply"
+RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -128,6 +131,48 @@ get_range_len() {
     echo $(( end - start + 1 ))
 }
 
+download_file_silent() {
+    local url="$1"
+    local target="$2"
+    local mode="$3"
+    local tmp_file="${target}.tmp.$$"
+
+    if ! curl -fsSL "$url" -o "$tmp_file" >/dev/null 2>&1; then
+        rm -f "$tmp_file" >/dev/null 2>&1
+        return 1
+    fi
+
+    if ! mv -f "$tmp_file" "$target" >/dev/null 2>&1; then
+        rm -f "$tmp_file" >/dev/null 2>&1
+        return 1
+    fi
+
+    [[ -n "$mode" ]] && chmod "$mode" "$target" >/dev/null 2>&1
+    return 0
+}
+
+sync_support_files() {
+    local force_update="${1:-false}"
+
+    if [[ "$force_update" == "true" || ! -s "$SCRIPT_INSTALL_PATH" ]]; then
+        download_file_silent "$RAW_APPLY_SCRIPT_URL" "$SCRIPT_INSTALL_PATH" "755" || return 1
+    else
+        chmod 755 "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
+    fi
+
+    if [[ "$force_update" == "true" || ! -s "$SERVICE_FILE" ]]; then
+        download_file_silent "$RAW_SERVICE_URL" "$SERVICE_FILE" "644" || return 1
+    fi
+
+    return 0
+}
+
+update_all_files() {
+    sync_support_files true || return 1
+    systemctl daemon-reload >/dev/null 2>&1
+    return 0
+}
+
 # ---------- 检查 root 权限 ----------
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -170,6 +215,11 @@ init_env() {
             exit 1
         fi
     fi
+
+    sync_support_files false || {
+        print_error "必需文件同步失败，请检查网络连接或 GitHub 地址"
+        exit 1
+    }
 }
 
 # ---------- 公网IP检测 ----------
@@ -340,115 +390,56 @@ apply_rules_core() {
 }
 
 apply_rules() {
-    if apply_rules_core; then
-        print_success "iptables 规则已应用 (共 ${#rules_src_port[@]} 条转发)"
-        return 0
-    fi
-    print_error "iptables 规则应用失败，请检查系统环境或规则配置"
-    return 1
+    apply_rules_core
 }
 
 # ---------- 创建应用规则脚本（供 systemd 调用） ----------
 create_apply_script() {
-    cat > "$SCRIPT_INSTALL_PATH" <<'SCRIPT_EOF'
-#!/bin/bash
-CONFIG_FILE="/etc/iptables-forward/rules.conf"
-
-echo 1 > /proc/sys/net/ipv4/ip_forward
-
-iptables -t nat -F PREROUTING 2>/dev/null
-iptables -t nat -F POSTROUTING 2>/dev/null
-iptables -t nat -A POSTROUTING -j MASQUERADE
-
-to_iptables_dport() {
-    echo "$1" | sed 's/-/:/'
-}
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    while IFS='|' read -r c1 c2 c3 c4 c5; do
-        [[ -z "$c1" || "$c1" == \#* ]] && continue
-
-        listen_ip=""
-        src_port=""
-        dst_ip=""
-        dst_port=""
-        proto=""
-
-        if [[ -n "$c5" ]]; then
-            listen_ip="$c1"
-            src_port="$c2"
-            dst_ip="$c3"
-            dst_port="$c4"
-            proto="$c5"
-        else
-            listen_ip="0.0.0.0"
-            src_port="$c1"
-            dst_ip="$c2"
-            dst_port="$c3"
-            proto="$c4"
-        fi
-
-        dport=$(to_iptables_dport "$src_port")
-        dst_addr="${dst_ip}:${dst_port}"
-
-        match_dst=""
-        if [[ "$listen_ip" != "0.0.0.0" ]]; then
-            match_dst="-d ${listen_ip}"
-        fi
-
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p tcp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p udp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
-        fi
-    done < "$CONFIG_FILE"
-fi
-
-echo "[iptables-forward] 规则已应用"
-SCRIPT_EOF
-
-    chmod +x "$SCRIPT_INSTALL_PATH"
+    sync_support_files false
 }
 
 # ---------- 创建 systemd 服务 ----------
 create_service() {
-    create_apply_script
+    sync_support_files false || return 1
 
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        cat > "$SERVICE_FILE" <<EOF_SVC
-[Unit]
-Description=iptables Port Forwarding Rules
-After=network.target network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${SCRIPT_INSTALL_PATH}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_SVC
-
-        systemctl daemon-reload
-    fi
+    systemctl daemon-reload >/dev/null 2>&1
 
     if ! systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
         systemctl enable iptables-forward.service 2>/dev/null
     fi
-    print_success "已创建 systemd 服务并设置开机自启"
+    return 0
+}
+
+do_update() {
+    print_banner
+    echo -e "${CYAN}请稍后...${NC}"
+
+    if update_all_files; then
+        set_last_result "success" "更新完成！"
+    else
+        set_last_result "error" "更新失败，请检查网络连接或 GitHub 地址"
+    fi
+
+    return
 }
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
+    local success_msg="${1:-操作成功！}"
+    local fail_msg="${2:-操作失败，请检查 iptables 环境}"
+
     save_rules
-    create_apply_script
+    if ! create_apply_script; then
+        set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
+        return 1
+    fi
+
     if apply_rules; then
-        print_success "规则已自动保存并应用！"
+        set_last_result "success" "$success_msg"
         return 0
     fi
-    print_error "规则已保存，但应用失败，请检查 iptables 环境"
+
+    set_last_result "error" "$fail_msg"
     return 1
 }
 
@@ -628,6 +619,7 @@ do_add() {
                 break
                 ;;
             N|n)
+                set_last_result "warn" "已取消添加"
                 return
                 ;;
             *)
@@ -642,7 +634,7 @@ do_add() {
     rules_dst_port+=("$dst_port")
     rules_proto+=("$proto")
 
-    auto_save_and_apply
+    auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 iptables 环境"
     return
 }
 
@@ -654,7 +646,7 @@ do_delete() {
 
     load_rules
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        print_warn "当前没有转发规则"
+        set_last_result "warn" "当前没有转发规则"
         return
     fi
 
@@ -677,7 +669,10 @@ do_delete() {
                 confirm_delete_all=${confirm_delete_all:-N}
                 case "$confirm_delete_all" in
                     Y|y) break ;;
-                    N|n) return ;;
+                    N|n)
+                        set_last_result "warn" "已取消删除"
+                        return
+                        ;;
                     *) print_error "输入无效，请重新输入！" ;;
                 esac
             done
@@ -687,8 +682,7 @@ do_delete() {
             rules_dst_ip=()
             rules_dst_port=()
             rules_proto=()
-            auto_save_and_apply
-            print_success "已删除全部转发规则！"
+            auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
             return
         fi
 
@@ -706,7 +700,10 @@ do_delete() {
             confirm_delete_one=${confirm_delete_one:-N}
             case "$confirm_delete_one" in
                 Y|y) break ;;
-                N|n) return ;;
+                N|n)
+                    set_last_result "warn" "已取消删除"
+                    return
+                    ;;
                 *) print_error "输入无效，请重新输入！" ;;
             esac
         done
@@ -723,8 +720,7 @@ do_delete() {
         rules_dst_port=("${rules_dst_port[@]}")
         rules_proto=("${rules_proto[@]}")
 
-        auto_save_and_apply
-        print_success "已删除转发: ${del_info}"
+        auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
         return
     done
 }
@@ -774,9 +770,12 @@ do_autostart() {
             read -r -p "请选择 [0-1]: " choice
             case "$choice" in
                 1)
-                    systemctl disable iptables-forward.service 2>/dev/null
-                    print_success "已关闭开机自启"
-                    break
+                    if systemctl disable iptables-forward.service 2>/dev/null; then
+                        set_last_result "success" "已关闭开机自启"
+                    else
+                        set_last_result "error" "关闭开机自启失败"
+                    fi
+                    return
                     ;;
                 0)
                     return
@@ -794,9 +793,12 @@ do_autostart() {
             read -r -p "请选择 [0-1]: " choice
             case "$choice" in
                 1)
-                    create_service
-                    print_success "已开启开机自启"
-                    break
+                    if create_service; then
+                        set_last_result "success" "已开启开机自启"
+                    else
+                        set_last_result "error" "开启开机自启失败，请检查网络或 systemd 状态"
+                    fi
+                    return
                     ;;
                 0)
                     return
@@ -850,12 +852,13 @@ show_menu() {
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
     echo -e "  ${YELLOW}4)${NC} 开机自启管理"
+    echo -e "  ${BLUE}5)${NC} 更新脚本文件"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
     while true; do
-        read -r -p "请选择操作 [0-4]: " choice
-        if [[ "$choice" =~ ^[0-4]$ ]]; then
+        read -r -p "请选择操作 [0-5]: " choice
+        if [[ "$choice" =~ ^[0-5]$ ]]; then
             break
         fi
         print_error "输入无效，请重新输入！"
@@ -875,6 +878,7 @@ main() {
             2) do_delete ;;
             3) do_restart ;;
             4) do_autostart ;;
+            5) do_update ;;
             0)
                 echo ""
                 print_info "再见！"
