@@ -120,12 +120,6 @@ proto_to_label() {
     esac
 }
 
-repeat_char() {
-    local char="$1" count="$2" result=""
-    for ((j=0; j<count; j++)); do result="${result}${char}"; done
-    echo "$result"
-}
-
 is_private_ip() {
     local ip="$1"
     [[ "$ip" =~ ^10\. ]] && return 0
@@ -290,17 +284,6 @@ parse_port_expr() {
     return 1
 }
 
-to_iptables_dport() {
-    # 用户输入 8000-9000，iptables --dport 需要 8000:9000
-    local expr="$1"
-    echo "$expr" | sed 's/-/:/'
-}
-
-get_range_len() {
-    local start="$1"
-    local end="$2"
-    echo $(( end - start + 1 ))
-}
 
 download_file_silent() {
     local url="$1"
@@ -446,8 +429,8 @@ choose_listen_ip() {
     detect_public_ip
 
     echo ""
-    echo -e "${CYAN}请选择监听IP（公网/内网）:${NC}"
-    echo "  1) 0.0.0.0 (公网+内网，默认)"
+    echo -e "${CYAN}请选择监听IP:${NC}"
+    echo "  1) 0.0.0.0 (默认)"
 
     local next_idx=2
 
@@ -457,7 +440,7 @@ choose_listen_ip() {
     if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
         has_public_ip=true
         public_ip_idx=$next_idx
-        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网IP, 来自 ip.sb)"
+        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网)"
         next_idx=$((next_idx + 1))
     fi
 
@@ -619,17 +602,8 @@ EOF_CONF
 
 # ---------- 应用 iptables 规则 ----------
 apply_rules_core() {
-    [[ -x "$SCRIPT_INSTALL_PATH" ]] || create_apply_script
+    [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false
     "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
-}
-
-apply_rules() {
-    apply_rules_core
-}
-
-# ---------- 创建应用规则脚本（供 systemd 调用） ----------
-create_apply_script() {
-    sync_support_files false
 }
 
 # ---------- 创建 systemd 服务 ----------
@@ -737,7 +711,7 @@ do_domain_watch_manage() {
             3)
                 local new_minutes
                 while true; do
-                    read -r -p "请输入域名监控间隔（分钟，默认: 10）: " new_minutes
+                    read -r -p "请输入域名监控间隔（分钟，默认: 5）: " new_minutes
                     new_minutes=${new_minutes:-5}
                     if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 1 ]] && [[ "$new_minutes" -le 59 ]]; then
                         GLOBAL_WATCH_INTERVAL_MINUTES="$new_minutes"
@@ -759,6 +733,42 @@ do_domain_watch_manage() {
     done
 }
 
+# ---------- 规则数组操作 ----------
+clear_all_rules() {
+    rules_listen_ip=()
+    rules_src_port=()
+    rules_dst_ip=()
+    rules_dst_port=()
+    rules_proto=()
+    rules_resolved_ip=()
+    rules_check_interval=()
+    rules_last_check_ts=()
+    rules_is_domain=()
+}
+
+remove_rule_at_index() {
+    local idx="$1"
+    unset 'rules_listen_ip[idx]'
+    unset 'rules_src_port[idx]'
+    unset 'rules_dst_ip[idx]'
+    unset 'rules_dst_port[idx]'
+    unset 'rules_proto[idx]'
+    unset 'rules_resolved_ip[idx]'
+    unset 'rules_check_interval[idx]'
+    unset 'rules_last_check_ts[idx]'
+    unset 'rules_is_domain[idx]'
+    # 重建连续索引
+    rules_listen_ip=("${rules_listen_ip[@]}")
+    rules_src_port=("${rules_src_port[@]}")
+    rules_dst_ip=("${rules_dst_ip[@]}")
+    rules_dst_port=("${rules_dst_port[@]}")
+    rules_proto=("${rules_proto[@]}")
+    rules_resolved_ip=("${rules_resolved_ip[@]}")
+    rules_check_interval=("${rules_check_interval[@]}")
+    rules_last_check_ts=("${rules_last_check_ts[@]}")
+    rules_is_domain=("${rules_is_domain[@]}")
+}
+
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
     local success_msg="${1:-操作成功！}"
@@ -766,66 +776,18 @@ auto_save_and_apply() {
 
     save_rules
 
-    if ! create_apply_script; then
+    if ! sync_support_files false; then
         set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
         return 1
     fi
 
-    if apply_rules; then
+    if apply_rules_core; then
         set_last_result "success" "$success_msg"
         return 0
     fi
 
     set_last_result "error" "${fail_msg}"
     return 1
-}
-
-# ---------- 打印规则表格 ----------
-print_rules_table() {
-    if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        echo -e "  ${YELLOW}(暂无转发规则)${NC}"
-        return
-    fi
-
-    local w_idx=4 w_lip=12 w_src=8 w_dst=16 w_proto=6
-    for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local idx=$((i + 1))
-        local idx_len=$(( ${#idx} + 2 ))
-        local dst_str="${rules_dst_ip[$i]}:${rules_dst_port[$i]}"
-        local proto_str
-        proto_str=$(proto_to_label "${rules_proto[$i]}")
-
-        (( idx_len > w_idx )) && w_idx=$idx_len
-        (( ${#rules_listen_ip[$i]} > w_lip )) && w_lip=${#rules_listen_ip[$i]}
-        (( ${#rules_src_port[$i]} > w_src )) && w_src=${#rules_src_port[$i]}
-        (( ${#dst_str} > w_dst )) && w_dst=${#dst_str}
-        (( ${#proto_str} > w_proto )) && w_proto=${#proto_str}
-    done
-
-    local header
-    header=$(printf "| %-${w_idx}s | %-${w_lip}s | %-${w_src}s | %-${w_dst}s | %-${w_proto}s |" \
-        "序号" "监听IP" "源端口" "目标地址" "协议")
-    echo -e "  ${BOLD}${header}${NC}"
-
-    local sep="|$(repeat_char '-' $((w_idx+2)))|$(repeat_char '-' $((w_lip+2)))|$(repeat_char '-' $((w_src+2)))|$(repeat_char '-' $((w_dst+2)))|$(repeat_char '-' $((w_proto+2)))|"
-    echo "  ${sep}"
-
-    for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local idx=$((i + 1))
-        local dst_str="${rules_dst_ip[$i]}:${rules_dst_port[$i]}"
-        local proto_str
-        proto_str=$(proto_to_label "${rules_proto[$i]}")
-
-        local col_idx col_lip col_src col_dst col_proto
-        col_idx=$(printf "%-${w_idx}s" "[$idx]")
-        col_lip=$(printf "%-${w_lip}s" "${rules_listen_ip[$i]}")
-        col_src=$(printf "%-${w_src}s" "${rules_src_port[$i]}")
-        col_dst=$(printf "%-${w_dst}s" "$dst_str")
-        col_proto=$(printf "%-${w_proto}s" "$proto_str")
-
-        echo -e "  | ${GREEN}${col_idx}${NC} | ${CYAN}${col_lip}${NC} | ${CYAN}${col_src}${NC} | ${CYAN}${col_dst}${NC} | ${CYAN}${col_proto}${NC} |"
-    done
-    echo ""
 }
 
 # ---------- 按首页样式打印规则 ----------
@@ -928,9 +890,8 @@ do_add() {
         fi
 
         if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
-            local src_len dst_len
-            src_len=$(get_range_len "$src_start" "$src_end")
-            dst_len=$(get_range_len "$dst_start" "$dst_end")
+            local src_len=$(( src_end - src_start + 1 ))
+            local dst_len=$(( dst_end - dst_start + 1 ))
             if [[ "$src_len" -ne "$dst_len" ]]; then
                 print_error "输入无效，请重新输入！"
                 continue
@@ -1027,15 +988,7 @@ do_delete() {
                 return
             fi
 
-            rules_listen_ip=()
-            rules_src_port=()
-            rules_dst_ip=()
-            rules_dst_port=()
-            rules_proto=()
-            rules_resolved_ip=()
-            rules_check_interval=()
-            rules_last_check_ts=()
-            rules_is_domain=()
+            clear_all_rules
             auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
             return
         fi
@@ -1054,26 +1007,7 @@ do_delete() {
             return
         fi
 
-        unset 'rules_listen_ip[del_idx]'
-        unset 'rules_src_port[del_idx]'
-        unset 'rules_dst_ip[del_idx]'
-        unset 'rules_dst_port[del_idx]'
-        unset 'rules_proto[del_idx]'
-        unset 'rules_resolved_ip[del_idx]'
-        unset 'rules_check_interval[del_idx]'
-        unset 'rules_last_check_ts[del_idx]'
-        unset 'rules_is_domain[del_idx]'
-
-        rules_listen_ip=("${rules_listen_ip[@]}")
-        rules_src_port=("${rules_src_port[@]}")
-        rules_dst_ip=("${rules_dst_ip[@]}")
-        rules_dst_port=("${rules_dst_port[@]}")
-        rules_proto=("${rules_proto[@]}")
-        rules_resolved_ip=("${rules_resolved_ip[@]}")
-        rules_check_interval=("${rules_check_interval[@]}")
-        rules_last_check_ts=("${rules_last_check_ts[@]}")
-        rules_is_domain=("${rules_is_domain[@]}")
-
+        remove_rule_at_index "$del_idx"
         auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
         return
     done
@@ -1108,53 +1042,36 @@ do_autostart() {
     echo ""
 
     local is_enabled=false
-    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
-        is_enabled=true
-        echo -e "  当前状态: ${GREEN}已启用开机自启${NC}"
-    else
-        echo -e "  当前状态: ${YELLOW}未启用开机自启${NC}"
-    fi
-    echo ""
+    systemctl is-enabled --quiet iptables-forward.service 2>/dev/null && is_enabled=true
 
     if $is_enabled; then
+        echo -e "  当前状态: ${GREEN}已启用开机自启${NC}"
+        echo ""
         echo -e "  ${RED}1)${NC} 关闭开机自启"
-        echo -e "  ${NC}0)${NC} 返回"
-        echo ""
-        choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
-        case "$choice" in
-            1)
-                if systemctl disable iptables-forward.service 2>/dev/null; then
-                    set_last_result "success" "已关闭开机自启"
-                else
-                    set_last_result "error" "关闭开机自启失败"
-                fi
-                return
-                ;;
-            0)
-                return
-                ;;
-        esac
     else
-        echo -e "  ${GREEN}1)${NC} 开启开机自启"
-        echo -e "  ${NC}0)${NC} 返回"
+        echo -e "  当前状态: ${YELLOW}未启用开机自启${NC}"
         echo ""
-        choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
-        case "$choice" in
-            1)
-                if create_service; then
-                    set_last_result "success" "已开启开机自启"
-                else
-                    set_last_result "error" "开启开机自启失败，请检查网络或 systemd 状态"
-                fi
-                return
-                ;;
-            0)
-                return
-                ;;
-        esac
+        echo -e "  ${GREEN}1)${NC} 开启开机自启"
     fi
+    echo -e "  ${NC}0)${NC} 返回"
+    echo ""
 
-    return
+    choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
+    [[ "$choice" == "0" ]] && return
+
+    if $is_enabled; then
+        if systemctl disable iptables-forward.service 2>/dev/null; then
+            set_last_result "success" "已关闭开机自启"
+        else
+            set_last_result "error" "关闭开机自启失败"
+        fi
+    else
+        if create_service; then
+            set_last_result "success" "已开启开机自启"
+        else
+            set_last_result "error" "开启开机自启失败，请检查网络或 systemd 状态"
+        fi
+    fi
 }
 
 # ---------- 主菜单 ----------
