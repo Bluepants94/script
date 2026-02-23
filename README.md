@@ -14,7 +14,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 # iptables端口转发
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward/iptables_forward.sh)
 ```
 # Nginx 编译安装
 ```
