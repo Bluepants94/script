@@ -12,24 +12,46 @@ to_iptables_dport() {
 }
 
 if [[ -f "$CONFIG_FILE" ]]; then
-    while IFS='|' read -r c1 c2 c3 c4 c5; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
 
         listen_ip=""
         src_port=""
+        dst_host=""
         dst_ip=""
         dst_port=""
         proto=""
+        resolved_ip=""
+        is_domain="0"
 
-        if [[ -n "$c5" ]]; then
+        if [[ -n "$c9" ]]; then
+            # 9列: listen|src|dst_host|dst_port|proto|resolved_ip|check_interval|last_check|is_domain
             listen_ip="$c1"
             src_port="$c2"
+            dst_host="$c3"
+            dst_port="$c4"
+            proto="$c5"
+            resolved_ip="$c6"
+            is_domain="$c9"
+
+            if [[ "$is_domain" == "1" && -n "$resolved_ip" ]]; then
+                dst_ip="$resolved_ip"
+            else
+                dst_ip="$dst_host"
+            fi
+        elif [[ -n "$c5" ]]; then
+            # 5列: listen|src|dst_ip|dst_port|proto
+            listen_ip="$c1"
+            src_port="$c2"
+            dst_host="$c3"
             dst_ip="$c3"
             dst_port="$c4"
             proto="$c5"
         else
+            # 4列: src|dst_ip|dst_port|proto
             listen_ip="0.0.0.0"
             src_port="$c1"
+            dst_host="$c2"
             dst_ip="$c2"
             dst_port="$c3"
             proto="$c4"
