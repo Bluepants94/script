@@ -97,8 +97,38 @@ prompt_start_params() {
     return 1
   fi
 
+  # 监听地址选择
+  echo ""
+  echo "请选择监听地址:"
+  echo "  1) 0.0.0.0 (所有网卡，允许外部访问) [默认]"
+  echo "  2) 127.0.0.1 (仅本地访问)"
+  echo "  3) 自定义IP"
+  read -r -p "输入选项 [1-3]: " listen_choice
+  case "${listen_choice}" in
+    2)
+      LISTEN_ADDR="127.0.0.1"
+      ;;
+    3)
+      read -r -p "请输入自定义监听IP: " custom_ip
+      if [ -z "$custom_ip" ]; then
+        print_err "监听IP不能为空"
+        return 1
+      fi
+      LISTEN_ADDR="$custom_ip"
+      ;;
+    *)
+      LISTEN_ADDR="0.0.0.0"
+      ;;
+  esac
+
   read -r -p "请输入用户名 (可留空): " PROXY_USER
   read -r -p "请输入密码 (可留空): " PROXY_PASS
+
+  # IP 白名单
+  echo ""
+  print_info "IP 白名单设置（留空则允许所有IP访问）"
+  print_info "多个IP用空格分隔，支持 CIDR 格式（如 192.168.1.0/24）"
+  read -r -p "请输入允许访问的IP: " ALLOW_IPS
 }
 
 is_port_used() {
@@ -134,7 +164,7 @@ generate_config() {
 
   cat >> "$CONFIG_FILE" <<EOF_CONF
 Port ${PROXY_PORT}
-Listen 0.0.0.0
+Listen ${LISTEN_ADDR}
 Timeout 600
 MaxClients 100
 StartServers 5
@@ -157,6 +187,13 @@ EOF_AUTH
     AUTH_ENABLED="yes"
   else
     AUTH_ENABLED="no"
+  fi
+
+  # IP 白名单写入配置
+  if [ -n "${ALLOW_IPS}" ]; then
+    for ip in ${ALLOW_IPS}; do
+      echo "Allow ${ip}" >> "$CONFIG_FILE"
+    done
   fi
 }
 
@@ -186,6 +223,7 @@ start_proxy() {
   if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
     print_ok "代理已启动。"
     echo "--------------------------------------------------"
+    echo "监听地址: ${LISTEN_ADDR}"
     echo "端口: ${PROXY_PORT}"
     if [ "$AUTH_ENABLED" = "yes" ]; then
       echo "认证: 已启用"
@@ -195,6 +233,11 @@ start_proxy() {
     else
       echo "认证: 未启用（用户名/密码留空）"
       echo "代理地址: http://<服务器IP>:${PROXY_PORT}"
+    fi
+    if [ -n "${ALLOW_IPS}" ]; then
+      echo "白名单: ${ALLOW_IPS}"
+    else
+      echo "白名单: 未启用（允许所有IP）"
     fi
     echo "配置文件: ${CONFIG_FILE}"
     echo "PID文件: ${PID_FILE}"
@@ -235,14 +278,6 @@ stop_proxy() {
   print_ok "配置文件、PID 文件、日志文件已清理。"
 }
 
-show_usage() {
-  cat <<EOF_USAGE
-用法:
-  ./tinyproxy_manager.sh            # 交互式 UI 菜单
-  ./tinyproxy_manager.sh start      # 命令行模式：检查安装并开启代理
-  ./tinyproxy_manager.sh stop       # 命令行模式：关闭代理并清理配置
-EOF_USAGE
-}
 
 show_banner() {
   echo ""
@@ -256,9 +291,10 @@ show_banner() {
   fi
 
   if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
-    local port
+    local port listen
     port="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || echo "未知")"
-    echo -e "  代理状态: ${GREEN}● 已启动${NC} (PID: ${pid}, 端口: ${port})"
+    listen="$(grep -oP '^Listen\s+\K\S+' "$CONFIG_FILE" 2>/dev/null || echo "未知")"
+    echo -e "  代理状态: ${GREEN}● 已启动${NC} (PID: ${pid}, 监听: ${listen}:${port})"
   else
     echo -e "  代理状态: ${RED}○ 未启动${NC}"
   fi
@@ -269,9 +305,8 @@ show_menu() {
   echo "请选择操作："
   echo "  1) 开启代理（检查/安装 tinyproxy）"
   echo "  2) 关闭代理（并清理配置）"
-  echo "  3) 查看帮助"
   echo "  0) 退出"
-  echo -n "输入选项 [0-3]: "
+  echo -n "输入选项 [0-2]: "
 }
 
 run_ui() {
@@ -287,15 +322,12 @@ run_ui() {
       2)
         stop_proxy || true
         ;;
-      3)
-        show_usage
-        ;;
       0)
         print_ok "已退出。"
         exit 0
         ;;
       *)
-        print_warn "无效选项，请输入 0-3。"
+        print_warn "无效选项，请输入 0-2。"
         ;;
     esac
 
@@ -304,23 +336,4 @@ run_ui() {
   done
 }
 
-main() {
-  local cmd="${1:-}"
-  case "$cmd" in
-    "")
-      run_ui
-      ;;
-    start)
-      start_proxy
-      ;;
-    stop)
-      stop_proxy
-      ;;
-    *)
-      show_usage
-      exit 1
-      ;;
-  esac
-}
-
-main "$@"
+run_ui
