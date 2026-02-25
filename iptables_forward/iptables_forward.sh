@@ -42,6 +42,7 @@ GLOBAL_WATCH_ENABLED=1
 GLOBAL_WATCH_INTERVAL_MINUTES=5
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
+DISABLE_PUBLIC_IP=0
 
 # ---------- 工具函数 ----------
 print_banner() {
@@ -410,6 +411,12 @@ detect_public_ip() {
         return 0
     fi
 
+    # 如果通过 -n 禁用公网检测
+    if [[ "$DISABLE_PUBLIC_IP" == "1" ]]; then
+        PUBLIC_IP_CACHE="(禁用检测)"
+        return 1
+    fi
+
     local ip=""
     # 尝试多个公网IP检测服务，超时3秒
     for url in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
@@ -441,32 +448,58 @@ choose_listen_ip() {
     get_local_ipv4_list
     detect_public_ip
 
+    # 分类网卡IP：内网 / 其他
+    local first_private_ip=""
+    local extra_ips=()
+    local extra_ifaces=()
+    for ((i=0; i<${#local_ips[@]}; i++)); do
+        if [[ -z "$first_private_ip" ]] && is_private_ip "${local_ips[$i]}"; then
+            first_private_ip="${local_ips[$i]}"
+        else
+            extra_ips+=("${local_ips[$i]}")
+            extra_ifaces+=("${local_ifaces[$i]}")
+        fi
+    done
+
     echo ""
     echo -e "${CYAN}请选择监听IP:${NC}"
-    echo "  1) 0.0.0.0 (默认)"
 
-    local next_idx=2
+    # 选项1: 0.0.0.0（固定）
+    echo "  1) 0.0.0.0"
+    # 选项2: 127.0.0.1（固定）
+    echo "  2) 127.0.0.1"
 
-    # 如果检测到公网IP，显示为选项
-    local has_public_ip=false
-    local public_ip_idx=0
-    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && -n "$PUBLIC_IP_CACHE" ]]; then
-        has_public_ip=true
-        public_ip_idx=$next_idx
-        echo -e "  ${next_idx}) ${GREEN}${PUBLIC_IP_CACHE}${NC} (公网)"
-        next_idx=$((next_idx + 1))
+    # 选项3: 内网IP
+    local private_ip_selectable=false
+    if [[ -n "$first_private_ip" ]]; then
+        echo -e "  3) ${first_private_ip} (内网)"
+        private_ip_selectable=true
+    else
+        echo -e "  3) ${YELLOW}---.---.---.---${NC} (内网)"
     fi
 
-    # 本机网卡IP
-    local iface_base=$next_idx
-    for ((i=0; i<${#local_ips[@]}; i++)); do
-        local tag="公网"
-        if is_private_ip "${local_ips[$i]}"; then
-            tag="内网"
-        fi
-        echo "  $((iface_base+i))) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
-    done
-    next_idx=$((iface_base + ${#local_ips[@]}))
+    # 选项4: 公网IP
+    local public_ip_selectable=false
+    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && "$PUBLIC_IP_CACHE" != "(禁用检测)" && -n "$PUBLIC_IP_CACHE" ]]; then
+        echo -e "  4) ${PUBLIC_IP_CACHE} (公网)"
+        public_ip_selectable=true
+    elif [[ "$DISABLE_PUBLIC_IP" == "1" ]]; then
+        echo -e "  4) ${YELLOW}---.---.---.---${NC} (公网, 禁用检测)"
+    else
+        echo -e "  4) ${YELLOW}---.---.---.---${NC} (公网)"
+    fi
+
+    # 选项5+: 其他网卡IP（如果有）
+    local extra_base=5
+    local next_idx=$extra_base
+    if [[ ${#extra_ips[@]} -gt 0 ]]; then
+        for ((i=0; i<${#extra_ips[@]}; i++)); do
+            local tag="公网"
+            is_private_ip "${extra_ips[$i]}" && tag="内网"
+            echo "  $((extra_base+i))) ${extra_ips[$i]} (${extra_ifaces[$i]}, ${tag})"
+        done
+        next_idx=$((extra_base + ${#extra_ips[@]}))
+    fi
 
     local manual_idx=$next_idx
     echo "  ${manual_idx}) 手动输入IP"
@@ -486,16 +519,37 @@ choose_listen_ip() {
             return 0
         fi
 
-        # 公网IP选项
-        if $has_public_ip && [[ "$choice" == "$public_ip_idx" ]]; then
-            SELECTED_LISTEN_IP="$PUBLIC_IP_CACHE"
+        if [[ "$choice" == "2" ]]; then
+            SELECTED_LISTEN_IP="127.0.0.1"
             return 0
         fi
 
-        # 网卡IP选项
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge "$iface_base" ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-            local idx=$((choice - iface_base))
-            SELECTED_LISTEN_IP="${local_ips[$idx]}"
+        # 内网IP
+        if [[ "$choice" == "3" ]]; then
+            if $private_ip_selectable; then
+                SELECTED_LISTEN_IP="$first_private_ip"
+                return 0
+            else
+                print_error "未检测到内网IP，无法选择！"
+                continue
+            fi
+        fi
+
+        # 公网IP
+        if [[ "$choice" == "4" ]]; then
+            if $public_ip_selectable; then
+                SELECTED_LISTEN_IP="$PUBLIC_IP_CACHE"
+                return 0
+            else
+                print_error "未检测到公网IP，无法选择！"
+                continue
+            fi
+        fi
+
+        # 其他网卡IP
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge "$extra_base" ]] && [[ "$choice" -lt "$manual_idx" ]]; then
+            local idx=$((choice - extra_base))
+            SELECTED_LISTEN_IP="${extra_ips[$idx]}"
             return 0
         fi
 
@@ -1127,13 +1181,6 @@ show_menu() {
         cron_status="${GREEN}已启动${NC}"
     fi
     echo -e "  Cron任务: ${cron_status} (${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES}分钟${NC})"
-
-    detect_public_ip
-    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" ]]; then
-        echo -e "  公网IP:   ${GREEN}${PUBLIC_IP_CACHE}${NC}"
-    else
-        echo -e "  公网IP:   ${RED}${PUBLIC_IP_CACHE}${NC}"
-    fi
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
@@ -1155,6 +1202,14 @@ show_menu() {
 
 # ---------- 主入口 ----------
 main() {
+    # 解析命令行参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n) DISABLE_PUBLIC_IP=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
     check_root
     init_env
     create_service
@@ -1179,4 +1234,4 @@ main() {
     done
 }
 
-main
+main "$@"
