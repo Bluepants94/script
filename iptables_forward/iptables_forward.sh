@@ -154,10 +154,11 @@ resolve_domain_ipv4_once() {
     local ip=""
 
     if command -v dig >/dev/null 2>&1; then
-        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        # 过滤 CNAME，只取 IPv4 格式的行
+        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
 
-        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | head -n 1 | tr -d '[:space:]')
+        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
     fi
 
@@ -296,6 +297,18 @@ download_file_silent() {
         return 1
     fi
 
+    # 校验下载文件：非空且以 shebang 或 [Unit] 开头（脚本/service 文件）
+    if [[ ! -s "$tmp_file" ]]; then
+        rm -f "$tmp_file" >/dev/null 2>&1
+        return 1
+    fi
+    local head_line
+    head_line=$(head -c 20 "$tmp_file" 2>/dev/null)
+    if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "[Unit]"* ]]; then
+        rm -f "$tmp_file" >/dev/null 2>&1
+        return 1
+    fi
+
     if ! mv -f "$tmp_file" "$target" >/dev/null 2>&1; then
         rm -f "$tmp_file" >/dev/null 2>&1
         return 1
@@ -353,8 +366,8 @@ init_env() {
     fi
 
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
-        if grep -q "^#.*net.ipv4.ip_forward" /etc/sysctl.conf 2>/dev/null; then
-            sed -i 's/^#.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
+        if grep -q "^#\s*net\.ipv4\.ip_forward\s*=" /etc/sysctl.conf 2>/dev/null; then
+            sed -i 's/^#\s*net\.ipv4\.ip_forward\s*=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
         else
             echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
         fi
@@ -490,11 +503,11 @@ choose_listen_ip() {
             while true; do
                 local manual_ip
                 read -r -p "请输入监听IP: " manual_ip
-                if [[ "$manual_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                if is_valid_ipv4 "$manual_ip"; then
                     SELECTED_LISTEN_IP="$manual_ip"
                     return 0
                 fi
-                print_error "输入无效，请重新输入！"
+                print_error "IP 格式无效或八位组超出范围，请重新输入！"
             done
         fi
 
@@ -862,7 +875,7 @@ do_add() {
 
             resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
             if ! is_valid_ipv4 "$resolved_ip"; then
-                print_error "输入无效，请重新输入！"
+                print_error "域名解析失败，请检查域名是否正确或网络是否可用！"
                 continue
             fi
 
@@ -934,6 +947,24 @@ do_add() {
         echo -e "  检测间隔: ${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES} 分钟（全局）${NC}"
     fi
     echo -e "  协议:     ${CYAN}${proto_display}${NC}"
+
+    # 检查重复规则（相同监听IP+源端口+协议可能冲突）
+    for ((i=0; i<${#rules_src_port[@]}; i++)); do
+        if [[ "${rules_listen_ip[$i]}" == "$listen_ip" && "${rules_src_port[$i]}" == "$src_port" ]]; then
+            local existing_proto="${rules_proto[$i]}"
+            # 协议有交集则视为冲突
+            if [[ "$existing_proto" == "both" || "$proto" == "both" || "$existing_proto" == "$proto" ]]; then
+                print_warn "检测到冲突：已存在规则 [$((i+1))] ${listen_ip} ${src_port} → ${rules_dst_ip[$i]}:${rules_dst_port[$i]} ($(proto_to_label "$existing_proto"))"
+                local confirm_dup
+                confirm_dup=$(read_confirm_yn_default "源端口冲突，是否仍要添加？[Y/N]（默认: N）: " "N")
+                if [[ "$confirm_dup" == "N" ]]; then
+                    set_last_result "warn" "已取消添加（源端口冲突）"
+                    return
+                fi
+                break
+            fi
+        fi
+    done
 
     local confirm_add
     confirm_add=$(read_confirm_yn_default "是否确认添加？[Y/N]（默认: Y）: " "Y")
@@ -1016,20 +1047,15 @@ do_delete() {
 # ---------- 重启 iptables 转发 ----------
 do_restart() {
     load_rules
-    if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        if iptables -t nat -F PREROUTING 2>/dev/null \
-            && iptables -t nat -F POSTROUTING 2>/dev/null \
-            && iptables -t nat -A POSTROUTING -j MASQUERADE; then
-            set_last_result "success" "重启完成：当前无转发规则，NAT 已清空"
+    # 统一走 apply_rules_core（使用自定义链，不影响其他服务）
+    if apply_rules_core; then
+        if [[ ${#rules_src_port[@]} -eq 0 ]]; then
+            set_last_result "success" "重启完成：当前无转发规则，自定义链已清空"
         else
-            set_last_result "error" "重启失败：清理 NAT 规则时发生错误"
+            set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则"
         fi
     else
-        if apply_rules_core; then
-            set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则"
-        else
-            set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
-        fi
+        set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
     fi
 
     return
