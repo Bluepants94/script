@@ -1,77 +1,231 @@
 #!/bin/bash
-CONFIG_FILE="/etc/iptables-forward/rules.conf"
 
-echo 1 > /proc/sys/net/ipv4/ip_forward
+# ============================================================
+#  iptables 端口转发 - 规则应用脚本（非交互式）
+#  功能: 读取 rules.conf 配置，清空并重新应用 iptables NAT 规则
+#  供 systemd 开机自启 / 主管理脚本调用，不含任何交互逻辑
+# ============================================================
 
-iptables -t nat -F PREROUTING 2>/dev/null
-iptables -t nat -F POSTROUTING 2>/dev/null
-iptables -t nat -A POSTROUTING -j MASQUERADE
+CONFIG_DIR="/etc/iptables-forward"
+CONFIG_FILE="${CONFIG_DIR}/rules.conf"
+
+# ---------- 工具函数 ----------
+is_valid_ipv4() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
 
 to_iptables_dport() {
+    # 将 8000-9000 格式转换为 iptables 的 8000:9000 格式
     echo "$1" | sed 's/-/:/'
 }
 
-if [[ -f "$CONFIG_FILE" ]]; then
+parse_port_expr() {
+    local expr="$1"
+    if [[ "$expr" =~ ^[0-9]+$ ]]; then
+        if [[ "$expr" -ge 1 && "$expr" -le 65535 ]]; then
+            echo "single|$expr|$expr"
+            return 0
+        fi
+        return 1
+    fi
+    if [[ "$expr" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        local a="${BASH_REMATCH[1]}"
+        local b="${BASH_REMATCH[2]}"
+        if [[ "$a" -ge 1 && "$b" -le 65535 && "$a" -lt "$b" ]]; then
+            echo "range|$a|$b"
+            return 0
+        fi
+        return 1
+    fi
+    return 1
+}
+
+# ---------- 加载规则 ----------
+rules_listen_ip=()
+rules_src_port=()
+rules_dst_port=()
+rules_resolved_ip=()
+rules_proto=()
+
+load_rules() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+
     while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
-
-        listen_ip=""
-        src_port=""
-        dst_host=""
-        dst_ip=""
-        dst_port=""
-        proto=""
-        resolved_ip=""
-        is_domain="0"
+        [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] && continue
+        [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] && continue
 
         if [[ -n "$c9" ]]; then
-            # 9列: listen|src|dst_host|dst_port|proto|resolved_ip|check_interval|last_check|is_domain
-            listen_ip="$c1"
-            src_port="$c2"
-            dst_host="$c3"
-            dst_port="$c4"
-            proto="$c5"
-            resolved_ip="$c6"
-            is_domain="$c9"
+            # 9列格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔|时间戳|是否域名
+            local resolved="$c6"
+            is_valid_ipv4 "$resolved" || resolved="$c3"
+            is_valid_ipv4 "$resolved" || continue
 
-            if [[ "$is_domain" == "1" && -n "$resolved_ip" ]]; then
-                dst_ip="$resolved_ip"
-            else
-                dst_ip="$dst_host"
-            fi
+            rules_listen_ip+=("$c1")
+            rules_src_port+=("$c2")
+            rules_dst_port+=("$c4")
+            rules_resolved_ip+=("$resolved")
+            rules_proto+=("$c5")
         elif [[ -n "$c5" ]]; then
-            # 5列: listen|src|dst_ip|dst_port|proto
-            listen_ip="$c1"
-            src_port="$c2"
-            dst_host="$c3"
-            dst_ip="$c3"
-            dst_port="$c4"
-            proto="$c5"
-        else
-            # 4列: src|dst_ip|dst_port|proto
-            listen_ip="0.0.0.0"
-            src_port="$c1"
-            dst_host="$c2"
-            dst_ip="$c2"
-            dst_port="$c3"
-            proto="$c4"
-        fi
+            # 5列格式: 监听IP|源端口|目标IP|目标端口|协议
+            is_valid_ipv4 "$c3" || continue
 
-        dport=$(to_iptables_dport "$src_port")
-        dst_addr="${dst_ip}:${dst_port}"
+            rules_listen_ip+=("$c1")
+            rules_src_port+=("$c2")
+            rules_dst_port+=("$c4")
+            rules_resolved_ip+=("$c3")
+            rules_proto+=("$c5")
+        elif [[ -n "$c4" ]]; then
+            # 4列旧格式: 源端口|目标IP|目标端口|协议
+            is_valid_ipv4 "$c2" || continue
 
-        match_dst=""
-        if [[ "$listen_ip" != "0.0.0.0" ]]; then
-            match_dst="-d ${listen_ip}"
-        fi
-
-        if [[ "$proto" == "tcp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p tcp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
-        fi
-        if [[ "$proto" == "udp" || "$proto" == "both" ]]; then
-            iptables -t nat -A PREROUTING ${match_dst} -p udp --dport "${dport}" -j DNAT --to-destination "${dst_addr}"
+            rules_listen_ip+=("0.0.0.0")
+            rules_src_port+=("$c1")
+            rules_dst_port+=("$c3")
+            rules_resolved_ip+=("$c2")
+            rules_proto+=("$c4")
         fi
     done < "$CONFIG_FILE"
-fi
+}
 
-echo "[iptables-forward] 规则已应用"
+# ---------- 自定义链名称 ----------
+CHAIN_PRE="IPTFWD-PRE"
+CHAIN_POST="IPTFWD-POST"
+
+# ---------- 初始化自定义链 ----------
+init_custom_chains() {
+    # 创建自定义链（如已存在则清空）
+    iptables -t nat -N "$CHAIN_PRE" 2>/dev/null || iptables -t nat -F "$CHAIN_PRE"
+    iptables -t nat -N "$CHAIN_POST" 2>/dev/null || iptables -t nat -F "$CHAIN_POST"
+
+    # 确保主链引用了自定义链（避免重复添加）
+    iptables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || \
+        iptables -t nat -A PREROUTING -j "$CHAIN_PRE"
+    iptables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -j "$CHAIN_POST"
+}
+
+# ---------- 添加单条 iptables 规则 ----------
+add_iptables_rule() {
+    local listen_ip="$1"
+    local src_port="$2"
+    local dst_ip="$3"
+    local dst_port="$4"
+    local proto="$5"  # tcp / udp
+
+    local src_dport dst_dport
+    src_dport=$(to_iptables_dport "$src_port")
+    dst_dport=$(to_iptables_dport "$dst_port")
+
+    local src_meta dst_meta
+    src_meta=$(parse_port_expr "$src_port") || return 1
+    dst_meta=$(parse_port_expr "$dst_port") || return 1
+
+    local src_type src_start src_end dst_type dst_start dst_end
+    IFS='|' read -r src_type src_start src_end <<< "$src_meta"
+    IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
+
+    # 构建 DNAT 目标
+    local dnat_target
+    if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
+        dnat_target="${dst_ip}:${dst_dport}"
+    elif [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+        if [[ "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
+            # 源和目标端口段相同，直接映射
+            dnat_target="${dst_ip}:${dst_dport}"
+        else
+            # 端口段一一对应映射，逐端口添加
+            local src_len=$(( src_end - src_start + 1 ))
+            if [[ "$src_len" -gt 1000 ]]; then
+                echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
+                return 1
+            fi
+            for ((offset=0; offset<src_len; offset++)); do
+                local sp=$((src_start + offset))
+                local dp=$((dst_start + offset))
+
+                if [[ "$listen_ip" == "0.0.0.0" ]]; then
+                    iptables -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_ip}:${dp}" || \
+                        echo "[错误] 添加规则失败: ${listen_ip} ${sp} -> ${dst_ip}:${dp} (${proto})" >&2
+                else
+                    iptables -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_ip}:${dp}" || \
+                        echo "[错误] 添加规则失败: ${listen_ip} ${sp} -> ${dst_ip}:${dp} (${proto})" >&2
+                fi
+            done
+            return 0
+        fi
+    else
+        # 单端口到端口段 或 端口段到单端口 — 不支持，跳过
+        return 1
+    fi
+
+    # 添加 PREROUTING DNAT 规则（到自定义链）
+    if [[ "$listen_ip" == "0.0.0.0" ]]; then
+        iptables -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${src_dport} -> ${dnat_target} (${proto})" >&2
+    else
+        iptables -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${src_dport} -> ${dnat_target} (${proto})" >&2
+    fi
+}
+
+# ---------- 主逻辑 ----------
+main() {
+    # 确保 IP 转发已开启
+    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
+        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+    fi
+
+    # 加载规则
+    load_rules
+
+    # 初始化自定义链（只清空自己的链，不影响其他服务如 Docker）
+    init_custom_chains
+
+    # 如果没有规则，确保 MASQUERADE 存在后退出
+    if [[ ${#rules_src_port[@]} -eq 0 ]]; then
+        # 仅对 DNAT 过的流量做 MASQUERADE
+        iptables -t nat -A "$CHAIN_POST" -m conntrack --ctstate DNAT -j MASQUERADE
+        exit 0
+    fi
+
+    # 逐条应用规则
+    local fail_count=0
+    for ((i=0; i<${#rules_src_port[@]}; i++)); do
+        local listen_ip="${rules_listen_ip[$i]}"
+        local src_port="${rules_src_port[$i]}"
+        local dst_ip="${rules_resolved_ip[$i]}"
+        local dst_port="${rules_dst_port[$i]}"
+        local proto="${rules_proto[$i]}"
+
+        case "$proto" in
+            tcp)
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
+                ;;
+            udp)
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
+                ;;
+            both)
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
+                ;;
+        esac
+    done
+
+    # 仅对 DNAT 过的流量做 MASQUERADE（不影响其他出站流量）
+    iptables -t nat -A "$CHAIN_POST" -m conntrack --ctstate DNAT -j MASQUERADE
+
+    if [[ "$fail_count" -gt 0 ]]; then
+        echo "[警告] 共 ${fail_count} 条规则应用失败" >&2
+    fi
+
+    exit 0
+}
+
+main
