@@ -249,6 +249,19 @@ show_banner() {
   echo "=================================================="
   echo "        Tinyproxy HTTP 代理管理工具 (UI)"
   echo "=================================================="
+
+  local pid=""
+  if [ -f "$PID_FILE" ]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+    local port
+    port="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || echo "未知")"
+    echo -e "  代理状态: ${GREEN}● 已启动${NC} (PID: ${pid}, 端口: ${port})"
+  else
+    echo -e "  代理状态: ${RED}○ 未启动${NC}"
+  fi
 }
 
 show_menu() {
