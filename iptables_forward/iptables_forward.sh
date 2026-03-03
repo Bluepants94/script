@@ -1275,24 +1275,24 @@ show_menu() {
     local ip_forward
     ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
     if [[ "$ip_forward" == "1" ]]; then
-        echo -e "  IP 转发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
+        echo -e "  IP  转  发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     else
-        echo -e "  IP 转发: ${RED}● 未开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
+        echo -e "  IP  转  发: ${RED}● 已关闭${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     fi
 
     if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
-        echo -e "  开机自启: ${GREEN}● 已启用${NC}"
+        echo -e "  开机自启: ${GREEN}● 已开启${NC}"
     else
-        echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+        echo -e "  开机自启: ${YELLOW}● 已关闭${NC}"
     fi
 
     local watch_minutes="${GLOBAL_WATCH_INTERVAL_MINUTES:-0}"
-    local watch_status="${YELLOW}已暂停${NC}"
-    [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}已启动${NC}"
+    local watch_status="${YELLOW}● 已关闭${NC}"
+    [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}● 已开启${NC}"
 
     local restart_minutes="${GLOBAL_RESTART_INTERVAL_MINUTES:-0}"
-    local restart_status="${YELLOW}已暂停${NC}"
-    [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}已启动${NC}"
+    local restart_status="${YELLOW}● 已关闭${NC}"
+    [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}● 已开启${NC}"
 
     echo -e "  域名解析: ${watch_status} (${CYAN}$(format_interval_label "$watch_minutes")${NC})"
     echo -e "  自动重启: ${restart_status} (${CYAN}$(format_interval_label "$restart_minutes")${NC})"
