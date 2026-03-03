@@ -60,6 +60,7 @@ load_rules() {
         [[ -z "$c1" || "$c1" == \#* ]] && continue
         [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] && continue
         [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] && continue
+        [[ "$c1" =~ ^GLOBAL_RESTART_INTERVAL_MINUTES= ]] && continue
 
         if [[ -n "$c9" ]]; then
             # 9列格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔|时间戳|是否域名
