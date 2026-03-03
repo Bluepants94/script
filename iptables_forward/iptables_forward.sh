@@ -1275,9 +1275,9 @@ show_menu() {
     local ip_forward
     ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
     if [[ "$ip_forward" == "1" ]]; then
-        echo -e "  IP  转  发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
+        echo -e "  IP 转 发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     else
-        echo -e "  IP  转  发: ${RED}● 已关闭${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
+        echo -e "  IP 转 发: ${RED}● 已关闭${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     fi
 
     if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
