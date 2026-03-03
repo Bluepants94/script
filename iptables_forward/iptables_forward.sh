@@ -177,7 +177,7 @@ is_watch_enabled() {
 
 normalize_global_watch_values() {
     [[ "$GLOBAL_WATCH_ENABLED" == "1" || "$GLOBAL_WATCH_ENABLED" == "0" ]] || GLOBAL_WATCH_ENABLED=0
-    if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 0 ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -gt 59 ]]; then
+    if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 0 ]]; then
         GLOBAL_WATCH_INTERVAL_MINUTES=0
     fi
 
@@ -189,8 +189,23 @@ normalize_global_watch_values() {
 }
 
 normalize_global_restart_values() {
-    if [[ ! "$GLOBAL_RESTART_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -lt 0 ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -gt 59 ]]; then
+    if [[ ! "$GLOBAL_RESTART_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -lt 0 ]]; then
         GLOBAL_RESTART_INTERVAL_MINUTES=0
+    fi
+}
+
+format_interval_label() {
+    local minutes="$1"
+    [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=0
+
+    if [[ "$minutes" -eq 0 ]]; then
+        echo "0分钟"
+    elif (( minutes % 1440 == 0 )); then
+        echo "$((minutes / 1440))天"
+    elif (( minutes % 60 == 0 )); then
+        echo "$((minutes / 60))小时"
+    else
+        echo "${minutes}分钟"
     fi
 }
 
@@ -204,14 +219,41 @@ get_cron_minutes_by_tag() {
     local tag="$1"
     command -v crontab >/dev/null 2>&1 || return 1
 
-    local line minutes
+    local line minutes m h d
     line=$(crontab -l 2>/dev/null | grep -F "$tag" | tail -n 1)
     [[ -n "$line" ]] || return 1
 
+    minutes=$(echo "$line" | sed -n 's#.* interval=\([0-9]\+\).*#\1#p')
+    if [[ "$minutes" =~ ^[0-9]+$ ]]; then
+        echo "$minutes"
+        return 0
+    fi
+
     minutes=$(echo "$line" | sed -n 's#\*/\([0-9]\+\) .*#\1#p')
-    [[ "$minutes" =~ ^[0-9]+$ ]] || return 1
-    echo "$minutes"
-    return 0
+    if [[ "$minutes" =~ ^[0-9]+$ ]]; then
+        echo "$minutes"
+        return 0
+    fi
+
+    h=$(echo "$line" | sed -n 's#^0 \*/\([0-9]\+\) .*#\1#p')
+    if [[ "$h" =~ ^[0-9]+$ ]]; then
+        echo $((h * 60))
+        return 0
+    fi
+
+    d=$(echo "$line" | sed -n 's#^0 0 \*/\([0-9]\+\) .*#\1#p')
+    if [[ "$d" =~ ^[0-9]+$ ]]; then
+        echo $((d * 1440))
+        return 0
+    fi
+
+    m=$(echo "$line" | sed -n 's#^\* \* \* \* \* .*__IPTFWD_INTERVAL=\([0-9]\+\).*#\1#p')
+    if [[ "$m" =~ ^[0-9]+$ ]]; then
+        echo "$m"
+        return 0
+    fi
+
+    return 1
 }
 
 set_cron_task_minutes() {
@@ -234,7 +276,18 @@ set_cron_task_minutes() {
         return 0
     fi
 
-    cron_line="*/${minutes} * * * * ${script_path} >/dev/null 2>&1 ${tag}"
+    if [[ "$minutes" -lt 60 ]]; then
+        cron_line="*/${minutes} * * * * ${script_path} >/dev/null 2>&1 ${tag} interval=${minutes}"
+    elif (( minutes % 1440 == 0 )); then
+        local days=$((minutes / 1440))
+        cron_line="0 0 */${days} * * ${script_path} >/dev/null 2>&1 ${tag} interval=${minutes}"
+    elif (( minutes % 60 == 0 )); then
+        local hours=$((minutes / 60))
+        cron_line="0 */${hours} * * * ${script_path} >/dev/null 2>&1 ${tag} interval=${minutes}"
+    else
+        cron_line="* * * * * __IPTFWD_INTERVAL=${minutes}; [ \$(( (\$(date +\\%s)/60) % __IPTFWD_INTERVAL )) -eq 0 ] && ${script_path} >/dev/null 2>&1 ${tag} interval=${minutes}"
+    fi
+
     if [[ -n "$filtered" ]]; then
         new_content="${filtered}"$'\n'"${cron_line}"
     else
@@ -659,9 +712,9 @@ save_rules() {
 # iptables 端口转发规则配置
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
-# 全局域名解析间隔(分钟, 0-59；0=关闭)
+# 全局域名解析间隔(分钟, >=0；0=关闭)
 GLOBAL_WATCH_INTERVAL_MINUTES=${GLOBAL_WATCH_INTERVAL_MINUTES}
-# 全局自动重启间隔(分钟, 0-59；0=关闭)
+# 全局自动重启间隔(分钟, >=0；0=关闭)
 GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # -------------------------------------------------
 # 格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
@@ -727,13 +780,10 @@ do_domain_watch_manage() {
     echo ""
 
     load_rules
-    local current_minutes=0
-    if cron_task_exists_by_tag "$WATCH_CRON_TAG"; then
-        current_minutes=$(get_cron_minutes_by_tag "$WATCH_CRON_TAG" || echo 0)
-    fi
+    local current_minutes="${GLOBAL_WATCH_INTERVAL_MINUTES:-0}"
 
     if [[ "$current_minutes" -gt 0 ]]; then
-        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}${current_minutes}分钟${NC})"
+        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}$(format_interval_label "$current_minutes")${NC})"
     else
         echo -e "  当前状态: ${YELLOW}已暂停${NC}"
     fi
@@ -750,9 +800,9 @@ do_domain_watch_manage() {
             1)
                 local new_minutes
                 while true; do
-                    read -r -p "请输入域名解析间隔（分钟，默认: 0；0=关闭）: " new_minutes
+                    read -r -p "请输入域名解析间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
                     new_minutes=${new_minutes:-0}
-                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]] && [[ "$new_minutes" -le 59 ]]; then
+                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
                         GLOBAL_WATCH_INTERVAL_MINUTES="$new_minutes"
                         if [[ "$new_minutes" -eq 0 ]]; then
                             GLOBAL_WATCH_ENABLED=0
@@ -765,7 +815,7 @@ do_domain_watch_manage() {
                             if [[ "$new_minutes" -eq 0 ]]; then
                                 set_last_result "success" "已关闭域名解析定时任务"
                             else
-                                set_last_result "success" "已设置域名解析为每 ${new_minutes} 分钟执行"
+                                set_last_result "success" "已设置域名解析为每 $(format_interval_label "$new_minutes") 执行"
                             fi
                         else
                             set_last_result "error" "Cron 任务更新失败"
@@ -1121,13 +1171,10 @@ do_restart_manage() {
     echo ""
 
     load_rules
-    local current_minutes=0
-    if cron_task_exists_by_tag "$RESTART_CRON_TAG"; then
-        current_minutes=$(get_cron_minutes_by_tag "$RESTART_CRON_TAG" || echo 0)
-    fi
+    local current_minutes="${GLOBAL_RESTART_INTERVAL_MINUTES:-0}"
 
     if [[ "$current_minutes" -gt 0 ]]; then
-        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}${current_minutes}分钟${NC})"
+        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}$(format_interval_label "$current_minutes")${NC})"
     else
         echo -e "  当前状态: ${YELLOW}已暂停${NC}"
     fi
@@ -1144,9 +1191,9 @@ do_restart_manage() {
             1)
                 local new_minutes
                 while true; do
-                    read -r -p "请输入自动重启间隔（分钟，默认: 0；0=关闭）: " new_minutes
+                    read -r -p "请输入自动重启间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
                     new_minutes=${new_minutes:-0}
-                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]] && [[ "$new_minutes" -le 59 ]]; then
+                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
                         GLOBAL_RESTART_INTERVAL_MINUTES="$new_minutes"
                         save_rules
 
@@ -1154,7 +1201,7 @@ do_restart_manage() {
                             if [[ "$new_minutes" -eq 0 ]]; then
                                 set_last_result "success" "已关闭自动重启定时任务"
                             else
-                                set_last_result "success" "已设置自动重启为每 ${new_minutes} 分钟执行"
+                                set_last_result "success" "已设置自动重启为每 $(format_interval_label "$new_minutes") 执行"
                             fi
                         else
                             set_last_result "error" "Cron 任务更新失败"
@@ -1239,22 +1286,16 @@ show_menu() {
         echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
     fi
 
-    local watch_minutes=0
+    local watch_minutes="${GLOBAL_WATCH_INTERVAL_MINUTES:-0}"
     local watch_status="${YELLOW}已暂停${NC}"
-    if cron_task_exists_by_tag "$WATCH_CRON_TAG"; then
-        watch_minutes=$(get_cron_minutes_by_tag "$WATCH_CRON_TAG" || echo 0)
-        [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}已启动${NC}"
-    fi
+    [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}已启动${NC}"
 
-    local restart_minutes=0
+    local restart_minutes="${GLOBAL_RESTART_INTERVAL_MINUTES:-0}"
     local restart_status="${YELLOW}已暂停${NC}"
-    if cron_task_exists_by_tag "$RESTART_CRON_TAG"; then
-        restart_minutes=$(get_cron_minutes_by_tag "$RESTART_CRON_TAG" || echo 0)
-        [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}已启动${NC}"
-    fi
+    [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}已启动${NC}"
 
-    echo -e "  域名解析: ${watch_status} (${CYAN}${watch_minutes}分钟${NC})"
-    echo -e "  自动重启: ${restart_status} (${CYAN}${restart_minutes}分钟${NC})"
+    echo -e "  域名解析: ${watch_status} (${CYAN}$(format_interval_label "$watch_minutes")${NC})"
+    echo -e "  自动重启: ${restart_status} (${CYAN}$(format_interval_label "$restart_minutes")${NC})"
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
