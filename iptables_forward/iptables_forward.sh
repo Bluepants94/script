@@ -27,6 +27,7 @@ RAW_APPLY_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward-apply"
 RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
 RAW_WATCH_URL="${RAW_BASE_URL}/iptables-forward-watch"
 WATCH_CRON_TAG="# iptables-forward-watch"
+RESTART_CRON_TAG="# iptables-forward-restart"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -40,6 +41,7 @@ rules_last_check_ts=()
 rules_is_domain=()
 GLOBAL_WATCH_ENABLED=1
 GLOBAL_WATCH_INTERVAL_MINUTES=5
+GLOBAL_RESTART_INTERVAL_MINUTES=0
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
 DISABLE_PUBLIC_IP=0
@@ -170,95 +172,110 @@ resolve_domain_ipv4_once() {
 }
 
 is_watch_enabled() {
-    [[ "$GLOBAL_WATCH_ENABLED" == "1" ]]
+    [[ "$GLOBAL_WATCH_ENABLED" == "1" && "$GLOBAL_WATCH_INTERVAL_MINUTES" -gt 0 ]]
 }
 
 normalize_global_watch_values() {
-    [[ "$GLOBAL_WATCH_ENABLED" == "1" || "$GLOBAL_WATCH_ENABLED" == "0" ]] || GLOBAL_WATCH_ENABLED=1
-    if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 1 ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -gt 59 ]]; then
-        GLOBAL_WATCH_INTERVAL_MINUTES=5
-    fi
-}
-
-cron_task_exists() {
-    command -v crontab >/dev/null 2>&1 || return 1
-    crontab -l 2>/dev/null | grep -qF "$WATCH_CRON_TAG"
-}
-
-add_watch_cron_task() {
-    command -v crontab >/dev/null 2>&1 || return 1
-
-    if cron_task_exists; then
-        return 2
+    [[ "$GLOBAL_WATCH_ENABLED" == "1" || "$GLOBAL_WATCH_ENABLED" == "0" ]] || GLOBAL_WATCH_ENABLED=0
+    if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 0 ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -gt 59 ]]; then
+        GLOBAL_WATCH_INTERVAL_MINUTES=0
     fi
 
-    normalize_global_watch_values
-    local current cron_line new_content
-    current=$(crontab -l 2>/dev/null || true)
-    cron_line="*/${GLOBAL_WATCH_INTERVAL_MINUTES} * * * * ${WATCH_SCRIPT_PATH} >/dev/null 2>&1 ${WATCH_CRON_TAG}"
-
-    if [[ -n "$current" ]]; then
-        new_content="${current}"$'\n'"${cron_line}"
+    if [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -eq 0 ]]; then
+        GLOBAL_WATCH_ENABLED=0
     else
-        new_content="$cron_line"
+        GLOBAL_WATCH_ENABLED=1
     fi
-
-    printf "%s\n" "$new_content" | crontab -
 }
 
-remove_watch_cron_task() {
+normalize_global_restart_values() {
+    if [[ ! "$GLOBAL_RESTART_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -lt 0 ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -gt 59 ]]; then
+        GLOBAL_RESTART_INTERVAL_MINUTES=0
+    fi
+}
+
+cron_task_exists_by_tag() {
+    local tag="$1"
+    command -v crontab >/dev/null 2>&1 || return 1
+    crontab -l 2>/dev/null | grep -qF "$tag"
+}
+
+get_cron_minutes_by_tag() {
+    local tag="$1"
     command -v crontab >/dev/null 2>&1 || return 1
 
-    if ! cron_task_exists; then
-        return 2
-    fi
+    local line minutes
+    line=$(crontab -l 2>/dev/null | grep -F "$tag" | tail -n 1)
+    [[ -n "$line" ]] || return 1
 
-    local new_content
-    new_content=$(crontab -l 2>/dev/null | grep -vF "$WATCH_CRON_TAG" || true)
-
-    if [[ -n "$new_content" ]]; then
-        printf "%s\n" "$new_content" | crontab -
-    else
-        crontab -r 2>/dev/null || true
-    fi
+    minutes=$(echo "$line" | sed -n 's#\*/\([0-9]\+\) .*#\1#p')
+    [[ "$minutes" =~ ^[0-9]+$ ]] || return 1
+    echo "$minutes"
+    return 0
 }
 
-ensure_watch_task_on_startup() {
-    add_watch_cron_task >/dev/null 2>&1 || true
-}
+set_cron_task_minutes() {
+    local tag="$1"
+    local script_path="$2"
+    local minutes="$3"
 
-sync_watch_cron_task_interval() {
     command -v crontab >/dev/null 2>&1 || return 1
-    normalize_global_watch_values
 
     local current filtered cron_line new_content
     current=$(crontab -l 2>/dev/null || true)
-    filtered=$(printf "%s\n" "$current" | grep -vF "$WATCH_CRON_TAG" || true)
-    cron_line="*/${GLOBAL_WATCH_INTERVAL_MINUTES} * * * * ${WATCH_SCRIPT_PATH} >/dev/null 2>&1 ${WATCH_CRON_TAG}"
+    filtered=$(printf "%s\n" "$current" | grep -vF "$tag" || true)
 
-    if cron_task_exists; then
+    if [[ "$minutes" -eq 0 ]]; then
         if [[ -n "$filtered" ]]; then
-            new_content="${filtered}"$'\n'"${cron_line}"
+            printf "%s\n" "$filtered" | crontab -
         else
-            new_content="$cron_line"
+            crontab -r 2>/dev/null || true
         fi
-        printf "%s\n" "$new_content" | crontab -
+        return 0
     fi
+
+    cron_line="*/${minutes} * * * * ${script_path} >/dev/null 2>&1 ${tag}"
+    if [[ -n "$filtered" ]]; then
+        new_content="${filtered}"$'\n'"${cron_line}"
+    else
+        new_content="$cron_line"
+    fi
+    printf "%s\n" "$new_content" | crontab -
+}
+
+sync_watch_cron_from_config() {
+    normalize_global_watch_values
+    set_cron_task_minutes "$WATCH_CRON_TAG" "$WATCH_SCRIPT_PATH" "$GLOBAL_WATCH_INTERVAL_MINUTES"
+}
+
+sync_restart_cron_from_config() {
+    normalize_global_restart_values
+    set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" "$GLOBAL_RESTART_INTERVAL_MINUTES"
+}
+
+sync_cron_tasks_from_config() {
+    sync_watch_cron_from_config >/dev/null 2>&1 || true
+    sync_restart_cron_from_config >/dev/null 2>&1 || true
 }
 
 read_global_settings_from_config() {
-    GLOBAL_WATCH_ENABLED=1
-    GLOBAL_WATCH_INTERVAL_MINUTES=5
+    GLOBAL_WATCH_ENABLED=0
+    GLOBAL_WATCH_INTERVAL_MINUTES=0
+    GLOBAL_RESTART_INTERVAL_MINUTES=0
 
     [[ -f "$CONFIG_FILE" ]] || return 0
 
     local enabled minutes
+    local restart_minutes
     enabled=$(grep -m1 '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
     minutes=$(grep -m1 '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
+    restart_minutes=$(grep -m1 '^GLOBAL_RESTART_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
 
     [[ -n "$enabled" ]] && GLOBAL_WATCH_ENABLED="$enabled"
     [[ -n "$minutes" ]] && GLOBAL_WATCH_INTERVAL_MINUTES="$minutes"
+    [[ -n "$restart_minutes" ]] && GLOBAL_RESTART_INTERVAL_MINUTES="$restart_minutes"
     normalize_global_watch_values
+    normalize_global_restart_values
 }
 
 parse_port_expr() {
@@ -397,10 +414,12 @@ init_env() {
 
     read_global_settings_from_config
 
-    if ! grep -q '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null || ! grep -q '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null; then
+    if ! grep -q '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null || ! grep -q '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null || ! grep -q '^GLOBAL_RESTART_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null; then
         load_rules
         save_rules
     fi
+
+    sync_cron_tasks_from_config
 }
 
 # ---------- 公网IP检测 ----------
@@ -592,6 +611,7 @@ load_rules() {
         [[ -z "$c1" || "$c1" == \#* ]] && continue
         [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] && continue
         [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] && continue
+        [[ "$c1" =~ ^GLOBAL_RESTART_INTERVAL_MINUTES= ]] && continue
 
         if [[ -n "$c9" ]]; then
             # 9列格式
@@ -633,13 +653,16 @@ load_rules() {
 # ---------- 保存规则配置 ----------
 save_rules() {
     normalize_global_watch_values
+    normalize_global_restart_values
 
     cat > "$CONFIG_FILE" <<EOF_CONF
 # iptables 端口转发规则配置
-# 全局域名监控开关(1=启动,0=暂停)
+# 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
-# 全局域名监控间隔(分钟, 1-59)
+# 全局域名解析间隔(分钟, 0-59；0=关闭)
 GLOBAL_WATCH_INTERVAL_MINUTES=${GLOBAL_WATCH_INTERVAL_MINUTES}
+# 全局自动重启间隔(分钟, 0-59；0=关闭)
+GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # -------------------------------------------------
 # 格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
 # 示例(IP): 0.0.0.0|8080|127.0.0.1|1080|both|127.0.0.1|0|0|0
@@ -700,95 +723,72 @@ do_update() {
 
 do_domain_watch_manage() {
     print_banner
-    echo -e "${BOLD}${BLUE}[ 域名监控间隔 ]${NC}"
+    echo -e "${BOLD}${BLUE}[ 域名解析间隔 ]${NC}"
     echo ""
 
     load_rules
-    local cron_exists=false
-    if cron_task_exists; then
-        cron_exists=true
+    local current_minutes=0
+    if cron_task_exists_by_tag "$WATCH_CRON_TAG"; then
+        current_minutes=$(get_cron_minutes_by_tag "$WATCH_CRON_TAG" || echo 0)
     fi
 
-    if is_watch_enabled; then
-        echo -e "  当前状态: ${GREEN}已启动${NC}"
+    if [[ "$current_minutes" -gt 0 ]]; then
+        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}${current_minutes}分钟${NC})"
     else
         echo -e "  当前状态: ${YELLOW}已暂停${NC}"
     fi
-
-    if $cron_exists; then
-        echo -e "  Cron任务: ${GREEN}已存在${NC}"
-    else
-        echo -e "  Cron任务: ${YELLOW}不存在${NC}"
-    fi
-    echo -e "  监控间隔: ${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES} 分钟${NC}"
     echo ""
 
-    if is_watch_enabled; then
-        echo -e "  ${RED}1)${NC} 暂停"
-    else
-        echo -e "  ${GREEN}1)${NC} 启动"
-    fi
-
-    if $cron_exists; then
-        echo -e "  ${RED}2)${NC} 删除任务"
-    else
-        echo -e "  ${GREEN}2)${NC} 添加任务"
-    fi
-
-    echo -e "  ${CYAN}3)${NC} 修改时间"
+    echo -e "  ${CYAN}1)${NC} 定时解析"
+    echo -e "  ${CYAN}2)${NC} 立即解析"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
 
     while true; do
-        sub_choice=$(read_menu_choice "请选择 [0-3]: " '^[0-3]$')
+        sub_choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
         case "$sub_choice" in
             1)
-                if is_watch_enabled; then
-                    GLOBAL_WATCH_ENABLED=0
-                    save_rules
-                    set_last_result "success" "已暂停"
-                else
-                    GLOBAL_WATCH_ENABLED=1
-                    save_rules
-                    set_last_result "success" "已启动"
-                fi
-                return
-                ;;
-            2)
-                if $cron_exists; then
-                    if remove_watch_cron_task; then
-                        set_last_result "success" "Cron任务删除成功"
-                    else
-                        set_last_result "error" "Cron任务删除失败"
-                    fi
-                else
-                    if add_watch_cron_task; then
-                        set_last_result "success" "Cron任务添加成功"
-                    else
-                        rc=$?
-                        if [[ "$rc" -eq 2 ]]; then
-                            set_last_result "warn" "Cron任务已存在，无需重复添加"
-                        else
-                            set_last_result "error" "Cron任务添加失败"
-                        fi
-                    fi
-                fi
-                return
-                ;;
-            3)
                 local new_minutes
                 while true; do
-                    read -r -p "请输入域名监控间隔（分钟，默认: 5）: " new_minutes
-                    new_minutes=${new_minutes:-5}
-                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 1 ]] && [[ "$new_minutes" -le 59 ]]; then
+                    read -r -p "请输入域名解析间隔（分钟，默认: 0；0=关闭）: " new_minutes
+                    new_minutes=${new_minutes:-0}
+                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]] && [[ "$new_minutes" -le 59 ]]; then
                         GLOBAL_WATCH_INTERVAL_MINUTES="$new_minutes"
+                        if [[ "$new_minutes" -eq 0 ]]; then
+                            GLOBAL_WATCH_ENABLED=0
+                        else
+                            GLOBAL_WATCH_ENABLED=1
+                        fi
+
                         save_rules
-                        sync_watch_cron_task_interval >/dev/null 2>&1 || true
-                        set_last_result "success" "修改成功！"
+                        if sync_watch_cron_from_config >/dev/null 2>&1; then
+                            if [[ "$new_minutes" -eq 0 ]]; then
+                                set_last_result "success" "已关闭域名解析定时任务"
+                            else
+                                set_last_result "success" "已设置域名解析为每 ${new_minutes} 分钟执行"
+                            fi
+                        else
+                            set_last_result "error" "Cron 任务更新失败"
+                        fi
                         return
                     fi
                     print_error "输入无效，请重新输入！"
                 done
+                ;;
+            2)
+                if [[ ! -x "$WATCH_SCRIPT_PATH" ]]; then
+                    sync_support_files false || {
+                        set_last_result "error" "立即解析失败：watch 脚本不存在且下载失败"
+                        return
+                    }
+                fi
+
+                if "$WATCH_SCRIPT_PATH" >/dev/null 2>&1; then
+                    set_last_result "success" "已立即执行一次域名解析"
+                else
+                    set_last_result "error" "立即解析失败：执行异常"
+                fi
+                return
                 ;;
             0)
                 return
@@ -1115,6 +1115,69 @@ do_restart() {
     return
 }
 
+do_restart_manage() {
+    print_banner
+    echo -e "${BOLD}${BLUE}[ 重启 iptables 转发 ]${NC}"
+    echo ""
+
+    load_rules
+    local current_minutes=0
+    if cron_task_exists_by_tag "$RESTART_CRON_TAG"; then
+        current_minutes=$(get_cron_minutes_by_tag "$RESTART_CRON_TAG" || echo 0)
+    fi
+
+    if [[ "$current_minutes" -gt 0 ]]; then
+        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}${current_minutes}分钟${NC})"
+    else
+        echo -e "  当前状态: ${YELLOW}已暂停${NC}"
+    fi
+    echo ""
+
+    echo -e "  ${CYAN}1)${NC} 定时重启"
+    echo -e "  ${CYAN}2)${NC} 立即重启"
+    echo -e "  ${NC}0)${NC} 返回"
+    echo ""
+
+    while true; do
+        sub_choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
+        case "$sub_choice" in
+            1)
+                local new_minutes
+                while true; do
+                    read -r -p "请输入自动重启间隔（分钟，默认: 0；0=关闭）: " new_minutes
+                    new_minutes=${new_minutes:-0}
+                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]] && [[ "$new_minutes" -le 59 ]]; then
+                        GLOBAL_RESTART_INTERVAL_MINUTES="$new_minutes"
+                        save_rules
+
+                        if sync_restart_cron_from_config >/dev/null 2>&1; then
+                            if [[ "$new_minutes" -eq 0 ]]; then
+                                set_last_result "success" "已关闭自动重启定时任务"
+                            else
+                                set_last_result "success" "已设置自动重启为每 ${new_minutes} 分钟执行"
+                            fi
+                        else
+                            set_last_result "error" "Cron 任务更新失败"
+                        fi
+                        return
+                    fi
+                    print_error "输入无效，请重新输入！"
+                done
+                ;;
+            2)
+                do_restart
+                return
+                ;;
+            0)
+                return
+                ;;
+            *)
+                print_error "输入无效，请重新输入！"
+                ;;
+        esac
+    done
+}
+
 # ---------- 管理开机自启 ----------
 do_autostart() {
     print_banner
@@ -1176,11 +1239,22 @@ show_menu() {
         echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
     fi
 
-    local cron_status="${YELLOW}已暂停${NC}"
-    if is_watch_enabled && cron_task_exists; then
-        cron_status="${GREEN}已启动${NC}"
+    local watch_minutes=0
+    local watch_status="${YELLOW}已暂停${NC}"
+    if cron_task_exists_by_tag "$WATCH_CRON_TAG"; then
+        watch_minutes=$(get_cron_minutes_by_tag "$WATCH_CRON_TAG" || echo 0)
+        [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}已启动${NC}"
     fi
-    echo -e "  Cron任务: ${cron_status} (${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES}分钟${NC})"
+
+    local restart_minutes=0
+    local restart_status="${YELLOW}已暂停${NC}"
+    if cron_task_exists_by_tag "$RESTART_CRON_TAG"; then
+        restart_minutes=$(get_cron_minutes_by_tag "$RESTART_CRON_TAG" || echo 0)
+        [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}已启动${NC}"
+    fi
+
+    echo -e "  域名解析: ${watch_status} (${CYAN}${watch_minutes}分钟${NC})"
+    echo -e "  自动重启: ${restart_status} (${CYAN}${restart_minutes}分钟${NC})"
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
@@ -1191,7 +1265,7 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
-    echo -e "  ${CYAN}4)${NC} 域名监控间隔"
+    echo -e "  ${CYAN}4)${NC} 域名解析间隔"
     echo -e "  ${YELLOW}5)${NC} 开机自启管理"
     echo -e "  ${BLUE}6)${NC} 更新脚本文件"
     echo -e "  ${NC}0)${NC} 退出"
@@ -1213,14 +1287,13 @@ main() {
     check_root
     init_env
     create_service
-    ensure_watch_task_on_startup
 
     while true; do
         show_menu
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_restart ;;
+            3) do_restart_manage ;;
             4) do_domain_watch_manage ;;
             5) do_autostart ;;
             6) do_update ;;
