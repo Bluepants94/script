@@ -58,7 +58,7 @@ print_banner() {
 
 print_info()    { echo -e "${GREEN}[信息]${NC} $1"; }
 print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
-print_error()   { echo -e "${RED}[错误]${NC} $1"; }
+print_error()   { echo -e "${RED}[错误]${NC} $1" >&2; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
 set_last_result() {
