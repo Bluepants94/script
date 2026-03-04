@@ -2,8 +2,10 @@
 CONFIG_FILE="/etc/iptables-forward/rules.conf"
 LOCK_FILE="/etc/iptables-forward/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
+CHAIN_POST="IPTFWD-POST"
 
 GLOBAL_WATCH_ENABLED=1
+MANUAL_MODE=0
 change_records=()
 change_listen_ips=()
 change_src_ports=()
@@ -11,6 +13,8 @@ change_dst_ports=()
 change_protos=()
 change_old_ips=()
 change_new_ips=()
+
+IP6_CHAINS_READY=0
 
 parse_port_expr() {
     local expr="$1"
@@ -38,6 +42,30 @@ to_iptables_dport() {
     echo "$1" | sed 's/-/:/'
 }
 
+is_ipv6() {
+    local ip="$1"
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    return 0
+}
+
+is_valid_ip() {
+    is_ipv4 "$1" || is_ipv6 "$1"
+}
+
+ensure_ip6_chains() {
+    [[ "$IP6_CHAINS_READY" -eq 1 ]] && return 0
+    command -v ip6tables >/dev/null 2>&1 || return 1
+
+    ip6tables -t nat -N "$CHAIN_PRE" 2>/dev/null || true
+    ip6tables -t nat -N "$CHAIN_POST" 2>/dev/null || true
+    ip6tables -t nat -C PREROUTING -j "$CHAIN_PRE" >/dev/null 2>&1 || ip6tables -t nat -A PREROUTING -j "$CHAIN_PRE" >/dev/null 2>&1 || true
+    ip6tables -t nat -C POSTROUTING -j "$CHAIN_POST" >/dev/null 2>&1 || ip6tables -t nat -A POSTROUTING -j "$CHAIN_POST" >/dev/null 2>&1 || true
+
+    IP6_CHAINS_READY=1
+    return 0
+}
+
 apply_single_rule() {
     local action="$1"      # -A / -D
     local listen_ip="$2"
@@ -50,6 +78,14 @@ apply_single_rule() {
     src_meta=$(parse_port_expr "$src_port") || return 1
     dst_meta=$(parse_port_expr "$dst_port") || return 1
 
+    local ip_cmd="iptables"
+    local dst_target_ip="$dst_ip"
+    if is_ipv6 "$dst_ip"; then
+        ensure_ip6_chains || return 1
+        ip_cmd="ip6tables"
+        dst_target_ip="[$dst_ip]"
+    fi
+
     local src_type src_start src_end dst_type dst_start dst_end
     IFS='|' read -r src_type src_start src_end <<< "$src_meta"
     IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
@@ -59,9 +95,11 @@ apply_single_rule() {
         src_dport=$(to_iptables_dport "$src_port")
         dst_dport=$(to_iptables_dport "$dst_port")
         if [[ "$listen_ip" == "0.0.0.0" ]]; then
-            iptables -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_ip}:${dst_dport}" >/dev/null 2>&1 || true
+            "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
+        elif [[ "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ]]; then
+            "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
         else
-            iptables -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_ip}:${dst_dport}" >/dev/null 2>&1 || true
+            "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
         fi
         return 0
     fi
@@ -72,9 +110,11 @@ apply_single_rule() {
             src_dport=$(to_iptables_dport "$src_port")
             dst_dport=$(to_iptables_dport "$dst_port")
             if [[ "$listen_ip" == "0.0.0.0" ]]; then
-                iptables -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_ip}:${dst_dport}" >/dev/null 2>&1 || true
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
+            elif [[ "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ]]; then
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
             else
-                iptables -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_ip}:${dst_dport}" >/dev/null 2>&1 || true
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "${dst_target_ip}:${dst_dport}" >/dev/null 2>&1 || true
             fi
             return 0
         fi
@@ -86,9 +126,11 @@ apply_single_rule() {
             local sp=$((src_start + offset))
             local dp=$((dst_start + offset))
             if [[ "$listen_ip" == "0.0.0.0" ]]; then
-                iptables -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_ip}:${dp}" >/dev/null 2>&1 || true
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_target_ip}:${dp}" >/dev/null 2>&1 || true
+            elif [[ "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ]]; then
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_target_ip}:${dp}" >/dev/null 2>&1 || true
             else
-                iptables -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_ip}:${dp}" >/dev/null 2>&1 || true
+                "$ip_cmd" -t nat "$action" "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_target_ip}:${dp}" >/dev/null 2>&1 || true
             fi
         done
         return 0
@@ -142,54 +184,38 @@ is_ipv4() {
     return 0
 }
 
-resolve_domain_ipv4() {
+resolve_domain_ip() {
     local domain="$1"
     local ip=""
 
     if command -v dig >/dev/null 2>&1; then
-        # 过滤 CNAME，只取 IPv4 格式的行
-        ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
+        # 主 DNS: 8.8.8.8（A）
+        ip=$(dig @8.8.8.8 "$domain" +short 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         if is_ipv4 "$ip"; then
             echo "$ip"
             return 0
         fi
 
-        ip=$(dig @1.0.0.1 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
+        # 主 DNS: 8.8.8.8（AAAA）
+        ip=$(dig @8.8.8.8 AAAA "$domain" +short 2>/dev/null | grep -oE '^[0-9A-Fa-f:]+$' | head -n 1)
+        if is_ipv6 "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+
+        # 备用 DNS: 1.1.1.1（A）
+        ip=$(dig @1.1.1.1 "$domain" +short 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         if is_ipv4 "$ip"; then
             echo "$ip"
             return 0
         fi
 
-        ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
-        if is_ipv4 "$ip"; then
+        # 备用 DNS: 1.1.1.1（AAAA）
+        ip=$(dig @1.1.1.1 AAAA "$domain" +short 2>/dev/null | grep -oE '^[0-9A-Fa-f:]+$' | head -n 1)
+        if is_ipv6 "$ip"; then
             echo "$ip"
             return 0
         fi
-
-        ip=$(dig @8.8.4.4 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
-        if is_ipv4 "$ip"; then
-            echo "$ip"
-            return 0
-        fi
-    fi
-
-    ip=$(curl -s --max-time 5 "https://cloudflare-dns.com/dns-query?name=${domain}&type=A" \
-        -H 'accept: application/dns-json' 2>/dev/null \
-        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
-        | head -n 1 \
-        | sed -E 's/"data":"([0-9.]+)"/\1/')
-    if is_ipv4 "$ip"; then
-        echo "$ip"
-        return 0
-    fi
-
-    ip=$(curl -s --max-time 5 "https://dns.google/resolve?name=${domain}&type=A" 2>/dev/null \
-        | grep -oE '"data":"([0-9]{1,3}\.){3}[0-9]{1,3}"' \
-        | head -n 1 \
-        | sed -E 's/"data":"([0-9.]+)"/\1/')
-    if is_ipv4 "$ip"; then
-        echo "$ip"
-        return 0
     fi
 
     return 1
@@ -198,6 +224,7 @@ resolve_domain_ipv4() {
 [[ -f "$CONFIG_FILE" ]] || exit 0
 read_global_watch_enabled
 [[ "$GLOBAL_WATCH_ENABLED" == "1" ]] || exit 0
+[[ -t 1 ]] && MANUAL_MODE=1
 
 # 文件锁：防止与主脚本或其他实例同时写配置文件
 exec 200>"$LOCK_FILE"
@@ -236,9 +263,19 @@ while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
 
     if [[ "$is_domain" == "1" ]]; then
         [[ "$check_interval" -le 0 ]] && check_interval=300
-        if (( now - last_check_ts >= check_interval )); then
-            new_ip=$(resolve_domain_ipv4 "$dst_host" 2>/dev/null || true)
-            if is_ipv4 "$new_ip"; then
+        need_check=0
+        if [[ "$MANUAL_MODE" -eq 1 ]]; then
+            need_check=1
+        elif (( now - last_check_ts >= check_interval )); then
+            need_check=1
+        fi
+
+        if [[ "$need_check" -eq 1 ]]; then
+            new_ip=$(resolve_domain_ip "$dst_host" 2>/dev/null || true)
+            if is_valid_ip "$new_ip"; then
+                if [[ "$MANUAL_MODE" -eq 1 ]]; then
+                    echo "${dst_host} -> ${new_ip}"
+                fi
                 if [[ "$new_ip" != "$resolved_ip" ]]; then
                     old_ip="$resolved_ip"
                     resolved_ip="$new_ip"
@@ -274,7 +311,7 @@ if [[ "$changed" -eq 1 ]]; then
     done
 
     # 日志仅记录 IP 更变
-    if command -v logger >/dev/null 2>&1; then
+    if [[ "$MANUAL_MODE" -eq 0 ]] && command -v logger >/dev/null 2>&1; then
         for record in "${change_records[@]}"; do
             logger -t iptables-forward-watch "IP changed: ${record}"
         done
