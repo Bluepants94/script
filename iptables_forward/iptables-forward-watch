@@ -141,15 +141,31 @@ while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
     echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}" >> "$tmp_file"
 done < "$CONFIG_FILE"
 
-if ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
+rm -f "$tmp_file.old" 2>/dev/null
+
+if [[ "$changed" -eq 1 ]]; then
+    # IP 发生变化：先备份旧配置，再写入新配置
+    cp "$CONFIG_FILE" "$tmp_file.old"
+    cp "$tmp_file" "$CONFIG_FILE"
+
+    if "$APPLY_SCRIPT" >/dev/null 2>&1; then
+        # apply 成功
+        rm -f "$tmp_file.old"
+        if command -v logger >/dev/null 2>&1; then
+            logger -t iptables-forward-watch "resolved ip changed, rules reapplied"
+        fi
+    else
+        # apply 失败：回滚配置文件，保留旧 resolved_ip
+        # 这样下次 watch 运行时仍能检测到 IP 变化并重试
+        cp "$tmp_file.old" "$CONFIG_FILE"
+        rm -f "$tmp_file.old"
+        if command -v logger >/dev/null 2>&1; then
+            logger -p user.err -t iptables-forward-watch "apply failed after IP change, config rolled back for retry"
+        fi
+    fi
+elif ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
+    # 仅时间戳等非关键字段变化，静默更新配置文件（不触发 apply）
     cp "$tmp_file" "$CONFIG_FILE"
 fi
 
 rm -f "$tmp_file"
-
-if [[ "$changed" -eq 1 ]]; then
-    "$APPLY_SCRIPT" >/dev/null 2>&1
-    if command -v logger >/dev/null 2>&1; then
-        logger -t iptables-forward-watch "resolved ip changed, rules reapplied"
-    fi
-fi
