@@ -24,11 +24,6 @@ log_watch() {
     command -v logger >/dev/null 2>&1 && logger -t iptables-forward "$1"
 }
 
-write_config_line() {
-    local c1="${1:-}" c2="${2:-}" c3="${3:-}" c4="${4:-}" c5="${5:-}" c6="${6:-}" c7="${7:-}" c8="${8:-}" c9="${9:-}"
-    echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}"
-}
-
 is_valid_ipv4() {
     local ip="$1"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -40,10 +35,7 @@ is_valid_ipv4() {
 }
 
 is_valid_ipv6() {
-    local ip="$1"
-    [[ "$ip" == *:* ]] || return 1
-    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-    return 0
+    [[ "$1" == *:* && "$1" =~ ^[0-9A-Fa-f:]+$ ]]
 }
 
 is_valid_ip() {
@@ -54,52 +46,36 @@ read_global_watch_enabled() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     local enabled
     enabled=$(grep -m1 '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-    if [[ "$enabled" == "0" || "$enabled" == "1" ]]; then
-        GLOBAL_WATCH_ENABLED="$enabled"
-    fi
+    [[ "$enabled" == "0" || "$enabled" == "1" ]] && GLOBAL_WATCH_ENABLED="$enabled"
 }
 
 resolve_domain_ip() {
-    local domain="$1"
-    local ip=""
+    local domain="$1" ip=""
+    command -v dig >/dev/null 2>&1 || return 1
 
-    if command -v dig >/dev/null 2>&1; then
-        ip=$(dig @8.8.8.8 "$domain" +short 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
-        is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
-
-        ip=$(dig @8.8.8.8 AAAA "$domain" +short 2>/dev/null | grep -oE '^[0-9A-Fa-f:]+$' | head -n 1)
-        is_valid_ipv6 "$ip" && { echo "$ip"; return 0; }
-
-        ip=$(dig @1.1.1.1 "$domain" +short 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
-        is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
-
-        ip=$(dig @1.1.1.1 AAAA "$domain" +short 2>/dev/null | grep -oE '^[0-9A-Fa-f:]+$' | head -n 1)
-        is_valid_ipv6 "$ip" && { echo "$ip"; return 0; }
-    fi
-
+    local server type
+    for server in 8.8.8.8 1.1.1.1; do
+        for type in A AAAA; do
+            ip=$(dig @"$server" "$type" "$domain" +short 2>/dev/null | head -n 1)
+            if [[ "$type" == "A" ]]; then
+                is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
+            else
+                is_valid_ipv6 "$ip" && { echo "$ip"; return 0; }
+            fi
+        done
+    done
     return 1
-}
-
-to_iptables_dport() {
-    echo "$1" | sed 's/-/:/'
 }
 
 parse_port_expr() {
     local expr="$1"
     if [[ "$expr" =~ ^[0-9]+$ ]]; then
-        if [[ "$expr" -ge 1 && "$expr" -le 65535 ]]; then
-            echo "single|$expr|$expr"
-            return 0
-        fi
+        [[ "$expr" -ge 1 && "$expr" -le 65535 ]] && { echo "single|$expr|$expr"; return 0; }
         return 1
     fi
     if [[ "$expr" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        local a="${BASH_REMATCH[1]}"
-        local b="${BASH_REMATCH[2]}"
-        if [[ "$a" -ge 1 && "$b" -le 65535 && "$a" -lt "$b" ]]; then
-            echo "range|$a|$b"
-            return 0
-        fi
+        local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+        [[ "$a" -ge 1 && "$b" -le 65535 && "$a" -lt "$b" ]] && { echo "range|$a|$b"; return 0; }
         return 1
     fi
     return 1
@@ -115,9 +91,9 @@ ensure_ip6_chains() {
     ip6tables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$CHAIN_POST"
 
     IP6_CHAINS_READY=1
-    return 0
 }
 
+# ---------- apply 用规则数组 ----------
 rules_listen_ip=()
 rules_src_port=()
 rules_dst_port=()
@@ -127,52 +103,34 @@ rules_proto=()
 load_rules_for_apply() {
     [[ -f "$CONFIG_FILE" ]] || return 1
 
-    rules_listen_ip=()
-    rules_src_port=()
-    rules_dst_port=()
-    rules_resolved_ip=()
-    rules_proto=()
+    rules_listen_ip=(); rules_src_port=(); rules_dst_port=()
+    rules_resolved_ip=(); rules_proto=()
 
     while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
-        [[ -z "$c1" || "$c1" == \#* ]] && continue
-        [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] && continue
-        [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] && continue
-        [[ "$c1" =~ ^GLOBAL_RESTART_INTERVAL_MINUTES= ]] && continue
+        [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]] && continue
+
+        local listen_ip src_port dst_port resolved proto
 
         if [[ -n "$c9" ]]; then
-            local resolved="$c6"
-            is_valid_ip "$resolved" || resolved="$c3"
-            is_valid_ip "$resolved" || continue
-
-            rules_listen_ip+=("$c1")
-            rules_src_port+=("$c2")
-            rules_dst_port+=("$c4")
-            rules_resolved_ip+=("$resolved")
-            rules_proto+=("$c5")
+            listen_ip="$c1"; src_port="$c2"; dst_port="$c4"; proto="$c5"
+            resolved="$c6"; is_valid_ip "$resolved" || resolved="$c3"
         elif [[ -n "$c5" ]]; then
-            is_valid_ip "$c3" || continue
-
-            rules_listen_ip+=("$c1")
-            rules_src_port+=("$c2")
-            rules_dst_port+=("$c4")
-            rules_resolved_ip+=("$c3")
-            rules_proto+=("$c5")
+            listen_ip="$c1"; src_port="$c2"; dst_port="$c4"; proto="$c5"; resolved="$c3"
         elif [[ -n "$c4" ]]; then
-            is_valid_ipv4 "$c2" || continue
-
-            rules_listen_ip+=("0.0.0.0")
-            rules_src_port+=("$c1")
-            rules_dst_port+=("$c3")
-            rules_resolved_ip+=("$c2")
-            rules_proto+=("$c4")
+            listen_ip="0.0.0.0"; src_port="$c1"; dst_port="$c3"; proto="$c4"; resolved="$c2"
+        else
+            continue
         fi
+
+        is_valid_ip "$resolved" || continue
+        rules_listen_ip+=("$listen_ip"); rules_src_port+=("$src_port")
+        rules_dst_port+=("$dst_port"); rules_resolved_ip+=("$resolved"); rules_proto+=("$proto")
     done < "$CONFIG_FILE"
 }
 
 init_custom_chains() {
     iptables -t nat -N "$CHAIN_PRE" 2>/dev/null || iptables -t nat -F "$CHAIN_PRE"
     iptables -t nat -N "$CHAIN_POST" 2>/dev/null || iptables -t nat -F "$CHAIN_POST"
-
     iptables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || iptables -t nat -A PREROUTING -j "$CHAIN_PRE"
     iptables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$CHAIN_POST"
 }
@@ -182,27 +140,27 @@ add_masquerade_rules() {
     if [[ "$IP6_CHAINS_READY" -eq 1 ]]; then
         ip6tables -t nat -A "$CHAIN_POST" -m conntrack --ctstate DNAT -j MASQUERADE 2>/dev/null || return 1
     fi
-    return 0
+}
+
+add_single_iptables_rule() {
+    local ip_cmd="$1" listen_ip="$2" proto="$3" dport="$4" dnat_target="$5"
+    if [[ "$listen_ip" == "0.0.0.0" || ( "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ) ]]; then
+        "$ip_cmd" -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${dport} -> ${dnat_target} (${proto})" >&2
+    else
+        "$ip_cmd" -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${dport} -> ${dnat_target} (${proto})" >&2
+    fi
 }
 
 add_iptables_rule() {
-    local listen_ip="$1"
-    local src_port="$2"
-    local dst_ip="$3"
-    local dst_port="$4"
-    local proto="$5"
+    local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
 
-    local ip_cmd="iptables"
-    local dst_target_ip="$dst_ip"
+    local ip_cmd="iptables" dst_target_ip="$dst_ip"
     if is_valid_ipv6 "$dst_ip"; then
         ensure_ip6_chains || return 1
-        ip_cmd="ip6tables"
-        dst_target_ip="[$dst_ip]"
+        ip_cmd="ip6tables"; dst_target_ip="[$dst_ip]"
     fi
-
-    local src_dport dst_dport
-    src_dport=$(to_iptables_dport "$src_port")
-    dst_dport=$(to_iptables_dport "$dst_port")
 
     local src_meta dst_meta
     src_meta=$(parse_port_expr "$src_port") || return 1
@@ -212,73 +170,50 @@ add_iptables_rule() {
     IFS='|' read -r src_type src_start src_end <<< "$src_meta"
     IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
 
-    local dnat_target
-    if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
-        dnat_target="${dst_target_ip}:${dst_dport}"
-    elif [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
-        if [[ "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
-            dnat_target="${dst_target_ip}:${dst_dport}"
-        else
-            local src_len=$(( src_end - src_start + 1 ))
-            if [[ "$src_len" -gt 1000 ]]; then
-                echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
-                return 1
-            fi
-            for ((offset=0; offset<src_len; offset++)); do
-                local sp=$((src_start + offset))
-                local dp=$((dst_start + offset))
+    # 单端口 → 单端口，或端口段相同
+    if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
+       [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
+        local src_dport="${src_port//-/:}"
+        add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$src_dport" "${dst_target_ip}:${dst_port}"
+        return
+    fi
 
-                if [[ "$listen_ip" == "0.0.0.0" || ( "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ) ]]; then
-                    "$ip_cmd" -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_target_ip}:${dp}" || \
-                        echo "[错误] 添加规则失败: ${listen_ip} ${sp} -> ${dst_target_ip}:${dp} (${proto})" >&2
-                else
-                    "$ip_cmd" -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$sp" -j DNAT --to-destination "${dst_target_ip}:${dp}" || \
-                        echo "[错误] 添加规则失败: ${listen_ip} ${sp} -> ${dst_target_ip}:${dp} (${proto})" >&2
-                fi
-            done
-            return 0
+    # 端口段一一映射
+    if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+        local src_len=$(( src_end - src_start + 1 ))
+        if [[ "$src_len" -gt 1000 ]]; then
+            echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
+            return 1
         fi
-    else
-        return 1
+        for ((offset=0; offset<src_len; offset++)); do
+            add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
+        done
+        return
     fi
 
-    if [[ "$listen_ip" == "0.0.0.0" || ( "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ) ]]; then
-        "$ip_cmd" -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "$dnat_target" || \
-            echo "[错误] 添加规则失败: ${listen_ip} ${src_dport} -> ${dnat_target} (${proto})" >&2
-    else
-        "$ip_cmd" -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$src_dport" -j DNAT --to-destination "$dnat_target" || \
-            echo "[错误] 添加规则失败: ${listen_ip} ${src_dport} -> ${dnat_target} (${proto})" >&2
-    fi
+    return 1
 }
 
 run_apply() {
-    if [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]]; then
-        echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || return 1
-    fi
+    [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" != "1" ]] && \
+        { echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || return 1; }
 
     load_rules_for_apply
     init_custom_chains || return 1
 
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        add_masquerade_rules
-        return $?
+        add_masquerade_rules; return $?
     fi
 
     local fail_count=0
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local listen_ip="${rules_listen_ip[$i]}"
-        local src_port="${rules_src_port[$i]}"
-        local dst_ip="${rules_resolved_ip[$i]}"
-        local dst_port="${rules_dst_port[$i]}"
+        local listen_ip="${rules_listen_ip[$i]}" src_port="${rules_src_port[$i]}"
+        local dst_ip="${rules_resolved_ip[$i]}" dst_port="${rules_dst_port[$i]}"
         local proto="${rules_proto[$i]}"
 
         case "$proto" in
-            tcp)
-                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
-                ;;
-            udp)
-                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
-                ;;
+            tcp)  add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++)) ;;
+            udp)  add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++)) ;;
             both)
                 add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
                 add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
@@ -287,11 +222,7 @@ run_apply() {
     done
 
     add_masquerade_rules || return 1
-
-    if [[ "$fail_count" -gt 0 ]]; then
-        echo "[警告] 共 ${fail_count} 条规则应用失败" >&2
-        return 1
-    fi
+    [[ "$fail_count" -gt 0 ]] && { echo "[警告] 共 ${fail_count} 条规则应用失败" >&2; return 1; }
     return 0
 }
 
@@ -302,9 +233,7 @@ run_watch() {
     [[ -t 1 ]] && MANUAL_MODE=1
 
     exec 200>"$LOCK_FILE"
-    if ! flock -n 200; then
-        return 0
-    fi
+    flock -n 200 || return 0
 
     local tmp_file now changed
     tmp_file=$(mktemp)
@@ -312,13 +241,9 @@ run_watch() {
     changed=0
 
     while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
-        if [[ -z "$c1" || "$c1" == \#* ]]; then
-            write_config_line "$c1" "$c2" "$c3" "$c4" "$c5" "$c6" "$c7" "$c8" "$c9" >> "$tmp_file"
-            continue
-        fi
-
-        if [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] || [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] || [[ "$c1" =~ ^GLOBAL_RESTART_INTERVAL_MINUTES= ]]; then
-            write_config_line "$c1" "$c2" "$c3" "$c4" "$c5" "$c6" "$c7" "$c8" "$c9" >> "$tmp_file"
+        # 注释行 / 空行 / 全局设置行直接透传
+        if [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]]; then
+            echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
             continue
         fi
 
@@ -331,11 +256,8 @@ run_watch() {
         if [[ "$is_domain" == "1" ]]; then
             [[ "$check_interval" -le 0 ]] && check_interval=300
             local need_check=0
-            if [[ "$MANUAL_MODE" -eq 1 ]]; then
-                need_check=1
-            elif (( now - last_check_ts >= check_interval )); then
-                need_check=1
-            fi
+            [[ "$MANUAL_MODE" -eq 1 ]] && need_check=1
+            (( now - last_check_ts >= check_interval )) && need_check=1
 
             if [[ "$need_check" -eq 1 ]]; then
                 local new_ip
@@ -343,10 +265,9 @@ run_watch() {
                 if is_valid_ip "$new_ip"; then
                     [[ "$MANUAL_MODE" -eq 1 ]] && echo "${dst_host} -> ${new_ip}"
                     if [[ "$new_ip" != "$resolved_ip" ]]; then
-                        local old_ip="$resolved_ip"
+                        change_records+=("${dst_host}: ${resolved_ip} -> ${new_ip}")
                         resolved_ip="$new_ip"
                         changed=1
-                        change_records+=("${dst_host}: ${old_ip} -> ${new_ip}")
                     fi
                     last_check_ts="$now"
                 fi
@@ -363,18 +284,14 @@ run_watch() {
             local apply_cmd="$SCRIPT_SELF"
             [[ -x "$apply_cmd" ]] || apply_cmd="/usr/local/bin/iptables-forward"
 
-            local apply_output=""
-            local apply_rc=0
-            apply_output=$("$apply_cmd" --apply 2>&1)
-            apply_rc=$?
+            local apply_output apply_rc=0
+            apply_output=$("$apply_cmd" --apply 2>&1) || apply_rc=$?
             if [[ "$apply_rc" -ne 0 ]]; then
-                local apply_output_one_line
-                apply_output_one_line=$(echo "$apply_output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-500)
-                log_watch "apply failed rc=${apply_rc} uid=${EUID} cmd='${apply_cmd} --apply' err='${apply_output_one_line}'"
+                local one_line
+                one_line=$(echo "$apply_output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-500)
+                log_watch "apply failed rc=${apply_rc} uid=${EUID} cmd='${apply_cmd} --apply' err='${one_line}'"
             fi
-        fi
 
-        if [[ "$MANUAL_MODE" -eq 0 ]]; then
             local record
             for record in "${change_records[@]}"; do
                 log_watch "IP changed: ${record}"
@@ -385,14 +302,12 @@ run_watch() {
     fi
 
     rm -f "$tmp_file"
-    return 0
 }
 
 main() {
     local mode="apply"
     case "${1:-}" in
         --watch) mode="watch" ;;
-        --apply|"") mode="apply" ;;
         *) mode="apply" ;;
     esac
 
