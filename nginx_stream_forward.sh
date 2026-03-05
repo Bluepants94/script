@@ -1023,8 +1023,6 @@ show_menu() {
         echo -e "  域名解析: ${YELLOW}● 已关闭${NC} (${CYAN}0分钟${NC})"
     fi
 
-    # 当前脚本未实现自动重启任务，这里按固定状态展示
-    echo -e "  自动重启: ${YELLOW}● 已关闭${NC} (${CYAN}0分钟${NC})"
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
