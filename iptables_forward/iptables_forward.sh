@@ -43,7 +43,7 @@ rules_check_interval=()
 rules_last_check_ts=()
 rules_is_domain=()
 GLOBAL_WATCH_ENABLED=1
-GLOBAL_WATCH_INTERVAL_MINUTES=5
+GLOBAL_WATCH_INTERVAL_MINUTES=1
 GLOBAL_RESTART_INTERVAL_MINUTES=0
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
@@ -63,18 +63,15 @@ print_warn()    { echo -e "${YELLOW}[警告]${NC} $1"; }
 print_error()   { echo -e "${RED}[错误]${NC} $1" >&2; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 
-set_last_result() {
-    LAST_RESULT_TYPE="$1"
-    LAST_RESULT_MSG="$2"
-}
+set_last_result() { LAST_RESULT_TYPE="$1"; LAST_RESULT_MSG="$2"; }
 
 show_last_result() {
     [[ -z "$LAST_RESULT_MSG" ]] && return
     case "$LAST_RESULT_TYPE" in
         success) print_success "$LAST_RESULT_MSG" ;;
-        warn) print_warn "$LAST_RESULT_MSG" ;;
-        error) print_error "$LAST_RESULT_MSG" ;;
-        *) print_info "$LAST_RESULT_MSG" ;;
+        warn)    print_warn "$LAST_RESULT_MSG" ;;
+        error)   print_error "$LAST_RESULT_MSG" ;;
+        *)       print_info "$LAST_RESULT_MSG" ;;
     esac
     echo ""
     LAST_RESULT_TYPE=""
@@ -82,46 +79,31 @@ show_last_result() {
 }
 
 read_menu_choice() {
-    local prompt="$1"
-    local regex="$2"
-    local default_value="${3:-}"
-    local value
-
+    local prompt="$1" regex="$2" default_value="${3:-}" value
     while true; do
         read -r -p "$prompt" value
-        if [[ -z "$value" && -n "$default_value" ]]; then
-            value="$default_value"
-        fi
-        if [[ "$value" =~ $regex ]]; then
-            echo "$value"
-            return 0
-        fi
+        [[ -z "$value" && -n "$default_value" ]] && value="$default_value"
+        [[ "$value" =~ $regex ]] && { echo "$value"; return 0; }
         print_error "输入无效，请重新输入！"
     done
 }
 
 read_confirm_yn_default() {
-    local prompt="$1"
-    local default_value="$2"
-    local value
-
+    local prompt="$1" default_value="$2" value
     while true; do
         read -r -p "$prompt" value
         value=${value:-$default_value}
         case "$value" in
             Y|y) echo "Y"; return 0 ;;
             N|n) echo "N"; return 0 ;;
-            *) print_error "输入无效，请重新输入！" ;;
+            *)   print_error "输入无效，请重新输入！" ;;
         esac
     done
 }
 
 proto_to_label() {
     case "$1" in
-        tcp) echo "TCP" ;;
-        udp) echo "UDP" ;;
-        both) echo "TCP+UDP" ;;
-        *) echo "$1" ;;
+        tcp) echo "TCP" ;; udp) echo "UDP" ;; both) echo "TCP+UDP" ;; *) echo "$1" ;;
     esac
 }
 
@@ -150,68 +132,50 @@ is_valid_ipv4() {
 is_valid_domain() {
     local domain="$1"
     [[ ${#domain} -le 253 ]] || return 1
-    [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]] || return 1
-    return 0
+    [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$ ]]
 }
 
 resolve_domain_ipv4_once() {
-    local domain="$1"
-    local ip=""
-
+    local domain="$1" ip=""
     if command -v dig >/dev/null 2>&1; then
-        # 过滤 CNAME，只取 IPv4 格式的行
         ip=$(dig @1.1.1.1 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
-
         ip=$(dig @8.8.8.8 +short A "$domain" 2>/dev/null | grep -oE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)
         is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
     fi
-
     ip=$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')
     is_valid_ipv4 "$ip" && { echo "$ip"; return 0; }
-
     return 1
 }
 
-normalize_global_watch_values() {
-    [[ "$GLOBAL_WATCH_ENABLED" == "1" || "$GLOBAL_WATCH_ENABLED" == "0" ]] || GLOBAL_WATCH_ENABLED=0
-    if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 0 ]]; then
-        GLOBAL_WATCH_INTERVAL_MINUTES=0
-    fi
-
-    if [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -eq 0 ]]; then
-        GLOBAL_WATCH_ENABLED=0
-    else
-        GLOBAL_WATCH_ENABLED=1
+# ---------- 全局设置归一化 ----------
+normalize_interval_var() {
+    local var_name="$1"
+    local val="${!var_name}"
+    if [[ ! "$val" =~ ^[0-9]+$ ]] || [[ "$val" -lt 0 ]]; then
+        eval "$var_name=0"
     fi
 }
 
-normalize_global_restart_values() {
-    if [[ ! "$GLOBAL_RESTART_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_RESTART_INTERVAL_MINUTES" -lt 0 ]]; then
-        GLOBAL_RESTART_INTERVAL_MINUTES=0
-    fi
+normalize_global_settings() {
+    normalize_interval_var GLOBAL_WATCH_INTERVAL_MINUTES
+    normalize_interval_var GLOBAL_RESTART_INTERVAL_MINUTES
+    [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -eq 0 ]] && GLOBAL_WATCH_ENABLED=0 || GLOBAL_WATCH_ENABLED=1
 }
 
 format_interval_label() {
     local minutes="$1"
     [[ "$minutes" =~ ^[0-9]+$ ]] || minutes=0
-
-    if [[ "$minutes" -eq 0 ]]; then
-        echo "0分钟"
-    elif (( minutes % 1440 == 0 )); then
-        echo "$((minutes / 1440))天"
-    elif (( minutes % 60 == 0 )); then
-        echo "$((minutes / 60))小时"
-    else
-        echo "${minutes}分钟"
+    if [[ "$minutes" -eq 0 ]]; then echo "0分钟"
+    elif (( minutes % 1440 == 0 )); then echo "$((minutes / 1440))天"
+    elif (( minutes % 60 == 0 )); then echo "$((minutes / 60))小时"
+    else echo "${minutes}分钟"
     fi
 }
 
+# ---------- Cron 任务管理 ----------
 set_cron_task_minutes() {
-    local tag="$1"
-    local script_path="$2"
-    local minutes="$3"
-
+    local tag="$1" script_path="$2" minutes="$3"
     command -v crontab >/dev/null 2>&1 || return 1
 
     local current filtered cron_line new_content
@@ -247,47 +211,36 @@ set_cron_task_minutes() {
     printf "%s\n" "$new_content" | crontab -
 }
 
-sync_watch_cron_from_config() {
-    normalize_global_watch_values
-    set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" "$GLOBAL_WATCH_INTERVAL_MINUTES"
-}
-
-sync_restart_cron_from_config() {
-    normalize_global_restart_values
-    set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" "$GLOBAL_RESTART_INTERVAL_MINUTES"
-}
-
 sync_cron_tasks_from_config() {
-    sync_watch_cron_from_config >/dev/null 2>&1 || true
-    sync_restart_cron_from_config >/dev/null 2>&1 || true
+    normalize_global_settings
+    set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" "$GLOBAL_WATCH_INTERVAL_MINUTES" >/dev/null 2>&1 || true
+    set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" "$GLOBAL_RESTART_INTERVAL_MINUTES" >/dev/null 2>&1 || true
 }
 
+# ---------- 自定义链清理 ----------
 remove_custom_chain() {
-    local cmd="$1"
-    local chain="$2"
-
+    local cmd="$1" chain="$2"
     command -v "$cmd" >/dev/null 2>&1 || return 0
-
     while "$cmd" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1; do :; done
     while "$cmd" -t nat -D POSTROUTING -j "$chain" >/dev/null 2>&1; do :; done
     "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
     "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
 }
 
-do_uninstall() {
-    print_banner
-    echo -e "${BOLD}${RED}[ 移除脚本 ]${NC}"
-    echo ""
-    echo -e "将清理：配置文件、systemd 服务、cron 任务、iptables 自定义链"
-    echo -e "${YELLOW}不会卸载系统安装的 iptables 软件包${NC}"
-    echo ""
+remove_all_custom_chains() {
+    local cmd chain
+    for cmd in iptables ip6tables; do
+        for chain in "$CHAIN_PRE" "$CHAIN_POST"; do
+            remove_custom_chain "$cmd" "$chain"
+        done
+    done
+}
 
-    local confirm_uninstall
-    confirm_uninstall=$(read_confirm_yn_default "是否确认移除脚本？[Y/N]（默认: N）: " "N")
-    if [[ "$confirm_uninstall" == "N" ]]; then
-        set_last_result "warn" "已取消移除"
-        return
-    fi
+# ---------- 卸载 ----------
+do_uninstall() {
+    local confirm
+    confirm=$(read_confirm_yn_default "是否确认移除脚本？[Y/N]（默认: N）: " "N")
+    [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消移除"; return; }
 
     systemctl disable --now iptables-forward.service >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE" >/dev/null 2>&1 || true
@@ -297,128 +250,99 @@ do_uninstall() {
     set_cron_task_minutes "$LEGACY_WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" 0 >/dev/null 2>&1 || true
     set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" 0 >/dev/null 2>&1 || true
 
-    remove_custom_chain iptables "$CHAIN_PRE"
-    remove_custom_chain iptables "$CHAIN_POST"
-    remove_custom_chain ip6tables "$CHAIN_PRE"
-    remove_custom_chain ip6tables "$CHAIN_POST"
+    remove_all_custom_chains
 
-    rm -f "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1 || true
-    rm -f "/usr/local/bin/iptables-forward-apply" >/dev/null 2>&1 || true
+    rm -f "$SCRIPT_INSTALL_PATH" "/usr/local/bin/iptables-forward-apply" >/dev/null 2>&1 || true
     rm -f "$CONFIG_FILE" "$LOCK_FILE" >/dev/null 2>&1 || true
     rm -rf "$CONFIG_DIR" >/dev/null 2>&1 || true
 
     set_last_result "success" "移除完成：已清理脚本相关文件、cron 任务与自定义链"
 }
 
+# ---------- 间隔设置（通用：域名解析 / 自动重启） ----------
 update_interval_setting() {
-    local mode="$1"
-    local minutes="$2"
+    local mode="$1" minutes="$2"
+    local var_name cron_tag cron_cmd label_on label_off
 
     if [[ "$mode" == "watch" ]]; then
+        var_name="GLOBAL_WATCH_INTERVAL_MINUTES"
+        cron_tag="$WATCH_CRON_TAG"
+        cron_cmd="$SCRIPT_INSTALL_PATH --watch"
+        label_on="域名解析"; label_off="域名解析定时任务"
         GLOBAL_WATCH_INTERVAL_MINUTES="$minutes"
         [[ "$minutes" -eq 0 ]] && GLOBAL_WATCH_ENABLED=0 || GLOBAL_WATCH_ENABLED=1
-        save_rules
-
-        if sync_watch_cron_from_config >/dev/null 2>&1; then
-            if [[ "$minutes" -eq 0 ]]; then
-                set_last_result "success" "已关闭域名解析定时任务"
-            else
-                set_last_result "success" "已设置域名解析为每 $(format_interval_label "$minutes") 执行"
-            fi
-        else
-            set_last_result "error" "Cron 任务更新失败"
-        fi
-        return
+    else
+        var_name="GLOBAL_RESTART_INTERVAL_MINUTES"
+        cron_tag="$RESTART_CRON_TAG"
+        cron_cmd="$SCRIPT_INSTALL_PATH"
+        label_on="自动重启"; label_off="自动重启定时任务"
+        GLOBAL_RESTART_INTERVAL_MINUTES="$minutes"
     fi
 
-    GLOBAL_RESTART_INTERVAL_MINUTES="$minutes"
     save_rules
 
-    if sync_restart_cron_from_config >/dev/null 2>&1; then
+    if set_cron_task_minutes "$cron_tag" "$cron_cmd" "$minutes" >/dev/null 2>&1; then
         if [[ "$minutes" -eq 0 ]]; then
-            set_last_result "success" "已关闭自动重启定时任务"
+            set_last_result "success" "已关闭${label_off}"
         else
-            set_last_result "success" "已设置自动重启为每 $(format_interval_label "$minutes") 执行"
+            set_last_result "success" "已设置${label_on}为每 $(format_interval_label "$minutes") 执行"
         fi
     else
         set_last_result "error" "Cron 任务更新失败"
     fi
 }
 
+# ---------- 全局设置读取 ----------
 read_global_settings_from_config() {
-    GLOBAL_WATCH_ENABLED=0
-    GLOBAL_WATCH_INTERVAL_MINUTES=0
+    GLOBAL_WATCH_ENABLED=1
+    GLOBAL_WATCH_INTERVAL_MINUTES=1
     GLOBAL_RESTART_INTERVAL_MINUTES=0
 
     [[ -f "$CONFIG_FILE" ]] || return 0
 
-    local enabled minutes
-    local restart_minutes
-    enabled=$(grep -m1 '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-    minutes=$(grep -m1 '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-    restart_minutes=$(grep -m1 '^GLOBAL_RESTART_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-
-    [[ -n "$enabled" ]] && GLOBAL_WATCH_ENABLED="$enabled"
-    [[ -n "$minutes" ]] && GLOBAL_WATCH_INTERVAL_MINUTES="$minutes"
-    [[ -n "$restart_minutes" ]] && GLOBAL_RESTART_INTERVAL_MINUTES="$restart_minutes"
-    normalize_global_watch_values
-    normalize_global_restart_values
+    local val
+    for key in GLOBAL_WATCH_ENABLED GLOBAL_WATCH_INTERVAL_MINUTES GLOBAL_RESTART_INTERVAL_MINUTES; do
+        val=$(grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
+        [[ -n "$val" ]] && eval "$key='$val'"
+    done
+    normalize_global_settings
 }
 
+# ---------- 端口表达式解析 ----------
 parse_port_expr() {
-    # 输出: type|start|end
-    # type: single / range
     local expr="$1"
     if [[ "$expr" =~ ^[0-9]+$ ]]; then
-        local p="$expr"
-        if [[ "$p" -ge 1 && "$p" -le 65535 ]]; then
-            echo "single|$p|$p"
-            return 0
-        fi
+        [[ "$expr" -ge 1 && "$expr" -le 65535 ]] && { echo "single|$expr|$expr"; return 0; }
         return 1
     fi
-
     if [[ "$expr" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        local a="${BASH_REMATCH[1]}"
-        local b="${BASH_REMATCH[2]}"
-        if [[ "$a" -ge 1 && "$b" -le 65535 && "$a" -lt "$b" ]]; then
-            echo "range|$a|$b"
-            return 0
-        fi
+        local a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+        [[ "$a" -ge 1 && "$b" -le 65535 && "$a" -lt "$b" ]] && { echo "range|$a|$b"; return 0; }
         return 1
     fi
     return 1
 }
 
-
+# ---------- 文件下载 ----------
 download_file_silent() {
-    local url="$1"
-    local target="$2"
-    local mode="$3"
+    local url="$1" target="$2" mode="$3"
     local tmp_file="${target}.tmp.$$"
 
     if ! curl -fsSL "$url" -o "$tmp_file" >/dev/null 2>&1; then
-        rm -f "$tmp_file" >/dev/null 2>&1
-        return 1
+        rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
-    # 校验下载文件：非空且以 shebang 或 [Unit] 开头（脚本/service 文件）
+    # 校验下载文件：非空且以 shebang 或 [Unit] 开头
     if [[ ! -s "$tmp_file" ]]; then
-        rm -f "$tmp_file" >/dev/null 2>&1
-        return 1
+        rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
     local head_line
     head_line=$(head -c 20 "$tmp_file" 2>/dev/null)
     if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "[Unit]"* ]]; then
-        rm -f "$tmp_file" >/dev/null 2>&1
-        return 1
+        rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
-    if ! mv -f "$tmp_file" "$target" >/dev/null 2>&1; then
-        rm -f "$tmp_file" >/dev/null 2>&1
-        return 1
-    fi
-
+    mv -f "$tmp_file" "$target" >/dev/null 2>&1 || { rm -f "$tmp_file" >/dev/null 2>&1; return 1; }
     [[ -n "$mode" ]] && chmod "$mode" "$target" >/dev/null 2>&1
     return 0
 }
@@ -437,16 +361,7 @@ sync_support_files() {
         download_file_silent "$RAW_SERVICE_URL" "$SERVICE_FILE" "644" || return 1
     fi
 
-    if [[ -f "$SERVICE_FILE" ]]; then
-        sed -i "s|^ExecStart=.*|ExecStart=${SCRIPT_INSTALL_PATH}|" "$SERVICE_FILE" >/dev/null 2>&1 || true
-    fi
-
-    return 0
-}
-
-update_all_files() {
-    sync_support_files true || return 1
-    systemctl daemon-reload >/dev/null 2>&1
+    [[ -f "$SERVICE_FILE" ]] && sed -i "s|^ExecStart=.*|ExecStart=${SCRIPT_INSTALL_PATH}|" "$SERVICE_FILE" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -464,11 +379,11 @@ init_env() {
     mkdir -p "$CONFIG_DIR"
     [[ -f "$CONFIG_FILE" ]] || touch "$CONFIG_FILE"
 
+    # 开启 IP 转发
     if [[ "$(cat /proc/sys/net/ipv4/ip_forward)" != "1" ]]; then
         echo 1 > /proc/sys/net/ipv4/ip_forward
         print_info "已临时开启 IP 转发"
     fi
-
     if ! grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
         if grep -q "^#\s*net\.ipv4\.ip_forward\s*=" /etc/sysctl.conf 2>/dev/null; then
             sed -i 's/^#\s*net\.ipv4\.ip_forward\s*=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf
@@ -479,6 +394,7 @@ init_env() {
         print_info "已持久化开启 IP 转发 (sysctl)"
     fi
 
+    # 安装 iptables
     if ! command -v iptables &>/dev/null; then
         print_error "iptables 未安装！正在尝试安装..."
         if command -v apt-get &>/dev/null; then
@@ -488,19 +404,19 @@ init_env() {
         elif command -v dnf &>/dev/null; then
             dnf install -y iptables
         else
-            print_error "无法自动安装 iptables，请手动安装后重试"
-            exit 1
+            print_error "无法自动安装 iptables，请手动安装后重试"; exit 1
         fi
     fi
 
     sync_support_files false || {
-        print_error "必需文件同步失败，请检查网络连接或 GitHub 地址"
-        exit 1
+        print_error "必需文件同步失败，请检查网络连接或 GitHub 地址"; exit 1
     }
 
     read_global_settings_from_config
 
-    if ! grep -q '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null || ! grep -q '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null || ! grep -q '^GLOBAL_RESTART_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null; then
+    if ! grep -q '^GLOBAL_WATCH_ENABLED=' "$CONFIG_FILE" 2>/dev/null || \
+       ! grep -q '^GLOBAL_WATCH_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null || \
+       ! grep -q '^GLOBAL_RESTART_INTERVAL_MINUTES=' "$CONFIG_FILE" 2>/dev/null; then
         load_rules
         save_rules
     fi
@@ -514,8 +430,7 @@ get_local_ipv4_list() {
     local_ifaces=()
     while IFS='|' read -r iface cidr; do
         [[ -z "$iface" || -z "$cidr" ]] && continue
-        local ip="${cidr%%/*}"
-        local_ips+=("$ip")
+        local_ips+=("${cidr%%/*}")
         local_ifaces+=("$iface")
     done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2"|"$4}')
 }
@@ -545,18 +460,11 @@ choose_listen_ip() {
         read -r -p "请选择 [0-${manual_idx}]（默认: 1）: " choice
         choice=${choice:-1}
 
-        if [[ "$choice" == "0" ]]; then
-            return 1
-        fi
-
-        if [[ "$choice" == "1" ]]; then
-            SELECTED_LISTEN_IP="0.0.0.0"
-            return 0
-        fi
+        [[ "$choice" == "0" ]] && return 1
+        [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
 
         if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 2 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-            local idx=$((choice - 2))
-            SELECTED_LISTEN_IP="${local_ips[$idx]}"
+            SELECTED_LISTEN_IP="${local_ips[$((choice - 2))]}"
             return 0
         fi
 
@@ -577,71 +485,41 @@ choose_listen_ip() {
 }
 
 # ---------- 加载规则配置 ----------
-# 新格式(9列): 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
-# 兼容格式(5列): 监听IP|源端口|目标IP|目标端口|协议
-# 旧格式(4列): 源端口|目标IP|目标端口|协议  (自动兼容为监听IP=0.0.0.0)
 load_rules() {
     read_global_settings_from_config
 
-    rules_listen_ip=()
-    rules_src_port=()
-    rules_dst_ip=()
-    rules_dst_port=()
-    rules_proto=()
-    rules_resolved_ip=()
-    rules_check_interval=()
-    rules_last_check_ts=()
-    rules_is_domain=()
+    rules_listen_ip=(); rules_src_port=(); rules_dst_ip=(); rules_dst_port=()
+    rules_proto=(); rules_resolved_ip=(); rules_check_interval=()
+    rules_last_check_ts=(); rules_is_domain=()
 
     [[ -f "$CONFIG_FILE" ]] || return
 
     while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
-        [[ "$c1" =~ ^GLOBAL_WATCH_ENABLED= ]] && continue
-        [[ "$c1" =~ ^GLOBAL_WATCH_INTERVAL_MINUTES= ]] && continue
-        [[ "$c1" =~ ^GLOBAL_RESTART_INTERVAL_MINUTES= ]] && continue
+        [[ "$c1" =~ ^GLOBAL_ ]] && continue
 
         if [[ -n "$c9" ]]; then
             # 9列格式
-            rules_listen_ip+=("$c1")
-            rules_src_port+=("$c2")
-            rules_dst_ip+=("$c3")
-            rules_dst_port+=("$c4")
-            rules_proto+=("$c5")
-            rules_resolved_ip+=("$c6")
-            rules_check_interval+=("$c7")
-            rules_last_check_ts+=("$c8")
-            rules_is_domain+=("$c9")
+            rules_listen_ip+=("$c1"); rules_src_port+=("$c2"); rules_dst_ip+=("$c3")
+            rules_dst_port+=("$c4"); rules_proto+=("$c5"); rules_resolved_ip+=("$c6")
+            rules_check_interval+=("$c7"); rules_last_check_ts+=("$c8"); rules_is_domain+=("$c9")
         elif [[ -n "$c5" ]]; then
             # 5列格式
-            rules_listen_ip+=("$c1")
-            rules_src_port+=("$c2")
-            rules_dst_ip+=("$c3")
-            rules_dst_port+=("$c4")
-            rules_proto+=("$c5")
-            rules_resolved_ip+=("$c3")
-            rules_check_interval+=("0")
-            rules_last_check_ts+=("0")
-            rules_is_domain+=("0")
-        else
-            # 4列旧格式兼容
-            rules_listen_ip+=("0.0.0.0")
-            rules_src_port+=("$c1")
-            rules_dst_ip+=("$c2")
-            rules_dst_port+=("$c3")
-            rules_proto+=("$c4")
-            rules_resolved_ip+=("$c2")
-            rules_check_interval+=("0")
-            rules_last_check_ts+=("0")
-            rules_is_domain+=("0")
+            rules_listen_ip+=("$c1"); rules_src_port+=("$c2"); rules_dst_ip+=("$c3")
+            rules_dst_port+=("$c4"); rules_proto+=("$c5"); rules_resolved_ip+=("$c3")
+            rules_check_interval+=("0"); rules_last_check_ts+=("0"); rules_is_domain+=("0")
+        elif [[ -n "$c4" ]]; then
+            # 4列旧格式
+            rules_listen_ip+=("0.0.0.0"); rules_src_port+=("$c1"); rules_dst_ip+=("$c2")
+            rules_dst_port+=("$c3"); rules_proto+=("$c4"); rules_resolved_ip+=("$c2")
+            rules_check_interval+=("0"); rules_last_check_ts+=("0"); rules_is_domain+=("0")
         fi
     done < "$CONFIG_FILE"
 }
 
 # ---------- 保存规则配置 ----------
 save_rules() {
-    normalize_global_watch_values
-    normalize_global_restart_values
+    normalize_global_settings
 
     cat > "$CONFIG_FILE" <<EOF_CONF
 # iptables 端口转发规则配置
@@ -653,28 +531,21 @@ GLOBAL_WATCH_INTERVAL_MINUTES=${GLOBAL_WATCH_INTERVAL_MINUTES}
 GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # -------------------------------------------------
 # 格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
-# 示例(IP): 0.0.0.0|8080|127.0.0.1|1080|both|127.0.0.1|0|0|0
-# 示例(域名): 0.0.0.0|8080|example.com|1080|tcp|93.184.216.34|300|1700000000|1
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local d_host="${rules_dst_ip[$i]}"
-        local d_resolved="${rules_resolved_ip[$i]}"
+        local d_resolved="${rules_resolved_ip[$i]:-${rules_dst_ip[$i]}}"
         local d_interval="${rules_check_interval[$i]}"
         local d_last="${rules_last_check_ts[$i]}"
         local d_is_domain="${rules_is_domain[$i]}"
 
-        [[ -n "$d_resolved" ]] || d_resolved="$d_host"
-        if [[ "${rules_is_domain[$i]}" == "1" ]]; then
-            d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-        else
-            [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
-        fi
+        [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
+        [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
         [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
         [[ "$d_is_domain" == "1" ]] || d_is_domain=0
 
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${d_host}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$CONFIG_FILE"
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$CONFIG_FILE"
     done
 }
 
@@ -687,35 +558,33 @@ apply_rules_core() {
 # ---------- 创建 systemd 服务 ----------
 create_service() {
     sync_support_files false || return 1
-
     systemctl daemon-reload >/dev/null 2>&1
-
-    if ! systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
+    systemctl is-enabled --quiet iptables-forward.service 2>/dev/null || \
         systemctl enable iptables-forward.service 2>/dev/null
-    fi
     return 0
 }
 
+# ---------- 更新脚本文件 ----------
 do_update() {
     print_banner
     echo -e "${CYAN}请稍后...${NC}"
-
-    if update_all_files; then
+    if sync_support_files true && systemctl daemon-reload >/dev/null 2>&1; then
         set_last_result "success" "更新完成！"
     else
         set_last_result "error" "更新失败，请检查网络连接或 GitHub 地址"
     fi
-
-    return
 }
 
-do_domain_watch_manage() {
+# ---------- 通用间隔管理菜单（域名解析 / 自动重启） ----------
+do_interval_manage() {
+    local mode="$1" title="$2" current_var="$3" unit_label="$4"
+
     print_banner
-    echo -e "${BOLD}${BLUE}[ 域名解析间隔 ]${NC}"
+    echo -e "${BOLD}${BLUE}[ ${title} ]${NC}"
     echo ""
 
     load_rules
-    local current_minutes="${GLOBAL_WATCH_INTERVAL_MINUTES:-0}"
+    local current_minutes="${!current_var:-0}"
 
     if [[ "$current_minutes" -gt 0 ]]; then
         echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}$(format_interval_label "$current_minutes")${NC})"
@@ -724,124 +593,87 @@ do_domain_watch_manage() {
     fi
     echo ""
 
-    echo -e "  ${CYAN}1)${NC} 定时解析"
-    echo -e "  ${CYAN}2)${NC} 立即解析"
+    echo -e "  ${CYAN}1)${NC} 定时${unit_label}"
+    echo -e "  ${CYAN}2)${NC} 立即${unit_label}"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
 
-    while true; do
-        sub_choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
-        case "$sub_choice" in
-            1)
-                local new_minutes
-                while true; do
-                    read -r -p "请输入域名解析间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
-                    new_minutes=${new_minutes:-0}
-                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
-                        update_interval_setting "watch" "$new_minutes"
-                        return
-                    fi
-                    print_error "输入无效，请重新输入！"
-                done
-                ;;
-            2)
-                if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
-                    sync_support_files false || {
-                        set_last_result "error" "立即解析失败：apply 脚本不存在且下载失败"
-                        return
-                    }
+    local sub_choice
+    sub_choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
+    case "$sub_choice" in
+        1)
+            local new_minutes
+            while true; do
+                read -r -p "请输入${unit_label}间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
+                new_minutes=${new_minutes:-0}
+                if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
+                    update_interval_setting "$mode" "$new_minutes"
+                    return
                 fi
-
+                print_error "输入无效，请重新输入！"
+            done
+            ;;
+        2)
+            if [[ "$mode" == "watch" ]]; then
+                [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false || {
+                    set_last_result "error" "立即解析失败：脚本不存在且下载失败"; return
+                }
                 if "$SCRIPT_INSTALL_PATH" --watch >/dev/null 2>&1; then
                     set_last_result "success" "已立即执行一次域名解析"
                 else
                     set_last_result "error" "立即解析失败：执行异常"
                 fi
-                return
-                ;;
-            0)
-                return
-                ;;
-            *)
-                print_error "输入无效，请重新输入！"
-                ;;
-        esac
-    done
+            else
+                do_restart
+            fi
+            ;;
+        0) ;;
+    esac
 }
 
 # ---------- 规则数组操作 ----------
 clear_all_rules() {
-    rules_listen_ip=()
-    rules_src_port=()
-    rules_dst_ip=()
-    rules_dst_port=()
-    rules_proto=()
-    rules_resolved_ip=()
-    rules_check_interval=()
-    rules_last_check_ts=()
-    rules_is_domain=()
+    rules_listen_ip=(); rules_src_port=(); rules_dst_ip=(); rules_dst_port=()
+    rules_proto=(); rules_resolved_ip=(); rules_check_interval=()
+    rules_last_check_ts=(); rules_is_domain=()
 }
 
 remove_rule_at_index() {
     local idx="$1"
-    unset 'rules_listen_ip[idx]'
-    unset 'rules_src_port[idx]'
-    unset 'rules_dst_ip[idx]'
-    unset 'rules_dst_port[idx]'
-    unset 'rules_proto[idx]'
-    unset 'rules_resolved_ip[idx]'
-    unset 'rules_check_interval[idx]'
-    unset 'rules_last_check_ts[idx]'
-    unset 'rules_is_domain[idx]'
-    # 重建连续索引
-    rules_listen_ip=("${rules_listen_ip[@]}")
-    rules_src_port=("${rules_src_port[@]}")
-    rules_dst_ip=("${rules_dst_ip[@]}")
-    rules_dst_port=("${rules_dst_port[@]}")
-    rules_proto=("${rules_proto[@]}")
-    rules_resolved_ip=("${rules_resolved_ip[@]}")
-    rules_check_interval=("${rules_check_interval[@]}")
-    rules_last_check_ts=("${rules_last_check_ts[@]}")
-    rules_is_domain=("${rules_is_domain[@]}")
+    local arr
+    for arr in rules_listen_ip rules_src_port rules_dst_ip rules_dst_port rules_proto \
+               rules_resolved_ip rules_check_interval rules_last_check_ts rules_is_domain; do
+        unset "${arr}[idx]"
+        eval "$arr=(\"\${${arr}[@]}\")"
+    done
 }
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
-    local success_msg="${1:-操作成功！}"
-    local fail_msg="${2:-操作失败，请检查 iptables 环境}"
-
+    local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 iptables 环境}"
     save_rules
-
     if ! sync_support_files false; then
         set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
         return 1
     fi
-
     if apply_rules_core; then
         set_last_result "success" "$success_msg"
-        return 0
+    else
+        set_last_result "error" "$fail_msg"
+        return 1
     fi
-
-    set_last_result "error" "${fail_msg}"
-    return 1
 }
 
-# ---------- 按首页样式打印规则 ----------
+# ---------- 打印规则列表 ----------
 print_rules_home_style() {
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        echo -e "  ${YELLOW}(暂无转发规则)${NC}"
-        return
+        echo -e "  ${YELLOW}(暂无转发规则)${NC}"; return
     fi
-
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local proto_str
+        local proto_str mark=""
         proto_str=$(proto_to_label "${rules_proto[$i]}")
-        local dst_host="${rules_dst_ip[$i]}"
-        local mark=""
-        if [[ "${rules_is_domain[$i]}" == "1" ]]; then
-            mark=" [域名→${rules_resolved_ip[$i]}]"
-        fi
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${dst_host}:${rules_dst_port[$i]}${NC} (${proto_str})${mark}"
+        [[ "${rules_is_domain[$i]}" == "1" ]] && mark=" [域名→${rules_resolved_ip[$i]}]"
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})${mark}"
     done
     echo ""
 }
@@ -858,89 +690,61 @@ do_add() {
         print_rules_home_style
     fi
 
-    echo ""
     echo -e "${BOLD}${CYAN}--- 新增转发 ---${NC}"
 
-        # 选择监听IP
-    local listen_ip
-    if ! choose_listen_ip; then
-        return
-    fi
-    listen_ip="$SELECTED_LISTEN_IP"
+    # 选择监听IP
+    choose_listen_ip || return
+    local listen_ip="$SELECTED_LISTEN_IP"
 
-        # 输入源端口
+    # 输入源端口
     local src_port src_meta src_type src_start src_end
     while true; do
         read -r -p "请输入源端口（单端口如 8080，端口段如 8000-9000）: " src_port
-        src_meta=$(parse_port_expr "$src_port") || {
-            print_error "输入无效，请重新输入！"
-            continue
-        }
+        src_meta=$(parse_port_expr "$src_port") || { print_error "输入无效，请重新输入！"; continue; }
         IFS='|' read -r src_type src_start src_end <<< "$src_meta"
         break
     done
 
-        # 输入目标地址（IP或域名）
+    # 输入目标地址
     local dst_host resolved_ip is_domain check_interval_seconds
     while true; do
         read -r -p "请输入目标地址（IPv4或域名）: " dst_host
-
         if is_valid_ipv4 "$dst_host"; then
-            is_domain="0"
-            resolved_ip="$dst_host"
-            check_interval_seconds=0
-            break
+            is_domain="0"; resolved_ip="$dst_host"; check_interval_seconds=0; break
         fi
-
         if is_valid_domain "$dst_host"; then
-            is_domain="1"
-            check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-
+            is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
             resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
             if ! is_valid_ipv4 "$resolved_ip"; then
-                print_error "域名解析失败，请检查域名是否正确或网络是否可用！"
-                continue
+                print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
             fi
-
             break
         fi
-
         print_error "输入无效，请重新输入！"
     done
 
-        # 输入目标端口
+    # 输入目标端口
     local dst_port_input dst_port dst_meta dst_type dst_start dst_end
     while true; do
         read -r -p "请输入目标端口（单端口/端口段，回车=与源端口相同）: " dst_port_input
         dst_port_input=${dst_port_input:-$src_port}
-
-        dst_meta=$(parse_port_expr "$dst_port_input") || {
-            print_error "输入无效，请重新输入！"
-            continue
-        }
+        dst_meta=$(parse_port_expr "$dst_port_input") || { print_error "输入无效，请重新输入！"; continue; }
         IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
 
         if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
-            dst_port="$dst_port_input"
-            break
-        fi
-
-        if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+            dst_port="$dst_port_input"; break
+        elif [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
             local src_len=$(( src_end - src_start + 1 ))
             local dst_len=$(( dst_end - dst_start + 1 ))
-            if [[ "$src_len" -ne "$dst_len" ]]; then
-                print_error "输入无效，请重新输入！"
-                continue
+            if [[ "$src_len" -eq "$dst_len" ]]; then
+                dst_port="$dst_port_input"; break
             fi
-            dst_port="$dst_port_input"
-            break
         fi
-
         print_error "输入无效，请重新输入！"
     done
 
-        # 选择协议
-    local proto proto_choice
+    # 选择协议
+    local proto
     echo ""
     echo -e "${CYAN}选择转发协议:${NC}"
     echo "  1) TCP+UDP（默认）"
@@ -950,15 +754,10 @@ do_add() {
         read -r -p "请选择 [1-3]（默认: 1）: " proto_choice
         proto_choice=${proto_choice:-1}
         case "$proto_choice" in
-            1) proto="both"; break ;;
-            2) proto="tcp"; break ;;
-            3) proto="udp"; break ;;
+            1) proto="both"; break ;; 2) proto="tcp"; break ;; 3) proto="udp"; break ;;
             *) print_error "输入无效，请重新输入！" ;;
         esac
     done
-
-    local proto_display
-    proto_display=$(proto_to_label "$proto")
 
     echo ""
     echo -e "${GREEN}即将添加转发:${NC}"
@@ -969,21 +768,17 @@ do_add() {
         echo -e "  域名解析: ${CYAN}${resolved_ip}${NC}"
         echo -e "  检测间隔: ${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES} 分钟（全局）${NC}"
     fi
-    echo -e "  协议:     ${CYAN}${proto_display}${NC}"
+    echo -e "  协议:     ${CYAN}$(proto_to_label "$proto")${NC}"
 
-    # 检查重复规则（相同监听IP+源端口+协议可能冲突）
+    # 检查重复规则
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         if [[ "${rules_listen_ip[$i]}" == "$listen_ip" && "${rules_src_port[$i]}" == "$src_port" ]]; then
             local existing_proto="${rules_proto[$i]}"
-            # 协议有交集则视为冲突
             if [[ "$existing_proto" == "both" || "$proto" == "both" || "$existing_proto" == "$proto" ]]; then
                 print_warn "检测到冲突：已存在规则 [$((i+1))] ${listen_ip} ${src_port} → ${rules_dst_ip[$i]}:${rules_dst_port[$i]} ($(proto_to_label "$existing_proto"))"
                 local confirm_dup
                 confirm_dup=$(read_confirm_yn_default "源端口冲突，是否仍要添加？[Y/N]（默认: N）: " "N")
-                if [[ "$confirm_dup" == "N" ]]; then
-                    set_last_result "warn" "已取消添加（源端口冲突）"
-                    return
-                fi
+                [[ "$confirm_dup" == "N" ]] && { set_last_result "warn" "已取消添加（源端口冲突）"; return; }
                 break
             fi
         fi
@@ -991,23 +786,15 @@ do_add() {
 
     local confirm_add
     confirm_add=$(read_confirm_yn_default "是否确认添加？[Y/N]（默认: Y）: " "Y")
-    if [[ "$confirm_add" == "N" ]]; then
-        set_last_result "warn" "已取消添加"
-        return
-    fi
+    [[ "$confirm_add" == "N" ]] && { set_last_result "warn" "已取消添加"; return; }
 
-    rules_listen_ip+=("$listen_ip")
-    rules_src_port+=("$src_port")
-    rules_dst_ip+=("$dst_host")
-    rules_dst_port+=("$dst_port")
-    rules_proto+=("$proto")
-    rules_resolved_ip+=("$resolved_ip")
-    rules_check_interval+=("$check_interval_seconds")
-    rules_last_check_ts+=("0")
+    rules_listen_ip+=("$listen_ip"); rules_src_port+=("$src_port")
+    rules_dst_ip+=("$dst_host"); rules_dst_port+=("$dst_port")
+    rules_proto+=("$proto"); rules_resolved_ip+=("$resolved_ip")
+    rules_check_interval+=("$check_interval_seconds"); rules_last_check_ts+=("0")
     rules_is_domain+=("$is_domain")
 
     auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 iptables 环境"
-    return
 }
 
 # ---------- 删除转发规则 ----------
@@ -1018,8 +805,7 @@ do_delete() {
 
     load_rules
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        set_last_result "warn" "当前没有转发规则"
-        return
+        set_last_result "warn" "当前没有转发规则"; return
     fi
 
     echo -e "${BOLD}${BLUE}当前转发规则:${NC}"
@@ -1030,38 +816,26 @@ do_delete() {
         echo -e "输入序号（${CYAN}1-${#rules_src_port[@]}${NC}），输入 ${YELLOW}all${NC} 删除全部，输入 ${NC}0${NC} 返回"
         read -r -p "请选择: " del_input
 
-        if [[ "$del_input" == "0" ]]; then
-            return
-        fi
+        [[ "$del_input" == "0" ]] && return
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            local confirm_delete_all
-            confirm_delete_all=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
-            if [[ "$confirm_delete_all" == "N" ]]; then
-                set_last_result "warn" "已取消删除"
-                return
-            fi
-
+            local confirm
+            confirm=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
+            [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
             clear_all_rules
             auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
             return
         fi
 
         if [[ ! "$del_input" =~ ^[0-9]+$ ]] || [[ "$del_input" -lt 1 ]] || [[ "$del_input" -gt ${#rules_src_port[@]} ]]; then
-            print_error "输入无效，请重新输入！"
-            continue
+            print_error "输入无效，请重新输入！"; continue
         fi
 
-        local del_idx=$((del_input - 1))
+        local confirm
+        confirm=$(read_confirm_yn_default "确认删除该规则？[Y/N]（默认: N）: " "N")
+        [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
 
-        local confirm_delete_one
-        confirm_delete_one=$(read_confirm_yn_default "确认删除该规则？[Y/N]（默认: N）: " "N")
-        if [[ "$confirm_delete_one" == "N" ]]; then
-            set_last_result "warn" "已取消删除"
-            return
-        fi
-
-        remove_rule_at_index "$del_idx"
+        remove_rule_at_index $((del_input - 1))
         auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
         return
     done
@@ -1070,7 +844,6 @@ do_delete() {
 # ---------- 重启 iptables 转发 ----------
 do_restart() {
     load_rules
-    # 统一走 apply_rules_core（使用自定义链，不影响其他服务）
     if apply_rules_core; then
         if [[ ${#rules_src_port[@]} -eq 0 ]]; then
             set_last_result "success" "重启完成：当前无转发规则，自定义链已清空"
@@ -1080,57 +853,6 @@ do_restart() {
     else
         set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
     fi
-
-    return
-}
-
-do_restart_manage() {
-    print_banner
-    echo -e "${BOLD}${BLUE}[ 重启 iptables 转发 ]${NC}"
-    echo ""
-
-    load_rules
-    local current_minutes="${GLOBAL_RESTART_INTERVAL_MINUTES:-0}"
-
-    if [[ "$current_minutes" -gt 0 ]]; then
-        echo -e "  当前状态: ${GREEN}已启动${NC} (${CYAN}$(format_interval_label "$current_minutes")${NC})"
-    else
-        echo -e "  当前状态: ${YELLOW}已暂停${NC}"
-    fi
-    echo ""
-
-    echo -e "  ${CYAN}1)${NC} 定时重启"
-    echo -e "  ${CYAN}2)${NC} 立即重启"
-    echo -e "  ${NC}0)${NC} 返回"
-    echo ""
-
-    while true; do
-        sub_choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
-        case "$sub_choice" in
-            1)
-                local new_minutes
-                while true; do
-                    read -r -p "请输入自动重启间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
-                    new_minutes=${new_minutes:-0}
-                    if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
-                        update_interval_setting "restart" "$new_minutes"
-                        return
-                    fi
-                    print_error "输入无效，请重新输入！"
-                done
-                ;;
-            2)
-                do_restart
-                return
-                ;;
-            0)
-                return
-                ;;
-            *)
-                print_error "输入无效，请重新输入！"
-                ;;
-        esac
-    done
 }
 
 # ---------- 管理开机自启 ----------
@@ -1154,6 +876,7 @@ do_autostart() {
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
 
+    local choice
     choice=$(read_menu_choice "请选择 [0-1]: " '^[0-1]$')
     [[ "$choice" == "0" ]] && return
 
@@ -1176,12 +899,12 @@ do_autostart() {
 show_menu() {
     print_banner
     show_last_result
-
     load_rules
-    local rule_count=${#rules_src_port[@]}
 
+    local rule_count=${#rules_src_port[@]}
     local ip_forward
     ip_forward=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
+
     if [[ "$ip_forward" == "1" ]]; then
         echo -e "  IP 转 发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     else
@@ -1195,21 +918,16 @@ show_menu() {
     fi
 
     local watch_minutes="${GLOBAL_WATCH_INTERVAL_MINUTES:-0}"
-    local watch_status="${YELLOW}● 已关闭${NC}"
-    [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}● 已开启${NC}"
-
     local restart_minutes="${GLOBAL_RESTART_INTERVAL_MINUTES:-0}"
-    local restart_status="${YELLOW}● 已关闭${NC}"
+    local watch_status="${YELLOW}● 已关闭${NC}" restart_status="${YELLOW}● 已关闭${NC}"
+    [[ "$watch_minutes" -gt 0 ]] && watch_status="${GREEN}● 已开启${NC}"
     [[ "$restart_minutes" -gt 0 ]] && restart_status="${GREEN}● 已开启${NC}"
 
     echo -e "  域名解析: ${watch_status} (${CYAN}$(format_interval_label "$watch_minutes")${NC})"
     echo -e "  自动重启: ${restart_status} (${CYAN}$(format_interval_label "$restart_minutes")${NC})"
     echo ""
 
-    if [[ $rule_count -gt 0 ]]; then
-        echo -e "${BOLD}${BLUE}当前转发:${NC}"
-        print_rules_home_style
-    fi
+    [[ $rule_count -gt 0 ]] && { echo -e "${BOLD}${BLUE}当前转发:${NC}"; print_rules_home_style; }
 
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
@@ -1235,17 +953,12 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_restart_manage ;;
-            4) do_domain_watch_manage ;;
+            3) do_interval_manage "restart" "重启 iptables 转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
             5) do_autostart ;;
             6) do_update ;;
             7) do_uninstall ;;
-            0)
-                echo ""
-                print_info "再见！"
-                exit 0
-                ;;
-            *) ;;
+            0) echo ""; print_info "再见！"; exit 0 ;;
         esac
     done
 }
