@@ -20,14 +20,17 @@ NC='\033[0m'
 CONFIG_DIR="/etc/iptables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
-SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward-apply"
-WATCH_SCRIPT_PATH="/usr/local/bin/iptables-forward-watch"
+SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward"
 RAW_BASE_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward"
-RAW_APPLY_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward-apply"
+RAW_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward"
+RAW_SCRIPT_COMPAT_URL="${RAW_BASE_URL}/iptables-forward-apply"
 RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
-RAW_WATCH_URL="${RAW_BASE_URL}/iptables-forward-watch"
-WATCH_CRON_TAG="# iptables-forward-watch"
+WATCH_CRON_TAG="# iptables-forward-domain"
 RESTART_CRON_TAG="# iptables-forward-restart"
+LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
+LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
+CHAIN_PRE="IPTFWD-PRE"
+CHAIN_POST="IPTFWD-POST"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -44,7 +47,6 @@ GLOBAL_WATCH_INTERVAL_MINUTES=5
 GLOBAL_RESTART_INTERVAL_MINUTES=0
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
-DISABLE_PUBLIC_IP=0
 
 # ---------- 工具函数 ----------
 print_banner() {
@@ -171,10 +173,6 @@ resolve_domain_ipv4_once() {
     return 1
 }
 
-is_watch_enabled() {
-    [[ "$GLOBAL_WATCH_ENABLED" == "1" && "$GLOBAL_WATCH_INTERVAL_MINUTES" -gt 0 ]]
-}
-
 normalize_global_watch_values() {
     [[ "$GLOBAL_WATCH_ENABLED" == "1" || "$GLOBAL_WATCH_ENABLED" == "0" ]] || GLOBAL_WATCH_ENABLED=0
     if [[ ! "$GLOBAL_WATCH_INTERVAL_MINUTES" =~ ^[0-9]+$ ]] || [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -lt 0 ]]; then
@@ -207,53 +205,6 @@ format_interval_label() {
     else
         echo "${minutes}分钟"
     fi
-}
-
-cron_task_exists_by_tag() {
-    local tag="$1"
-    command -v crontab >/dev/null 2>&1 || return 1
-    crontab -l 2>/dev/null | grep -qF "$tag"
-}
-
-get_cron_minutes_by_tag() {
-    local tag="$1"
-    command -v crontab >/dev/null 2>&1 || return 1
-
-    local line minutes m h d
-    line=$(crontab -l 2>/dev/null | grep -F "$tag" | tail -n 1)
-    [[ -n "$line" ]] || return 1
-
-    minutes=$(echo "$line" | sed -n 's#.* interval=\([0-9]\+\).*#\1#p')
-    if [[ "$minutes" =~ ^[0-9]+$ ]]; then
-        echo "$minutes"
-        return 0
-    fi
-
-    minutes=$(echo "$line" | sed -n 's#\*/\([0-9]\+\) .*#\1#p')
-    if [[ "$minutes" =~ ^[0-9]+$ ]]; then
-        echo "$minutes"
-        return 0
-    fi
-
-    h=$(echo "$line" | sed -n 's#^0 \*/\([0-9]\+\) .*#\1#p')
-    if [[ "$h" =~ ^[0-9]+$ ]]; then
-        echo $((h * 60))
-        return 0
-    fi
-
-    d=$(echo "$line" | sed -n 's#^0 0 \*/\([0-9]\+\) .*#\1#p')
-    if [[ "$d" =~ ^[0-9]+$ ]]; then
-        echo $((d * 1440))
-        return 0
-    fi
-
-    m=$(echo "$line" | sed -n 's#^\* \* \* \* \* .*__IPTFWD_INTERVAL=\([0-9]\+\).*#\1#p')
-    if [[ "$m" =~ ^[0-9]+$ ]]; then
-        echo "$m"
-        return 0
-    fi
-
-    return 1
 }
 
 set_cron_task_minutes() {
@@ -298,7 +249,7 @@ set_cron_task_minutes() {
 
 sync_watch_cron_from_config() {
     normalize_global_watch_values
-    set_cron_task_minutes "$WATCH_CRON_TAG" "$WATCH_SCRIPT_PATH" "$GLOBAL_WATCH_INTERVAL_MINUTES"
+    set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" "$GLOBAL_WATCH_INTERVAL_MINUTES"
 }
 
 sync_restart_cron_from_config() {
@@ -309,6 +260,89 @@ sync_restart_cron_from_config() {
 sync_cron_tasks_from_config() {
     sync_watch_cron_from_config >/dev/null 2>&1 || true
     sync_restart_cron_from_config >/dev/null 2>&1 || true
+}
+
+remove_custom_chain() {
+    local cmd="$1"
+    local chain="$2"
+
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+
+    while "$cmd" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1; do :; done
+    while "$cmd" -t nat -D POSTROUTING -j "$chain" >/dev/null 2>&1; do :; done
+    "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
+    "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+}
+
+do_uninstall() {
+    print_banner
+    echo -e "${BOLD}${RED}[ 移除脚本 ]${NC}"
+    echo ""
+    echo -e "将清理：配置文件、systemd 服务、cron 任务、iptables 自定义链"
+    echo -e "${YELLOW}不会卸载系统安装的 iptables 软件包${NC}"
+    echo ""
+
+    local confirm_uninstall
+    confirm_uninstall=$(read_confirm_yn_default "是否确认移除脚本？[Y/N]（默认: N）: " "N")
+    if [[ "$confirm_uninstall" == "N" ]]; then
+        set_last_result "warn" "已取消移除"
+        return
+    fi
+
+    systemctl disable --now iptables-forward.service >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" 0 >/dev/null 2>&1 || true
+    set_cron_task_minutes "$LEGACY_WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" 0 >/dev/null 2>&1 || true
+    set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" 0 >/dev/null 2>&1 || true
+
+    remove_custom_chain iptables "$CHAIN_PRE"
+    remove_custom_chain iptables "$CHAIN_POST"
+    remove_custom_chain ip6tables "$CHAIN_PRE"
+    remove_custom_chain ip6tables "$CHAIN_POST"
+
+    rm -f "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1 || true
+    rm -f "/usr/local/bin/iptables-forward-apply" >/dev/null 2>&1 || true
+    rm -f "$CONFIG_FILE" "$LOCK_FILE" >/dev/null 2>&1 || true
+    rm -rf "$CONFIG_DIR" >/dev/null 2>&1 || true
+
+    set_last_result "success" "移除完成：已清理脚本相关文件、cron 任务与自定义链"
+}
+
+update_interval_setting() {
+    local mode="$1"
+    local minutes="$2"
+
+    if [[ "$mode" == "watch" ]]; then
+        GLOBAL_WATCH_INTERVAL_MINUTES="$minutes"
+        [[ "$minutes" -eq 0 ]] && GLOBAL_WATCH_ENABLED=0 || GLOBAL_WATCH_ENABLED=1
+        save_rules
+
+        if sync_watch_cron_from_config >/dev/null 2>&1; then
+            if [[ "$minutes" -eq 0 ]]; then
+                set_last_result "success" "已关闭域名解析定时任务"
+            else
+                set_last_result "success" "已设置域名解析为每 $(format_interval_label "$minutes") 执行"
+            fi
+        else
+            set_last_result "error" "Cron 任务更新失败"
+        fi
+        return
+    fi
+
+    GLOBAL_RESTART_INTERVAL_MINUTES="$minutes"
+    save_rules
+
+    if sync_restart_cron_from_config >/dev/null 2>&1; then
+        if [[ "$minutes" -eq 0 ]]; then
+            set_last_result "success" "已关闭自动重启定时任务"
+        else
+            set_last_result "success" "已设置自动重启为每 $(format_interval_label "$minutes") 执行"
+        fi
+    else
+        set_last_result "error" "Cron 任务更新失败"
+    fi
 }
 
 read_global_settings_from_config() {
@@ -393,7 +427,8 @@ sync_support_files() {
     local force_update="${1:-false}"
 
     if [[ "$force_update" == "true" || ! -s "$SCRIPT_INSTALL_PATH" ]]; then
-        download_file_silent "$RAW_APPLY_SCRIPT_URL" "$SCRIPT_INSTALL_PATH" "755" || return 1
+        download_file_silent "$RAW_SCRIPT_URL" "$SCRIPT_INSTALL_PATH" "755" || \
+        download_file_silent "$RAW_SCRIPT_COMPAT_URL" "$SCRIPT_INSTALL_PATH" "755" || return 1
     else
         chmod 755 "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
     fi
@@ -402,10 +437,8 @@ sync_support_files() {
         download_file_silent "$RAW_SERVICE_URL" "$SERVICE_FILE" "644" || return 1
     fi
 
-    if [[ "$force_update" == "true" || ! -s "$WATCH_SCRIPT_PATH" ]]; then
-        download_file_silent "$RAW_WATCH_URL" "$WATCH_SCRIPT_PATH" "755" || return 1
-    else
-        chmod 755 "$WATCH_SCRIPT_PATH" >/dev/null 2>&1
+    if [[ -f "$SERVICE_FILE" ]]; then
+        sed -i "s|^ExecStart=.*|ExecStart=${SCRIPT_INSTALL_PATH}|" "$SERVICE_FILE" >/dev/null 2>&1 || true
     fi
 
     return 0
@@ -475,34 +508,6 @@ init_env() {
     sync_cron_tasks_from_config
 }
 
-# ---------- 公网IP检测 ----------
-PUBLIC_IP_CACHE=""
-detect_public_ip() {
-    # 如果已缓存则直接返回
-    if [[ -n "$PUBLIC_IP_CACHE" ]]; then
-        return 0
-    fi
-
-    # 如果通过 -n 禁用公网检测
-    if [[ "$DISABLE_PUBLIC_IP" == "1" ]]; then
-        PUBLIC_IP_CACHE="(禁用检测)"
-        return 1
-    fi
-
-    local ip=""
-    # 尝试多个公网IP检测服务，超时3秒
-    for url in "https://ip.sb" "https://api.ipify.org" "https://ifconfig.me" "https://icanhazip.com"; do
-        ip=$(curl -4 -s --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-            PUBLIC_IP_CACHE="$ip"
-            return 0
-        fi
-    done
-
-    PUBLIC_IP_CACHE="(检测失败)"
-    return 1
-}
-
 # ---------- 本机IP探测 ----------
 get_local_ipv4_list() {
     local_ips=()
@@ -518,60 +523,18 @@ get_local_ipv4_list() {
 choose_listen_ip() {
     SELECTED_LISTEN_IP="0.0.0.0"
     get_local_ipv4_list
-    detect_public_ip
-
-    # 分类网卡IP：内网 / 其他
-    local first_private_ip=""
-    local extra_ips=()
-    local extra_ifaces=()
-    for ((i=0; i<${#local_ips[@]}; i++)); do
-        if [[ -z "$first_private_ip" ]] && is_private_ip "${local_ips[$i]}"; then
-            first_private_ip="${local_ips[$i]}"
-        else
-            extra_ips+=("${local_ips[$i]}")
-            extra_ifaces+=("${local_ifaces[$i]}")
-        fi
-    done
 
     echo ""
     echo -e "${CYAN}请选择监听IP:${NC}"
-
-    # 选项1: 0.0.0.0（固定）
     echo "  1) 0.0.0.0"
-    # 选项2: 127.0.0.1（固定）
-    echo "  2) 127.0.0.1"
 
-    # 选项3: 内网IP
-    local private_ip_selectable=false
-    if [[ -n "$first_private_ip" ]]; then
-        echo -e "  3) ${first_private_ip} (内网)"
-        private_ip_selectable=true
-    else
-        echo -e "  3) ${YELLOW}---.---.---.---${NC} (内网)"
-    fi
-
-    # 选项4: 公网IP
-    local public_ip_selectable=false
-    if [[ "$PUBLIC_IP_CACHE" != "(检测失败)" && "$PUBLIC_IP_CACHE" != "(禁用检测)" && -n "$PUBLIC_IP_CACHE" ]]; then
-        echo -e "  4) ${PUBLIC_IP_CACHE} (公网)"
-        public_ip_selectable=true
-    elif [[ "$DISABLE_PUBLIC_IP" == "1" ]]; then
-        echo -e "  4) ${YELLOW}---.---.---.---${NC} (公网, 禁用检测)"
-    else
-        echo -e "  4) ${YELLOW}---.---.---.---${NC} (公网)"
-    fi
-
-    # 选项5+: 其他网卡IP（如果有）
-    local extra_base=5
-    local next_idx=$extra_base
-    if [[ ${#extra_ips[@]} -gt 0 ]]; then
-        for ((i=0; i<${#extra_ips[@]}; i++)); do
-            local tag="公网"
-            is_private_ip "${extra_ips[$i]}" && tag="内网"
-            echo "  $((extra_base+i))) ${extra_ips[$i]} (${extra_ifaces[$i]}, ${tag})"
-        done
-        next_idx=$((extra_base + ${#extra_ips[@]}))
-    fi
+    local next_idx=2
+    for ((i=0; i<${#local_ips[@]}; i++)); do
+        local tag="公网"
+        is_private_ip "${local_ips[$i]}" && tag="内网"
+        echo "  ${next_idx}) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
+        next_idx=$((next_idx + 1))
+    done
 
     local manual_idx=$next_idx
     echo "  ${manual_idx}) 手动输入IP"
@@ -591,37 +554,9 @@ choose_listen_ip() {
             return 0
         fi
 
-        if [[ "$choice" == "2" ]]; then
-            SELECTED_LISTEN_IP="127.0.0.1"
-            return 0
-        fi
-
-        # 内网IP
-        if [[ "$choice" == "3" ]]; then
-            if $private_ip_selectable; then
-                SELECTED_LISTEN_IP="$first_private_ip"
-                return 0
-            else
-                print_error "未检测到内网IP，无法选择！"
-                continue
-            fi
-        fi
-
-        # 公网IP
-        if [[ "$choice" == "4" ]]; then
-            if $public_ip_selectable; then
-                SELECTED_LISTEN_IP="$PUBLIC_IP_CACHE"
-                return 0
-            else
-                print_error "未检测到公网IP，无法选择！"
-                continue
-            fi
-        fi
-
-        # 其他网卡IP
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge "$extra_base" ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-            local idx=$((choice - extra_base))
-            SELECTED_LISTEN_IP="${extra_ips[$idx]}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 2 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
+            local idx=$((choice - 2))
+            SELECTED_LISTEN_IP="${local_ips[$idx]}"
             return 0
         fi
 
@@ -803,37 +738,21 @@ do_domain_watch_manage() {
                     read -r -p "请输入域名解析间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
                     new_minutes=${new_minutes:-0}
                     if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
-                        GLOBAL_WATCH_INTERVAL_MINUTES="$new_minutes"
-                        if [[ "$new_minutes" -eq 0 ]]; then
-                            GLOBAL_WATCH_ENABLED=0
-                        else
-                            GLOBAL_WATCH_ENABLED=1
-                        fi
-
-                        save_rules
-                        if sync_watch_cron_from_config >/dev/null 2>&1; then
-                            if [[ "$new_minutes" -eq 0 ]]; then
-                                set_last_result "success" "已关闭域名解析定时任务"
-                            else
-                                set_last_result "success" "已设置域名解析为每 $(format_interval_label "$new_minutes") 执行"
-                            fi
-                        else
-                            set_last_result "error" "Cron 任务更新失败"
-                        fi
+                        update_interval_setting "watch" "$new_minutes"
                         return
                     fi
                     print_error "输入无效，请重新输入！"
                 done
                 ;;
             2)
-                if [[ ! -x "$WATCH_SCRIPT_PATH" ]]; then
+                if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
                     sync_support_files false || {
-                        set_last_result "error" "立即解析失败：watch 脚本不存在且下载失败"
+                        set_last_result "error" "立即解析失败：apply 脚本不存在且下载失败"
                         return
                     }
                 fi
 
-                if "$WATCH_SCRIPT_PATH" >/dev/null 2>&1; then
+                if "$SCRIPT_INSTALL_PATH" --watch >/dev/null 2>&1; then
                     set_last_result "success" "已立即执行一次域名解析"
                 else
                     set_last_result "error" "立即解析失败：执行异常"
@@ -1194,18 +1113,7 @@ do_restart_manage() {
                     read -r -p "请输入自动重启间隔（单位：分钟，默认: 0；0=关闭）: " new_minutes
                     new_minutes=${new_minutes:-0}
                     if [[ "$new_minutes" =~ ^[0-9]+$ ]] && [[ "$new_minutes" -ge 0 ]]; then
-                        GLOBAL_RESTART_INTERVAL_MINUTES="$new_minutes"
-                        save_rules
-
-                        if sync_restart_cron_from_config >/dev/null 2>&1; then
-                            if [[ "$new_minutes" -eq 0 ]]; then
-                                set_last_result "success" "已关闭自动重启定时任务"
-                            else
-                                set_last_result "success" "已设置自动重启为每 $(format_interval_label "$new_minutes") 执行"
-                            fi
-                        else
-                            set_last_result "error" "Cron 任务更新失败"
-                        fi
+                        update_interval_setting "restart" "$new_minutes"
                         return
                     fi
                     print_error "输入无效，请重新输入！"
@@ -1309,22 +1217,15 @@ show_menu() {
     echo -e "  ${CYAN}4)${NC} 域名解析间隔"
     echo -e "  ${YELLOW}5)${NC} 开机自启管理"
     echo -e "  ${BLUE}6)${NC} 更新脚本文件"
+    echo -e "  ${RED}7)${NC} 移除脚本"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    choice=$(read_menu_choice "请选择操作 [0-6]: " '^[0-6]$')
+    choice=$(read_menu_choice "请选择操作 [0-7]: " '^[0-7]$')
 }
 
 # ---------- 主入口 ----------
 main() {
-    # 解析命令行参数
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -n) DISABLE_PUBLIC_IP=1; shift ;;
-            *) shift ;;
-        esac
-    done
-
     check_root
     init_env
     create_service
@@ -1338,6 +1239,7 @@ main() {
             4) do_domain_watch_manage ;;
             5) do_autostart ;;
             6) do_update ;;
+            7) do_uninstall ;;
             0)
                 echo ""
                 print_info "再见！"
@@ -1348,4 +1250,4 @@ main() {
     done
 }
 
-main "$@"
+main
