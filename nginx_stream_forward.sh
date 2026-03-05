@@ -972,6 +972,26 @@ do_service_control() {
     esac
 }
 
+# ---------- 首页状态展示辅助 ----------
+get_domain_resolve_status() {
+    # 默认按启用处理（脚本写入的基础配置包含 resolver）
+    DOMAIN_RESOLVE_ENABLED=true
+    DOMAIN_RESOLVE_MINUTES=1
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        local valid_seconds
+        valid_seconds=$(grep -Eo 'valid=[0-9]+s' "$CONFIG_FILE" 2>/dev/null | head -n1 | grep -Eo '[0-9]+' || true)
+        if [[ "$valid_seconds" =~ ^[0-9]+$ ]] && [[ "$valid_seconds" -gt 0 ]]; then
+            DOMAIN_RESOLVE_MINUTES=$(( (valid_seconds + 59) / 60 ))
+        fi
+
+        if ! grep -Eq '^[[:space:]]*resolver[[:space:]]+' "$CONFIG_FILE" 2>/dev/null; then
+            DOMAIN_RESOLVE_ENABLED=false
+            DOMAIN_RESOLVE_MINUTES=0
+        fi
+    fi
+}
+
 # ---------- 主菜单 ----------
 show_menu() {
     print_banner
@@ -980,14 +1000,13 @@ show_menu() {
     parse_config
     local rule_count=${#rule_nodes[@]}
 
-    echo -e "  配置文件: ${CYAN}${CONFIG_FILE}${NC}"
-    echo -e "  转发规则: ${CYAN}${rule_count} 条${NC}"
-    
     # 检查 Nginx 状态
+    local nginx_running=false
     if systemctl is-active --quiet nginx 2>/dev/null || pgrep nginx >/dev/null 2>&1; then
-        echo -e "  Nginx 状态: ${GREEN}● 运行中${NC}"
+        nginx_running=true
+        echo -e "  IP 转 发: ${GREEN}● 已开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     else
-        echo -e "  Nginx 状态: ${RED}● 未运行${NC}"
+        echo -e "  IP 转 发: ${RED}● 未开启${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     fi
 
     refresh_autostart_state
@@ -996,6 +1015,16 @@ show_menu() {
     else
         echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
     fi
+
+    get_domain_resolve_status
+    if $DOMAIN_RESOLVE_ENABLED; then
+        echo -e "  域名解析: ${GREEN}● 已开启${NC} (${CYAN}${DOMAIN_RESOLVE_MINUTES}分钟${NC})"
+    else
+        echo -e "  域名解析: ${YELLOW}● 已关闭${NC} (${CYAN}0分钟${NC})"
+    fi
+
+    # 当前脚本未实现自动重启任务，这里按固定状态展示
+    echo -e "  自动重启: ${YELLOW}● 已关闭${NC} (${CYAN}0分钟${NC})"
     echo ""
 
     if [[ $rule_count -gt 0 ]]; then
