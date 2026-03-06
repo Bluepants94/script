@@ -1,27 +1,27 @@
 #!/bin/bash
 
 # ============================================================
-#  nftables 端口转发统一脚本（apply + watch）
-#  --apply : 读取 rules.conf 并重建 nftables 规则
+#  iptables 端口转发统一脚本（apply + watch）
+#  --apply : 读取 rules.conf 并重建 iptables 规则
 #  --watch : 解析域名并按需触发规则重建
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 
-CONFIG_DIR="/etc/nftables-forward"
+CONFIG_DIR="/etc/iptables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
-NFT_TABLE="iptfwd"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
 GLOBAL_WATCH_ENABLED=1
+IP6_CHAINS_READY=0
 MANUAL_MODE=0
 change_records=()
 
 log_watch() {
-    command -v logger >/dev/null 2>&1 && logger -t nftables-forward "$1"
+    command -v logger >/dev/null 2>&1 && logger -t iptables-forward "$1"
 }
 
 is_valid_ipv4() {
@@ -81,6 +81,18 @@ parse_port_expr() {
     return 1
 }
 
+ensure_ip6_chains() {
+    [[ "$IP6_CHAINS_READY" -eq 1 ]] && return 0
+    command -v ip6tables >/dev/null 2>&1 || return 1
+
+    ip6tables -t nat -N "$CHAIN_PRE" 2>/dev/null || ip6tables -t nat -F "$CHAIN_PRE"
+    ip6tables -t nat -N "$CHAIN_POST" 2>/dev/null || ip6tables -t nat -F "$CHAIN_POST"
+    ip6tables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || ip6tables -t nat -A PREROUTING -j "$CHAIN_PRE"
+    ip6tables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$CHAIN_POST"
+
+    IP6_CHAINS_READY=1
+}
+
 # ---------- apply 用规则数组 ----------
 rules_listen_ip=()
 rules_src_port=()
@@ -116,45 +128,39 @@ load_rules_for_apply() {
     done < "$CONFIG_FILE"
 }
 
-setup_nft_family() {
-    local family="$1"
-    nft add table "$family" "$NFT_TABLE" >/dev/null 2>&1 || true
-    nft flush table "$family" "$NFT_TABLE" >/dev/null 2>&1 || return 1
-    nft add chain "$family" "$NFT_TABLE" prerouting '{ type nat hook prerouting priority dstnat; policy accept; }' >/dev/null 2>&1 || return 1
-    nft add chain "$family" "$NFT_TABLE" postrouting '{ type nat hook postrouting priority srcnat; policy accept; }' >/dev/null 2>&1 || return 1
+init_custom_chains() {
+    iptables -t nat -N "$CHAIN_PRE" 2>/dev/null || iptables -t nat -F "$CHAIN_PRE"
+    iptables -t nat -N "$CHAIN_POST" 2>/dev/null || iptables -t nat -F "$CHAIN_POST"
+    iptables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || iptables -t nat -A PREROUTING -j "$CHAIN_PRE"
+    iptables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$CHAIN_POST"
 }
 
-cleanup_unused_ip6_table() {
-    nft delete table ip6 "$NFT_TABLE" >/dev/null 2>&1 || true
-}
-
-add_single_nft_rule() {
-    local family="$1" listen_ip="$2" proto="$3" src_dport="$4" dst_ip="$5" dst_port="$6"
-    local dnat_target="$dst_ip:$dst_port"
-    local -a cmd=(add rule "$family" "$NFT_TABLE" prerouting)
-
-    if [[ "$family" == "ip" ]]; then
-        if is_valid_ipv4 "$listen_ip" && [[ "$listen_ip" != "0.0.0.0" ]]; then
-            cmd+=(ip daddr "$listen_ip")
-        fi
-    else
-        dnat_target="[$dst_ip]:$dst_port"
-        if is_valid_ipv6 "$listen_ip" && [[ "$listen_ip" != "::" ]]; then
-            cmd+=(ip6 daddr "$listen_ip")
-        fi
+add_masquerade_rules() {
+    iptables -t nat -A "$CHAIN_POST" -m conntrack --ctstate DNAT -j MASQUERADE || return 1
+    if [[ "$IP6_CHAINS_READY" -eq 1 ]]; then
+        ip6tables -t nat -A "$CHAIN_POST" -m conntrack --ctstate DNAT -j MASQUERADE 2>/dev/null || return 1
     fi
-
-    cmd+=("$proto" dport "$src_dport" dnat to "$dnat_target")
-    nft "${cmd[@]}" >/dev/null 2>&1 || {
-        echo "[错误] 添加规则失败: ${listen_ip} ${src_dport} -> ${dnat_target} (${proto}, ${family})" >&2
-        return 1
-    }
 }
 
-add_nft_rule() {
+add_single_iptables_rule() {
+    local ip_cmd="$1" listen_ip="$2" proto="$3" dport="$4" dnat_target="$5"
+    if [[ "$listen_ip" == "0.0.0.0" || ( "$listen_ip" == "::" && "$ip_cmd" == "ip6tables" ) ]]; then
+        "$ip_cmd" -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${dport} -> ${dnat_target} (${proto})" >&2
+    else
+        "$ip_cmd" -t nat -A "$CHAIN_PRE" -d "$listen_ip" -p "$proto" --dport "$dport" -j DNAT --to-destination "$dnat_target" || \
+            echo "[错误] 添加规则失败: ${listen_ip} ${dport} -> ${dnat_target} (${proto})" >&2
+    fi
+}
+
+add_iptables_rule() {
     local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
-    local family="ip"
-    is_valid_ipv6 "$dst_ip" && family="ip6"
+
+    local ip_cmd="iptables" dst_target_ip="$dst_ip"
+    if is_valid_ipv6 "$dst_ip"; then
+        ensure_ip6_chains || return 1
+        ip_cmd="ip6tables"; dst_target_ip="[$dst_ip]"
+    fi
 
     local src_meta dst_meta
     src_meta=$(parse_port_expr "$src_port") || return 1
@@ -164,38 +170,28 @@ add_nft_rule() {
     IFS='|' read -r src_type src_start src_end <<< "$src_meta"
     IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
 
-    if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
-        add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_start" "$dst_ip" "$dst_start"
-        return $?
+    # 单端口 → 单端口，或端口段相同
+    if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
+       [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
+        local src_dport="${src_port//-/:}"
+        add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$src_dport" "${dst_target_ip}:${dst_port}"
+        return
     fi
 
+    # 端口段一一映射
     if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
         local src_len=$(( src_end - src_start + 1 ))
-        local dst_len=$(( dst_end - dst_start + 1 ))
-        if [[ "$src_len" -ne "$dst_len" ]]; then
-            return 1
-        fi
         if [[ "$src_len" -gt 1000 ]]; then
             echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
             return 1
         fi
-        local offset
         for ((offset=0; offset<src_len; offset++)); do
-            add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "$dst_ip" "$((dst_start + offset))" || return 1
+            add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
         done
-        return 0
+        return
     fi
 
     return 1
-}
-
-add_masquerade_rules() {
-    local enable_ip6="$1"
-    nft add rule ip "$NFT_TABLE" postrouting ct status dnat masquerade >/dev/null 2>&1 || return 1
-    if [[ "$enable_ip6" == "1" ]]; then
-        nft add rule ip6 "$NFT_TABLE" postrouting ct status dnat masquerade >/dev/null 2>&1 || return 1
-    fi
-    return 0
 }
 
 run_apply() {
@@ -203,22 +199,10 @@ run_apply() {
         { echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || return 1; }
 
     load_rules_for_apply
-    setup_nft_family ip || return 1
-
-    local need_ip6=0
-    local i
-    for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        is_valid_ipv6 "${rules_resolved_ip[$i]}" && { need_ip6=1; break; }
-    done
-
-    if [[ "$need_ip6" -eq 1 ]]; then
-        setup_nft_family ip6 || return 1
-    else
-        cleanup_unused_ip6_table
-    fi
+    init_custom_chains || return 1
 
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-        add_masquerade_rules "$need_ip6"; return $?
+        add_masquerade_rules; return $?
     fi
 
     local fail_count=0
@@ -228,16 +212,16 @@ run_apply() {
         local proto="${rules_proto[$i]}"
 
         case "$proto" in
-            tcp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++)) ;;
-            udp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++)) ;;
+            tcp)  add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++)) ;;
+            udp)  add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++)) ;;
             both)
-                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
-                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
+                add_iptables_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
                 ;;
         esac
     done
 
-    add_masquerade_rules "$need_ip6" || return 1
+    add_masquerade_rules || return 1
     [[ "$fail_count" -gt 0 ]] && { echo "[警告] 共 ${fail_count} 条规则应用失败" >&2; return 1; }
     return 0
 }
@@ -333,9 +317,9 @@ main() {
         return 1
     fi
 
-    if ! command -v nft >/dev/null 2>&1; then
-        log_watch "nft command not found, mode=${mode}, PATH=${PATH}"
-        echo "[错误] nft 未找到，请确认已安装 nftables 并可在当前 PATH 下执行" >&2
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_watch "iptables command not found, mode=${mode}, PATH=${PATH}"
+        echo "[错误] iptables 未找到，请确认已安装并可在当前 PATH 下执行" >&2
         return 1
     fi
 
