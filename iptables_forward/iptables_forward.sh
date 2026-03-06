@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # ============================================================
-#  iptables 端口转发管理脚本（增强版）
-#  功能: 添加/删除/重启 iptables 端口转发规则
-#  支持: 单端口、端口段、一一对应端口段、监听IP区分
+#  端口转发管理脚本（增强版）
+#  功能: 添加/删除/重启 端口转发规则
+#  后端: nftables（主） / iptables（备用）
+#  支持: 单端口、端口段（源=目标）、监听IP区分
 #  持久化: systemd 开机自启 + 规则配置文件
 # ============================================================
 
@@ -31,7 +32,10 @@ LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
+NFT_TABLE="portfwd"
 
+# ---------- 全局变量 ----------
+FW_BACKEND=""
 # ---------- 全局数组 ----------
 rules_listen_ip=()
 rules_src_port=()
@@ -53,7 +57,7 @@ print_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════╗"
-    echo "║      iptables 端口转发管理工具 (增强版)      ║"
+    echo "║       端口转发管理工具 (nftables 增强版)      ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -227,7 +231,16 @@ remove_custom_chain() {
     "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
 }
 
+remove_nft_tables() {
+    command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "$NFT_TABLE" 2>/dev/null || true
+    nft delete table ip6 "$NFT_TABLE" 2>/dev/null || true
+}
+
 remove_all_custom_chains() {
+    # 清理 nftables 表
+    remove_nft_tables
+    # 清理 iptables 自定义链
     local cmd chain
     for cmd in iptables ip6tables; do
         for chain in "$CHAIN_PRE" "$CHAIN_POST"; do
@@ -394,18 +407,36 @@ init_env() {
         print_info "已持久化开启 IP 转发 (sysctl)"
     fi
 
-    # 安装 iptables
-    if ! command -v iptables &>/dev/null; then
-        print_error "iptables 未安装！正在尝试安装..."
+    # 检测防火墙后端: nftables 优先，iptables 备用
+    if command -v nft &>/dev/null; then
+        FW_BACKEND="nft"
+        print_info "防火墙后端: nftables"
+    elif command -v iptables &>/dev/null; then
+        FW_BACKEND="iptables"
+        print_info "防火墙后端: iptables（备用）"
+    else
+        print_warn "未检测到 nftables 或 iptables，尝试安装..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -y && apt-get install -y iptables
+            apt-get update -y && apt-get install -y nftables && FW_BACKEND="nft"
         elif command -v yum &>/dev/null; then
-            yum install -y iptables
+            yum install -y nftables && FW_BACKEND="nft"
         elif command -v dnf &>/dev/null; then
-            dnf install -y iptables
-        else
-            print_error "无法自动安装 iptables，请手动安装后重试"; exit 1
+            dnf install -y nftables && FW_BACKEND="nft"
         fi
+        if [[ -z "$FW_BACKEND" ]]; then
+            # nftables 安装失败，回退尝试 iptables
+            if command -v apt-get &>/dev/null; then
+                apt-get install -y iptables && FW_BACKEND="iptables"
+            elif command -v yum &>/dev/null; then
+                yum install -y iptables && FW_BACKEND="iptables"
+            elif command -v dnf &>/dev/null; then
+                dnf install -y iptables && FW_BACKEND="iptables"
+            fi
+        fi
+        if [[ -z "$FW_BACKEND" ]]; then
+            print_error "无法安装 nftables 或 iptables，请手动安装后重试"; exit 1
+        fi
+        print_info "防火墙后端: ${FW_BACKEND}"
     fi
 
     sync_support_files false || {
@@ -522,7 +553,7 @@ save_rules() {
     normalize_global_settings
 
     cat > "$CONFIG_FILE" <<EOF_CONF
-# iptables 端口转发规则配置
+# 端口转发规则配置（后端: nftables/iptables）
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
 # 全局域名解析间隔(分钟, >=0；0=关闭)
@@ -549,7 +580,7 @@ EOF_CONF
     done
 }
 
-# ---------- 应用 iptables 规则 ----------
+# ---------- 应用转发规则 ----------
 apply_rules_core() {
     [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false
     "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
@@ -650,7 +681,7 @@ remove_rule_at_index() {
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
-    local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 iptables 环境}"
+    local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查防火墙后端环境}"
     save_rules
     if ! sync_support_files false; then
         set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
@@ -794,7 +825,7 @@ do_add() {
     rules_check_interval+=("$check_interval_seconds"); rules_last_check_ts+=("0")
     rules_is_domain+=("$is_domain")
 
-    auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 iptables 环境"
+    auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查防火墙后端环境"
 }
 
 # ---------- 删除转发规则 ----------
@@ -823,7 +854,7 @@ do_delete() {
             confirm=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
             [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
             clear_all_rules
-            auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
+            auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查防火墙后端环境"
             return
         fi
 
@@ -836,22 +867,22 @@ do_delete() {
         [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
 
         remove_rule_at_index $((del_input - 1))
-        auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
+        auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查防火墙后端环境"
         return
     done
 }
 
-# ---------- 重启 iptables 转发 ----------
+# ---------- 重启端口转发 ----------
 do_restart() {
     load_rules
     if apply_rules_core; then
         if [[ ${#rules_src_port[@]} -eq 0 ]]; then
-            set_last_result "success" "重启完成：当前无转发规则，自定义链已清空"
+            set_last_result "success" "重启完成：当前无转发规则，已清空规则表"
         else
-            set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则"
+            set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则 (${FW_BACKEND:-auto})"
         fi
     else
-        set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
+        set_last_result "error" "重启失败：规则应用异常，请检查防火墙后端和配置"
     fi
 }
 
@@ -931,7 +962,7 @@ show_menu() {
 
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
-    echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
+    echo -e "  ${CYAN}3)${NC} 重启端口转发"
     echo -e "  ${CYAN}4)${NC} 域名解析间隔"
     echo -e "  ${YELLOW}5)${NC} 开机自启管理"
     echo -e "  ${BLUE}6)${NC} 更新脚本文件"
@@ -953,7 +984,7 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_interval_manage "restart" "重启 iptables 转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            3) do_interval_manage "restart" "重启端口转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
             4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
             5) do_autostart ;;
             6) do_update ;;
