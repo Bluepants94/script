@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ============================================================
-#  iptables 端口转发管理脚本（增强版）
-#  功能: 添加/删除/重启 iptables 端口转发规则
+#  nftables 端口转发管理脚本（增强版）
+#  功能: 添加/删除/重启端口转发规则（底层基于 nftables）
 #  支持: 单端口、端口段、一一对应端口段、监听IP区分
 #  持久化: systemd 开机自启 + 规则配置文件
 # ============================================================
@@ -17,20 +17,21 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ---------- 路径定义 ----------
-CONFIG_DIR="/etc/iptables-forward"
+CONFIG_DIR="/etc/nftables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
-SERVICE_FILE="/etc/systemd/system/iptables-forward.service"
+SERVICE_FILE="/etc/systemd/system/nftables-forward.service"
 SCRIPT_INSTALL_PATH="/usr/local/bin/iptables-forward"
 RAW_BASE_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward"
 RAW_SCRIPT_URL="${RAW_BASE_URL}/iptables-forward"
 RAW_SCRIPT_COMPAT_URL="${RAW_BASE_URL}/iptables-forward-apply"
 RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
-WATCH_CRON_TAG="# iptables-forward-domain"
-RESTART_CRON_TAG="# iptables-forward-restart"
-LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
+WATCH_CRON_TAG="# nftables-forward-domain"
+RESTART_CRON_TAG="# nftables-forward-restart"
+LEGACY_WATCH_CRON_TAG="# nftables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
+NFT_TABLE="iptfwd"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -53,7 +54,7 @@ print_banner() {
     clear
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════╗"
-    echo "║      iptables 端口转发管理工具 (增强版)      ║"
+    echo "║      nftables 端口转发管理工具 (增强版)      ║"
     echo "╚══════════════════════════════════════════════╝"
     echo -e "${NC}"
 }
@@ -228,12 +229,9 @@ remove_custom_chain() {
 }
 
 remove_all_custom_chains() {
-    local cmd chain
-    for cmd in iptables ip6tables; do
-        for chain in "$CHAIN_PRE" "$CHAIN_POST"; do
-            remove_custom_chain "$cmd" "$chain"
-        done
-    done
+    command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "$NFT_TABLE" >/dev/null 2>&1 || true
+    nft delete table ip6 "$NFT_TABLE" >/dev/null 2>&1 || true
 }
 
 # ---------- 卸载 ----------
@@ -242,7 +240,7 @@ do_uninstall() {
     confirm=$(read_confirm_yn_default "是否确认移除脚本？[Y/N]（默认: N）: " "N")
     [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消移除"; return; }
 
-    systemctl disable --now iptables-forward.service >/dev/null 2>&1 || true
+    systemctl disable --now nftables-forward.service >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE" >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -394,17 +392,17 @@ init_env() {
         print_info "已持久化开启 IP 转发 (sysctl)"
     fi
 
-    # 安装 iptables
-    if ! command -v iptables &>/dev/null; then
-        print_error "iptables 未安装！正在尝试安装..."
+    # 安装 nftables
+    if ! command -v nft &>/dev/null; then
+        print_error "nftables 未安装！正在尝试安装..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -y && apt-get install -y iptables
+            apt-get update -y && apt-get install -y nftables
         elif command -v yum &>/dev/null; then
-            yum install -y iptables
+            yum install -y nftables
         elif command -v dnf &>/dev/null; then
-            dnf install -y iptables
+            dnf install -y nftables
         else
-            print_error "无法自动安装 iptables，请手动安装后重试"; exit 1
+            print_error "无法自动安装 nftables，请手动安装后重试"; exit 1
         fi
     fi
 
@@ -522,7 +520,7 @@ save_rules() {
     normalize_global_settings
 
     cat > "$CONFIG_FILE" <<EOF_CONF
-# iptables 端口转发规则配置
+# nftables 端口转发规则配置
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
 # 全局域名解析间隔(分钟, >=0；0=关闭)
@@ -549,7 +547,7 @@ EOF_CONF
     done
 }
 
-# ---------- 应用 iptables 规则 ----------
+# ---------- 应用转发规则 ----------
 apply_rules_core() {
     [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false
     "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
@@ -559,8 +557,8 @@ apply_rules_core() {
 create_service() {
     sync_support_files false || return 1
     systemctl daemon-reload >/dev/null 2>&1
-    systemctl is-enabled --quiet iptables-forward.service 2>/dev/null || \
-        systemctl enable iptables-forward.service 2>/dev/null
+    systemctl is-enabled --quiet nftables-forward.service 2>/dev/null || \
+        systemctl enable nftables-forward.service 2>/dev/null
     return 0
 }
 
@@ -650,7 +648,7 @@ remove_rule_at_index() {
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
-    local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 iptables 环境}"
+    local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 nftables 环境}"
     save_rules
     if ! sync_support_files false; then
         set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
@@ -794,7 +792,7 @@ do_add() {
     rules_check_interval+=("$check_interval_seconds"); rules_last_check_ts+=("0")
     rules_is_domain+=("$is_domain")
 
-    auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 iptables 环境"
+    auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 nftables 环境"
 }
 
 # ---------- 删除转发规则 ----------
@@ -823,7 +821,7 @@ do_delete() {
             confirm=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
             [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
             clear_all_rules
-            auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
+            auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 nftables 环境"
             return
         fi
 
@@ -836,12 +834,12 @@ do_delete() {
         [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
 
         remove_rule_at_index $((del_input - 1))
-        auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 iptables 环境"
+        auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 nftables 环境"
         return
     done
 }
 
-# ---------- 重启 iptables 转发 ----------
+# ---------- 重启转发规则 ----------
 do_restart() {
     load_rules
     if apply_rules_core; then
@@ -851,7 +849,7 @@ do_restart() {
             set_last_result "success" "重启完成：已重新加载 ${#rules_src_port[@]} 条转发规则"
         fi
     else
-        set_last_result "error" "重启失败：规则应用异常，请检查 iptables 和配置"
+        set_last_result "error" "重启失败：规则应用异常，请检查 nftables 和配置"
     fi
 }
 
@@ -862,7 +860,7 @@ do_autostart() {
     echo ""
 
     local is_enabled=false
-    systemctl is-enabled --quiet iptables-forward.service 2>/dev/null && is_enabled=true
+    systemctl is-enabled --quiet nftables-forward.service 2>/dev/null && is_enabled=true
 
     if $is_enabled; then
         echo -e "  当前状态: ${GREEN}已启用开机自启${NC}"
@@ -881,7 +879,7 @@ do_autostart() {
     [[ "$choice" == "0" ]] && return
 
     if $is_enabled; then
-        if systemctl disable iptables-forward.service 2>/dev/null; then
+        if systemctl disable nftables-forward.service 2>/dev/null; then
             set_last_result "success" "已关闭开机自启"
         else
             set_last_result "error" "关闭开机自启失败"
@@ -911,7 +909,7 @@ show_menu() {
         echo -e "  IP 转 发: ${RED}● 已关闭${NC}    转发规则: ${CYAN}${rule_count} 条${NC}"
     fi
 
-    if systemctl is-enabled --quiet iptables-forward.service 2>/dev/null; then
+    if systemctl is-enabled --quiet nftables-forward.service 2>/dev/null; then
         echo -e "  开机自启: ${GREEN}● 已开启${NC}"
     else
         echo -e "  开机自启: ${YELLOW}● 已关闭${NC}"
@@ -931,7 +929,7 @@ show_menu() {
 
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
-    echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
+    echo -e "  ${CYAN}3)${NC} 重启转发规则"
     echo -e "  ${CYAN}4)${NC} 域名解析间隔"
     echo -e "  ${YELLOW}5)${NC} 开机自启管理"
     echo -e "  ${BLUE}6)${NC} 更新脚本文件"
@@ -953,7 +951,7 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_interval_manage "restart" "重启 iptables 转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            3) do_interval_manage "restart" "重启转发规则" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
             4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
             5) do_autostart ;;
             6) do_update ;;
