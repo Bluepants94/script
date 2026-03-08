@@ -44,3 +44,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install_acme.sh)
 ```
+# docker-compose 定时更新
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/docker-compose-auto-update/install.sh)
+```
