@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -u
 
-SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-
 INSTALL_DIR="/opt/docker-compose-auto-update"
 
 TARGET_SCRIPT="docker-compose-auto-update.sh"
@@ -170,7 +168,7 @@ install_or_update() {
 
 uninstall_all() {
   echo
-  read -r -p "确认卸载？将移除 crontab 任务及本目录所有相关文件（含日志与控制脚本）[y/N]: " ans
+  read -r -p "确认卸载？将移除 crontab 任务及本目录相关文件（脚本/配置/日志）[y/N]: " ans
   if [[ ! "$ans" =~ ^[Yy]$ ]]; then
     echo "[取消] 未执行卸载。"
     return
@@ -178,32 +176,13 @@ uninstall_all() {
 
   remove_managed_cron
 
-  local running_installed="0"
-  if [[ "$SELF_PATH" == "${INSTALL_DIR}/docker-compose-auto-update-control.sh" ]]; then
-    running_installed="1"
-  fi
-
   rm -f \
     "$TARGET_SCRIPT_PATH" \
     "$TARGET_CONFIG_PATH" \
     "$TARGET_LOG_PATH"
 
-  if [[ "$running_installed" == "1" ]]; then
-    echo "[成功] 已移除 crontab 任务与相关文件。"
-    echo "[提示] 控制脚本将自删除并退出。"
-
-    # 延迟自删除，避免脚本运行中直接删除自身导致异常
-    (
-      sleep 1
-      rm -f "${INSTALL_DIR}/docker-compose-auto-update-control.sh"
-      rmdir "$INSTALL_DIR" 2>/dev/null || true
-    ) >/dev/null 2>&1 &
-    exit 0
-  else
-    rm -f "${INSTALL_DIR}/docker-compose-auto-update-control.sh"
-    rmdir "$INSTALL_DIR" 2>/dev/null || true
-    echo "[成功] 已移除 crontab 任务与相关文件。"
-  fi
+  rmdir "$INSTALL_DIR" 2>/dev/null || true
+  echo "[成功] 已移除 crontab 任务与相关文件。"
 }
 
 update_interval() {
