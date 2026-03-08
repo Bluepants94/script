@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 set -u
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")")"
+SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+
+INSTALL_DIR="/opt/docker-compose-auto-update"
+CONTROL_SCRIPT="docker-compose-auto-update-control.sh"
+CONTROL_SCRIPT_PATH="${INSTALL_DIR}/${CONTROL_SCRIPT}"
 
 TARGET_SCRIPT="docker-compose-auto-update.sh"
 TARGET_CONFIG="docker-compose-projects.list"
-TARGET_SCRIPT_PATH="${SCRIPT_DIR}/${TARGET_SCRIPT}"
-TARGET_CONFIG_PATH="${SCRIPT_DIR}/${TARGET_CONFIG}"
+TARGET_SCRIPT_PATH="${INSTALL_DIR}/${TARGET_SCRIPT}"
+TARGET_CONFIG_PATH="${INSTALL_DIR}/${TARGET_CONFIG}"
+TARGET_LOG_PATH="${INSTALL_DIR}/docker-compose-auto-update.log"
 
 BASE_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/docker-compose-auto-update"
 SCRIPT_URL="${BASE_URL}/${TARGET_SCRIPT}"
@@ -54,15 +58,7 @@ cron_status() {
 }
 
 script_status() {
-  if [[ -f "$TARGET_SCRIPT_PATH" ]]; then
-    echo "已下载"
-  else
-    echo "未下载"
-  fi
-}
-
-config_status() {
-  if [[ -f "$TARGET_CONFIG_PATH" ]]; then
+  if [[ -f "$TARGET_SCRIPT_PATH" && -f "$TARGET_CONFIG_PATH" ]]; then
     echo "已下载"
   else
     echo "未下载"
@@ -74,11 +70,10 @@ render_home() {
   echo "=============================================="
   echo " docker-compose-auto-update 控制台"
   echo "=============================================="
-  echo "脚本目录        : $SCRIPT_DIR"
+  echo "安装目录        : $INSTALL_DIR"
   echo "Crontab 状态    : $(cron_status)"
   echo "Crontab 定时    : $(get_managed_schedule)"
-  echo "更新脚本状态    : $(script_status)"
-  echo "配置文件状态    : $(config_status)"
+  echo "脚本状态        : $(script_status)"
   echo "----------------------------------------------"
   echo "1) 安装/更新"
   echo "2) 卸载"
@@ -138,6 +133,24 @@ install_or_update() {
   echo
   echo "[安装/更新] 开始下载文件..."
 
+  if ! mkdir -p "$INSTALL_DIR"; then
+    echo "[错误] 无法创建安装目录: $INSTALL_DIR"
+    return
+  fi
+
+  if [[ ! -w "$INSTALL_DIR" ]]; then
+    echo "[错误] 安装目录不可写: $INSTALL_DIR"
+    echo "[提示] 请使用 root 权限运行。"
+    return
+  fi
+
+  # 同步控制脚本到固定安装目录，便于后续直接运行
+  if ! safe_download "${BASE_URL}/${CONTROL_SCRIPT}" "$CONTROL_SCRIPT_PATH"; then
+    echo "[错误] 控制脚本下载失败: ${BASE_URL}/${CONTROL_SCRIPT}"
+    return
+  fi
+  chmod +x "$CONTROL_SCRIPT_PATH"
+
   if ! safe_download "$SCRIPT_URL" "$TARGET_SCRIPT_PATH"; then
     echo "[失败] 更新脚本下载失败。"
     return
@@ -173,17 +186,33 @@ uninstall_all() {
   fi
 
   remove_managed_cron
+
+  local running_installed="0"
+  if [[ "$SELF_PATH" == "$CONTROL_SCRIPT_PATH" ]]; then
+    running_installed="1"
+  fi
+
   rm -f \
     "$TARGET_SCRIPT_PATH" \
     "$TARGET_CONFIG_PATH" \
-    "${SCRIPT_DIR}/docker-compose-auto-update.log"
+    "$TARGET_LOG_PATH"
 
-  echo "[成功] 已移除 crontab 任务与相关文件。"
-  echo "[提示] 控制脚本将自删除并退出。"
+  if [[ "$running_installed" == "1" ]]; then
+    echo "[成功] 已移除 crontab 任务与相关文件。"
+    echo "[提示] 控制脚本将自删除并退出。"
 
-  # 延迟自删除，避免脚本运行中直接删除自身导致异常
-  (sleep 1; rm -f "$SELF_PATH") >/dev/null 2>&1 &
-  exit 0
+    # 延迟自删除，避免脚本运行中直接删除自身导致异常
+    (
+      sleep 1
+      rm -f "$CONTROL_SCRIPT_PATH"
+      rmdir "$INSTALL_DIR" 2>/dev/null || true
+    ) >/dev/null 2>&1 &
+    exit 0
+  else
+    rm -f "$CONTROL_SCRIPT_PATH"
+    rmdir "$INSTALL_DIR" 2>/dev/null || true
+    echo "[成功] 已移除 crontab 任务与相关文件。"
+  fi
 }
 
 update_interval() {
