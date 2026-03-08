@@ -4,8 +4,6 @@ set -u
 SELF_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 
 INSTALL_DIR="/opt/docker-compose-auto-update"
-CONTROL_SCRIPT="docker-compose-auto-update-control.sh"
-CONTROL_SCRIPT_PATH="${INSTALL_DIR}/${CONTROL_SCRIPT}"
 
 TARGET_SCRIPT="docker-compose-auto-update.sh"
 TARGET_CONFIG="docker-compose-projects.list"
@@ -144,13 +142,6 @@ install_or_update() {
     return
   fi
 
-  # 同步控制脚本到固定安装目录，便于后续直接运行
-  if ! safe_download "${BASE_URL}/${CONTROL_SCRIPT}" "$CONTROL_SCRIPT_PATH"; then
-    echo "[错误] 控制脚本下载失败: ${BASE_URL}/${CONTROL_SCRIPT}"
-    return
-  fi
-  chmod +x "$CONTROL_SCRIPT_PATH"
-
   if ! safe_download "$SCRIPT_URL" "$TARGET_SCRIPT_PATH"; then
     echo "[失败] 更新脚本下载失败。"
     return
@@ -188,7 +179,7 @@ uninstall_all() {
   remove_managed_cron
 
   local running_installed="0"
-  if [[ "$SELF_PATH" == "$CONTROL_SCRIPT_PATH" ]]; then
+  if [[ "$SELF_PATH" == "${INSTALL_DIR}/docker-compose-auto-update-control.sh" ]]; then
     running_installed="1"
   fi
 
@@ -204,12 +195,12 @@ uninstall_all() {
     # 延迟自删除，避免脚本运行中直接删除自身导致异常
     (
       sleep 1
-      rm -f "$CONTROL_SCRIPT_PATH"
+      rm -f "${INSTALL_DIR}/docker-compose-auto-update-control.sh"
       rmdir "$INSTALL_DIR" 2>/dev/null || true
     ) >/dev/null 2>&1 &
     exit 0
   else
-    rm -f "$CONTROL_SCRIPT_PATH"
+    rm -f "${INSTALL_DIR}/docker-compose-auto-update-control.sh"
     rmdir "$INSTALL_DIR" 2>/dev/null || true
     echo "[成功] 已移除 crontab 任务与相关文件。"
   fi
