@@ -63,8 +63,9 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   fi
 
   # 更新：pull + up -d
-  if (cd "$project_dir" && $COMPOSE_CMD pull && $COMPOSE_CMD up -d); then
-    echo "[$(date '+%F %T')] OK: 更新成功: $project_dir"
+  echo "[$(date '+%F %T')] INFO: 更新中: $project_dir"
+  if (cd "$project_dir" && $COMPOSE_CMD pull >/dev/null 2>&1 && $COMPOSE_CMD up -d >/dev/null 2>&1); then
+    echo "[$(date '+%F %T')] OK: 更新完成（或无需更新）: $project_dir"
     ((success_count++))
   else
     echo "[$(date '+%F %T')] ERROR: 更新失败: $project_dir"
@@ -75,7 +76,7 @@ done < "$CONFIG_FILE"
 
 # 清理悬空镜像（dangling images）
 echo "[$(date '+%F %T')] 开始清理悬空镜像..."
-if docker image prune -f; then
+if docker image prune -f >/dev/null 2>&1; then
   echo "[$(date '+%F %T')] OK: 悬空镜像清理完成"
 else
   echo "[$(date '+%F %T')] ERROR: 悬空镜像清理失败"
