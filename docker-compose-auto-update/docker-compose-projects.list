@@ -1,0 +1,6 @@
+# 每行一个 docker-compose 项目目录（绝对路径）
+# 支持注释和空行
+
+/opt/app1
+/srv/monitoring
+/home/docker/proxy
