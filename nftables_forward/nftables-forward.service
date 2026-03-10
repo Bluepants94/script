@@ -1,0 +1,15 @@
+[Unit]
+Description=nftables Port Forwarding Rules
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nftables-forward
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nftables-forward
+
+[Install]
+WantedBy=multi-user.target
