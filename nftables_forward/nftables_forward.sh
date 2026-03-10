@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================
 #  nftables 端口转发管理脚本（增强版）
@@ -153,7 +153,7 @@ normalize_interval_var() {
     local var_name="$1"
     local val="${!var_name}"
     if [[ ! "$val" =~ ^[0-9]+$ ]] || [[ "$val" -lt 0 ]]; then
-        eval "$var_name=0"
+        printf -v "$var_name" '%s' '0'
     fi
 }
 
@@ -220,8 +220,8 @@ sync_cron_tasks_from_config() {
 # ---------- 自定义表清理 ----------
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
-    nft list table ip "nftfwd" >/dev/null 2>&1 && nft delete table ip "nftfwd" >/dev/null 2>&1 || true
-    nft list table ip6 "nftfwd" >/dev/null 2>&1 && nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
+    nft delete table ip "nftfwd" >/dev/null 2>&1 || true
+    nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
 }
 
 # ---------- 卸载 ----------
@@ -291,7 +291,8 @@ read_global_settings_from_config() {
     local val
     for key in GLOBAL_WATCH_ENABLED GLOBAL_WATCH_INTERVAL_MINUTES GLOBAL_RESTART_INTERVAL_MINUTES; do
         val=$(grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-        [[ -n "$val" ]] && eval "$key='$val'"
+        # 仅接受纯数字，防止配置被篡改后注入
+        [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
     done
     normalize_global_settings
 }
@@ -320,13 +321,16 @@ download_file_silent() {
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
+    # 统一换行为 LF，避免 Windows CRLF 导致 Linux 执行报错
+    sed -i 's/\r$//' "$tmp_file" >/dev/null 2>&1 || true
+
     # 校验下载文件：非空且以 shebang 或 [Unit] 开头
     if [[ ! -s "$tmp_file" ]]; then
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
     local head_line
     head_line=$(head -c 20 "$tmp_file" 2>/dev/null)
-    if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "[Unit]"* ]]; then
+    if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "#!/usr/bin/env bash"* && "$head_line" != "[Unit]"* ]]; then
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
@@ -628,12 +632,17 @@ clear_all_rules() {
 
 remove_rule_at_index() {
     local idx="$1"
-    local arr
-    for arr in rules_listen_ip rules_src_port rules_dst_ip rules_dst_port rules_proto \
-               rules_resolved_ip rules_check_interval rules_last_check_ts rules_is_domain; do
-        unset "${arr}[idx]"
-        eval "$arr=(\"\${${arr}[@]}\")"
-    done
+    # 通过重建新数组方式避免 eval，同时正确压缩稀疏数组
+    local i new=()
+    new=(); for i in "${!rules_listen_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_listen_ip[$i]}"); done; rules_listen_ip=("${new[@]}")
+    new=(); for i in "${!rules_src_port[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_src_port[$i]}"); done; rules_src_port=("${new[@]}")
+    new=(); for i in "${!rules_dst_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_dst_ip[$i]}"); done; rules_dst_ip=("${new[@]}")
+    new=(); for i in "${!rules_dst_port[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_dst_port[$i]}"); done; rules_dst_port=("${new[@]}")
+    new=(); for i in "${!rules_proto[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_proto[$i]}"); done; rules_proto=("${new[@]}")
+    new=(); for i in "${!rules_resolved_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_resolved_ip[$i]}"); done; rules_resolved_ip=("${new[@]}")
+    new=(); for i in "${!rules_check_interval[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_check_interval[$i]}"); done; rules_check_interval=("${new[@]}")
+    new=(); for i in "${!rules_last_check_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_last_check_ts[$i]}"); done; rules_last_check_ts=("${new[@]}")
+    new=(); for i in "${!rules_is_domain[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_is_domain[$i]}"); done; rules_is_domain=("${new[@]}")
 }
 
 # ---------- 自动保存并应用 ----------
