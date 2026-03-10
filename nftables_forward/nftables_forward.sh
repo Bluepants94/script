@@ -400,9 +400,16 @@ init_env() {
         fi
     fi
 
-    sync_support_files false || {
-        print_error "必需文件同步失败，请检查网络连接或 GitHub 地址"; exit 1
-    }
+    # 检查必需文件是否存在（不自动下载，需用户手动更新）
+    if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+        print_warn "应用脚本 ${SCRIPT_INSTALL_PATH} 不存在，正在尝试首次下载..."
+        if ! sync_support_files true; then
+            print_error "首次下载失败，请检查网络连接或 GitHub 地址"
+            print_info "也可手动放置文件后重试，或稍后通过菜单「更新脚本文件」下载"
+            exit 1
+        fi
+        print_success "首次下载完成"
+    fi
 
     read_global_settings_from_config
 
@@ -543,13 +550,19 @@ EOF_CONF
 
 # ---------- 应用 nftables 规则 ----------
 apply_rules_core() {
-    [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false
+    if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+        print_error "应用脚本不存在，请先通过菜单「更新脚本文件」下载"
+        return 1
+    fi
     "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
 }
 
 # ---------- 创建 systemd 服务 ----------
 create_service() {
-    sync_support_files false || return 1
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_warn "服务文件不存在，请先通过菜单「更新脚本文件」下载"
+        return 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1
     systemctl is-enabled --quiet nftables-forward.service 2>/dev/null || \
         systemctl enable nftables-forward.service 2>/dev/null
@@ -607,9 +620,9 @@ do_interval_manage() {
             ;;
         2)
             if [[ "$mode" == "watch" ]]; then
-                [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false || {
-                    set_last_result "error" "立即解析失败：脚本不存在且下载失败"; return
-                }
+                if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+                    set_last_result "error" "立即解析失败：应用脚本不存在，请先通过菜单「更新脚本文件」下载"; return
+                fi
                 if "$SCRIPT_INSTALL_PATH" --watch >/dev/null 2>&1; then
                     set_last_result "success" "已立即执行一次域名解析"
                 else
@@ -649,10 +662,6 @@ remove_rule_at_index() {
 auto_save_and_apply() {
     local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 nftables 环境}"
     save_rules
-    if ! sync_support_files false; then
-        set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
-        return 1
-    fi
     if apply_rules_core; then
         set_last_result "success" "$success_msg"
     else
