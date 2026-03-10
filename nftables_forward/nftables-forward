@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================
 #  nftables 端口转发统一脚本（apply + watch）
@@ -119,8 +119,8 @@ load_rules_for_apply() {
 
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
-    nft list table ip "$TABLE_NAME" >/dev/null 2>&1 && nft delete table ip "$TABLE_NAME" >/dev/null 2>&1 || true
-    nft list table ip6 "$TABLE_NAME" >/dev/null 2>&1 && nft delete table ip6 "$TABLE_NAME" >/dev/null 2>&1 || true
+    nft delete table ip "$TABLE_NAME" >/dev/null 2>&1 || true
+    nft delete table ip6 "$TABLE_NAME" >/dev/null 2>&1 || true
 }
 
 append_nft_line() {
@@ -137,7 +137,7 @@ init_ruleset_base() {
     append_nft_line "add chain ip ${TABLE_NAME} ${CHAIN_POST}"
     append_nft_line "add rule ip ${TABLE_NAME} prerouting jump ${CHAIN_PRE}"
     append_nft_line "add rule ip ${TABLE_NAME} postrouting jump ${CHAIN_POST}"
-    append_nft_line "add rule ip ${TABLE_NAME} ${CHAIN_POST} ct state dnat masquerade"
+    append_nft_line "add rule ip ${TABLE_NAME} ${CHAIN_POST} ct status dnat masquerade"
 
     append_nft_line "add table ip6 ${TABLE_NAME}"
     append_nft_line "add chain ip6 ${TABLE_NAME} prerouting { type nat hook prerouting priority dstnat; policy accept; }"
@@ -146,7 +146,7 @@ init_ruleset_base() {
     append_nft_line "add chain ip6 ${TABLE_NAME} ${CHAIN_POST}"
     append_nft_line "add rule ip6 ${TABLE_NAME} prerouting jump ${CHAIN_PRE}"
     append_nft_line "add rule ip6 ${TABLE_NAME} postrouting jump ${CHAIN_POST}"
-    append_nft_line "add rule ip6 ${TABLE_NAME} ${CHAIN_POST} ct state dnat masquerade"
+    append_nft_line "add rule ip6 ${TABLE_NAME} ${CHAIN_POST} ct status dnat masquerade"
 }
 
 add_single_nft_rule() {
@@ -233,11 +233,11 @@ run_apply() {
     nft_out=$(nft -f "$nft_tmp" 2>&1) || nft_rc=$?
     rm -f "$nft_tmp"
 
-    [[ "$fail_count" -gt 0 ]] && { echo "[警告] 共 ${fail_count} 条规则应用失败" >&2; return 1; }
     if [[ "$nft_rc" -ne 0 ]]; then
         echo "[错误] nft 应用失败: ${nft_out}" >&2
         return 1
     fi
+    [[ "$fail_count" -gt 0 ]] && echo "[警告] 共 ${fail_count} 条规则构建失败（已跳过）" >&2
     return 0
 }
 
@@ -250,14 +250,15 @@ run_watch() {
     exec 200>"$LOCK_FILE"
     flock -n 200 || return 0
 
-    local tmp_file now changed
+    local tmp_file now changed raw_line
     tmp_file=$(mktemp)
     now=$(date +%s)
     changed=0
 
-    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    while IFS= read -r raw_line; do
+        IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<< "$raw_line"
         if [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]]; then
-            echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
+            printf '%s\n' "$raw_line" >> "$tmp_file"
             continue
         fi
 
