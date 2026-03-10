@@ -16,6 +16,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/iptables_forward/iptables_forward.sh)
 ```
+# nftables端口转发
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/nftables_forward/nftables_forward.sh)
+```
 # Nginx 编译安装
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/install_nginx.sh)
