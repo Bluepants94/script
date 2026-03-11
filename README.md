@@ -18,7 +18,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 # nftables端口转发
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/nftables_forward/nftables_forward.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/nftables_forward/nftables_forward_new.sh)
 ```
 # Nginx 编译安装
 ```
