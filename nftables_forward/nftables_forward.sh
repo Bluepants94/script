@@ -29,8 +29,7 @@ WATCH_CRON_TAG="# nftables-forward-domain"
 RESTART_CRON_TAG="# nftables-forward-restart"
 LEGACY_WATCH_CRON_TAG="# nftables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
-CHAIN_PRE="NFTFWD-PRE"
-CHAIN_POST="NFTFWD-POST"
+# 注意: CHAIN_PRE/CHAIN_POST 由 nftables-forward 执行脚本使用，管理脚本仅在卸载时清理表
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -124,6 +123,9 @@ is_valid_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
     for o in "$o1" "$o2" "$o3" "$o4"; do
+        # 检查纯数字、拒绝前导零（如 010）、范围 0-255
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        [[ "${#o}" -gt 1 && "$o" == 0* ]] && return 1
         [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
     done
     return 0
@@ -329,7 +331,7 @@ download_file_silent() {
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
     local head_line
-    head_line=$(head -c 20 "$tmp_file" 2>/dev/null)
+    head_line=$(head -c 32 "$tmp_file" 2>/dev/null)
     if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "#!/usr/bin/env bash"* && "$head_line" != "[Unit]"* ]]; then
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
@@ -520,7 +522,8 @@ load_rules() {
 save_rules() {
     normalize_global_settings
 
-    cat > "$CONFIG_FILE" <<EOF_CONF
+    local tmp_conf="${CONFIG_FILE}.tmp.$$"
+    cat > "$tmp_conf" <<EOF_CONF
 # nftables 端口转发规则配置
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
@@ -544,8 +547,11 @@ EOF_CONF
         [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
         [[ "$d_is_domain" == "1" ]] || d_is_domain=0
 
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$CONFIG_FILE"
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$tmp_conf"
     done
+
+    # 原子替换：先写临时文件再 mv，避免写入中断导致配置丢失
+    mv -f "$tmp_conf" "$CONFIG_FILE" || { rm -f "$tmp_conf"; return 1; }
 }
 
 # ---------- 应用 nftables 规则 ----------
@@ -820,6 +826,7 @@ do_delete() {
     while true; do
         echo ""
         echo -e "输入序号（${CYAN}1-${#rules_src_port[@]}${NC}），输入 ${YELLOW}all${NC} 删除全部，输入 ${NC}0${NC} 返回"
+        local del_input
         read -r -p "请选择: " del_input
 
         [[ "$del_input" == "0" ]] && return
@@ -938,14 +945,15 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 nftables 转发"
-    echo -e "  ${CYAN}4)${NC} 域名解析间隔"
-    echo -e "  ${YELLOW}5)${NC} 开机自启管理"
-    echo -e "  ${BLUE}6)${NC} 更新脚本文件"
-    echo -e "  ${RED}7)${NC} 移除脚本"
+    echo -e "  ${CYAN}4)${NC} 自动重启间隔"
+    echo -e "  ${CYAN}5)${NC} 域名解析间隔"
+    echo -e "  ${YELLOW}6)${NC} 开机自启管理"
+    echo -e "  ${BLUE}7)${NC} 更新脚本文件"
+    echo -e "  ${RED}8)${NC} 移除脚本"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    choice=$(read_menu_choice "请选择操作 [0-7]: " '^[0-7]$')
+    choice=$(read_menu_choice "请选择操作 [0-8]: " '^[0-8]$')
 }
 
 # ---------- 主入口 ----------
@@ -959,11 +967,12 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_interval_manage "restart" "重启 nftables 转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
-            4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
-            5) do_autostart ;;
-            6) do_update ;;
-            7) do_uninstall ;;
+            3) do_restart ;;
+            4) do_interval_manage "restart" "自动重启间隔" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            5) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
+            6) do_autostart ;;
+            7) do_update ;;
+            8) do_uninstall ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
         esac
     done

@@ -30,6 +30,8 @@ is_valid_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
     for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        [[ "${#o}" -gt 1 && "$o" == 0* ]] && return 1
         [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
     done
     return 0
@@ -293,7 +295,7 @@ run_watch() {
     done < "$CONFIG_FILE"
 
     if [[ "$changed" -eq 1 ]]; then
-        cp "$tmp_file" "$CONFIG_FILE"
+        mv -f "$tmp_file" "$CONFIG_FILE"
         if [[ "$MANUAL_MODE" -eq 0 ]]; then
             sleep 3
             local apply_cmd="$SCRIPT_SELF"
@@ -313,10 +315,13 @@ run_watch() {
             done
         fi
     elif ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
-        cp "$tmp_file" "$CONFIG_FILE"
+        mv -f "$tmp_file" "$CONFIG_FILE"
+    else
+        rm -f "$tmp_file"
     fi
 
-    rm -f "$tmp_file"
+    # 释放文件锁
+    exec 200>&-
 }
 
 main() {
