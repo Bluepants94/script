@@ -28,7 +28,6 @@ RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
 WATCH_CRON_TAG="# iptables-forward-domain"
 RESTART_CRON_TAG="# iptables-forward-restart"
 LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
-LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
 
@@ -124,6 +123,8 @@ is_valid_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
     for o in "$o1" "$o2" "$o3" "$o4"; do
+        # 拒绝前导零（如 099、01）
+        [[ "$o" =~ ^0[0-9]+ ]] && return 1
         [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
     done
     return 0
@@ -153,7 +154,7 @@ normalize_interval_var() {
     local var_name="$1"
     local val="${!var_name}"
     if [[ ! "$val" =~ ^[0-9]+$ ]] || [[ "$val" -lt 0 ]]; then
-        eval "$var_name=0"
+        printf -v "$var_name" '%s' '0'
     fi
 }
 
@@ -253,7 +254,7 @@ do_uninstall() {
     remove_all_custom_chains
 
     rm -f "$SCRIPT_INSTALL_PATH" "/usr/local/bin/iptables-forward-apply" >/dev/null 2>&1 || true
-    rm -f "$CONFIG_FILE" "$LOCK_FILE" >/dev/null 2>&1 || true
+    rm -f "$CONFIG_FILE" >/dev/null 2>&1 || true
     rm -rf "$CONFIG_DIR" >/dev/null 2>&1 || true
 
     set_last_result "success" "移除完成：已清理脚本相关文件、cron 任务与自定义链"
@@ -303,7 +304,12 @@ read_global_settings_from_config() {
     local val
     for key in GLOBAL_WATCH_ENABLED GLOBAL_WATCH_INTERVAL_MINUTES GLOBAL_RESTART_INTERVAL_MINUTES; do
         val=$(grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-        [[ -n "$val" ]] && eval "$key='$val'"
+        if [[ -n "$val" ]]; then
+            # 安全校验：仅接受纯数字，防止注入
+            if [[ "$val" =~ ^[0-9]+$ ]]; then
+                printf -v "$key" '%s' "$val"
+            fi
+        fi
     done
     normalize_global_settings
 }
@@ -521,7 +527,8 @@ load_rules() {
 save_rules() {
     normalize_global_settings
 
-    cat > "$CONFIG_FILE" <<EOF_CONF
+    {
+        cat <<EOF_CONF
 # iptables 端口转发规则配置
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
@@ -534,19 +541,20 @@ GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
-    for ((i=0; i<${#rules_src_port[@]}; i++)); do
-        local d_resolved="${rules_resolved_ip[$i]:-${rules_dst_ip[$i]}}"
-        local d_interval="${rules_check_interval[$i]}"
-        local d_last="${rules_last_check_ts[$i]}"
-        local d_is_domain="${rules_is_domain[$i]}"
+        for ((i=0; i<${#rules_src_port[@]}; i++)); do
+            local d_resolved="${rules_resolved_ip[$i]:-${rules_dst_ip[$i]}}"
+            local d_interval="${rules_check_interval[$i]}"
+            local d_last="${rules_last_check_ts[$i]}"
+            local d_is_domain="${rules_is_domain[$i]}"
 
-        [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-        [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
-        [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
-        [[ "$d_is_domain" == "1" ]] || d_is_domain=0
+            [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
+            [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
+            [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
+            [[ "$d_is_domain" == "1" ]] || d_is_domain=0
 
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$CONFIG_FILE"
-    done
+            echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}"
+        done
+    } > "$CONFIG_FILE"
 }
 
 # ---------- 应用 iptables 规则 ----------
@@ -714,7 +722,7 @@ do_add() {
         fi
         if is_valid_domain "$dst_host"; then
             is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-            resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
+            resolved_ip=$(resolve_domain_ipv4_once "$dst_host") || resolved_ip=""
             if ! is_valid_ipv4 "$resolved_ip"; then
                 print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
             fi
@@ -739,8 +747,10 @@ do_add() {
             if [[ "$src_len" -eq "$dst_len" ]]; then
                 dst_port="$dst_port_input"; break
             fi
+            print_error "源端口段与目标端口段长度不一致（源=${src_len}，目标=${dst_len}），请重新输入！"
+            continue
         fi
-        print_error "输入无效，请重新输入！"
+        print_error "源端口与目标端口类型需匹配（同为单端口或同为端口段），请重新输入！"
     done
 
     # 选择协议
@@ -933,13 +943,14 @@ show_menu() {
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
     echo -e "  ${CYAN}4)${NC} 域名解析间隔"
-    echo -e "  ${YELLOW}5)${NC} 开机自启管理"
-    echo -e "  ${BLUE}6)${NC} 更新脚本文件"
-    echo -e "  ${RED}7)${NC} 移除脚本"
+    echo -e "  ${CYAN}5)${NC} 自动重启间隔"
+    echo -e "  ${YELLOW}6)${NC} 开机自启管理"
+    echo -e "  ${BLUE}7)${NC} 更新脚本文件"
+    echo -e "  ${RED}8)${NC} 移除脚本"
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    choice=$(read_menu_choice "请选择操作 [0-7]: " '^[0-7]$')
+    choice=$(read_menu_choice "请选择操作 [0-8]: " '^[0-8]$')
 }
 
 # ---------- 主入口 ----------
@@ -953,11 +964,12 @@ main() {
         case "$choice" in
             1) do_add ;;
             2) do_delete ;;
-            3) do_interval_manage "restart" "重启 iptables 转发" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            3) do_restart ;;
             4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
-            5) do_autostart ;;
-            6) do_update ;;
-            7) do_uninstall ;;
+            5) do_interval_manage "restart" "自动重启间隔" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            6) do_autostart ;;
+            7) do_update ;;
+            8) do_uninstall ;;
             0) echo ""; print_info "再见！"; exit 0 ;;
         esac
     done
