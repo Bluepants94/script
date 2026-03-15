@@ -4,7 +4,7 @@
 #  nftables 端口转发统一脚本（apply + watch + quota-maintain）
 #  --apply             : 读取 rules.conf 并重建 nftables 规则（含 named quota）
 #  --watch             : 域名解析并按需触发规则重建
-#  --save-quota-state  : 持久化当前 quota 已用流量到本地状态文件
+#  --save-quota-state  : 持久化当前 counter 已用流量到本地状态文件
 #  --maintain          : 到期清理 + 周期重置（必要时触发重建）
 # ============================================================
 
@@ -39,6 +39,8 @@ rules_quota_bytes=()
 declare -A QUOTA_USED_MAP
 declare -A QUOTA_OBJ_ADDED_IP
 declare -A QUOTA_OBJ_ADDED_IP6
+declare -A COUNTER_OBJ_ADDED_IP
+declare -A COUNTER_OBJ_ADDED_IP6
 
 log_watch() {
     command -v logger >/dev/null 2>&1 && logger -t nftables-forward "$1"
@@ -74,6 +76,11 @@ sanitize_rule_id() {
 quota_name_by_rule_id() {
     local rid="$1"
     echo "q_$(sanitize_rule_id "$rid")"
+}
+
+counter_name_by_rule_id() {
+    local rid="$1"
+    echo "c_$(sanitize_rule_id "$rid")"
 }
 
 read_global_watch_enabled() {
@@ -188,6 +195,8 @@ init_ruleset_base() {
     NFT_RULE_LINES=()
     QUOTA_OBJ_ADDED_IP=()
     QUOTA_OBJ_ADDED_IP6=()
+    COUNTER_OBJ_ADDED_IP=()
+    COUNTER_OBJ_ADDED_IP6=()
 
     # --- nat 表（DNAT + masquerade）---
     append_nft_line "add table ip ${TABLE_NAME}"
@@ -238,6 +247,21 @@ ensure_quota_obj() {
     fi
 }
 
+ensure_counter_obj() {
+    local family="$1" cname="$2"
+
+    if [[ "$family" == "ip" ]]; then
+        [[ -n "${COUNTER_OBJ_ADDED_IP[$cname]}" ]] && return 0
+        COUNTER_OBJ_ADDED_IP[$cname]=1
+    else
+        [[ -n "${COUNTER_OBJ_ADDED_IP6[$cname]}" ]] && return 0
+        COUNTER_OBJ_ADDED_IP6[$cname]=1
+    fi
+
+    # counter 对象放在 filter 表中，供 forward 规则引用
+    append_nft_line "add counter ${family} ${FILTER_TABLE_NAME} ${cname}"
+}
+
 add_single_nft_rule() {
     local family="$1" listen_ip="$2" proto="$3" dport="$4" dnat_target="$5"
     local line="add rule ${family} ${TABLE_NAME} ${CHAIN_PRE} "
@@ -258,15 +282,19 @@ add_filter_quota_drop_rules() {
     # 1) 正向：客户端 -> 后端（daddr/dport）
     # 2) 反向：后端 -> 客户端（saddr/sport）
     # 这样可覆盖双向流量统计，避免仅统计单向导致配额显示偏小。
-    local family="$1" proto="$2" dst_ip="$3" dst_port="$4" quota_name="$5"
+    local family="$1" proto="$2" dst_ip="$3" dst_port="$4" quota_name="$5" counter_name="$6"
     [[ -z "$quota_name" ]] && return 0
 
     local addr_kw="ip"
     [[ "$family" == "ip6" ]] && addr_kw="ip6"
 
-    # 兼容写法：quota name "xxx" over
+    # 方案：保留 quota 做超额阻断，同时用 named counter 记录已放行流量
+    # 先做 over/drop，再计数；超额被 drop 的包不会进入 counter。
     append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} daddr ${dst_ip} ${proto} dport ${dst_port} quota name \"${quota_name}\" over drop"
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} daddr ${dst_ip} ${proto} dport ${dst_port} counter name \"${counter_name}\""
+
     append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} saddr ${dst_ip} ${proto} sport ${dst_port} quota name \"${quota_name}\" over drop"
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} saddr ${dst_ip} ${proto} sport ${dst_port} counter name \"${counter_name}\""
 }
 
 add_nft_rule() {
@@ -278,10 +306,12 @@ add_nft_rule() {
         dst_target_ip="[${dst_ip}]"
     fi
 
-    local quota_name=""
+    local quota_name="" counter_name=""
     if [[ "$q_enable" == "1" && "$q_bytes" -gt 0 ]]; then
         quota_name=$(quota_name_by_rule_id "$rid")
+        counter_name=$(counter_name_by_rule_id "$rid")
         ensure_quota_obj "$family" "$quota_name" "$q_bytes" "${QUOTA_USED_MAP[$rid]:-0}"
+        ensure_counter_obj "$family" "$counter_name"
     fi
 
     local src_meta dst_meta
@@ -295,7 +325,7 @@ add_nft_rule() {
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
         add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}"
-        add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name"
+        add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name" "$counter_name"
         return
     fi
 
@@ -304,7 +334,7 @@ add_nft_rule() {
         [[ "$src_len" -gt 1000 ]] && return 1
         for ((offset=0; offset<src_len; offset++)); do
             add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
-            add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name"
+            add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name" "$counter_name"
         done
         return
     fi
@@ -354,12 +384,12 @@ run_apply() {
     return 0
 }
 
-get_quota_used_bytes() {
-    local family="$1" qname="$2"
+get_counter_used_bytes() {
+    local family="$1" cname="$2"
     local out used
-    # quota 对象现在位于 filter 表
-    out=$(nft list quota "$family" "$FILTER_TABLE_NAME" "$qname" 2>/dev/null || true)
-    used=$(echo "$out" | grep -oE 'used[[:space:]]+[0-9]+[[:space:]]+bytes' | head -n1 | grep -oE '[0-9]+' | head -n1)
+    # counter 对象位于 filter 表
+    out=$(nft list counter "$family" "$FILTER_TABLE_NAME" "$cname" 2>/dev/null || true)
+    used=$(echo "$out" | grep -oE 'bytes[[:space:]]+[0-9]+' | head -n1 | grep -oE '[0-9]+' | head -n1)
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
     echo "$used"
 }
@@ -373,7 +403,7 @@ run_save_quota_state() {
     now=$(date +%s)
     : > "$tmp_file"
 
-    local i rid q_enable q_bytes qname family used
+    local i rid q_enable q_bytes qname cname family used
     declare -A seen
     for ((i=0; i<${#rules_id[@]}; i++)); do
         rid="${rules_id[$i]}"
@@ -382,11 +412,12 @@ run_save_quota_state() {
         [[ "$q_enable" == "1" && "$q_bytes" -gt 0 ]] || continue
 
         qname=$(quota_name_by_rule_id "$rid")
+        cname=$(counter_name_by_rule_id "$rid")
         [[ -n "${seen[$rid]}" ]] && continue
         seen[$rid]=1
 
         if is_valid_ipv6 "${rules_resolved_ip[$i]}"; then family="ip6"; else family="ip"; fi
-        used=$(get_quota_used_bytes "$family" "$qname")
+        used=$(get_counter_used_bytes "$family" "$cname")
         echo "${rid}|${qname}|${used}|${now}" >> "$tmp_file"
     done
 
