@@ -17,6 +17,8 @@ QUOTA_STATE_FILE="${CONFIG_DIR}/quota.state"
 CHAIN_PRE="NFTFWD-PRE"
 CHAIN_POST="NFTFWD-POST"
 TABLE_NAME="nftfwd"
+FILTER_TABLE_NAME="nftfwd_filter"
+FILTER_CHAIN_FWD="NFTFWD-FWD"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
 GLOBAL_WATCH_ENABLED=1
@@ -172,6 +174,8 @@ load_rules_for_apply() {
 
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "$FILTER_TABLE_NAME" >/dev/null 2>&1 || true
+    nft delete table ip6 "$FILTER_TABLE_NAME" >/dev/null 2>&1 || true
     nft delete table ip "$TABLE_NAME" >/dev/null 2>&1 || true
     nft delete table ip6 "$TABLE_NAME" >/dev/null 2>&1 || true
 }
@@ -185,6 +189,7 @@ init_ruleset_base() {
     QUOTA_OBJ_ADDED_IP=()
     QUOTA_OBJ_ADDED_IP6=()
 
+    # --- nat 表（DNAT + masquerade）---
     append_nft_line "add table ip ${TABLE_NAME}"
     append_nft_line "add chain ip ${TABLE_NAME} prerouting { type nat hook prerouting priority dstnat; policy accept; }"
     append_nft_line "add chain ip ${TABLE_NAME} postrouting { type nat hook postrouting priority srcnat; policy accept; }"
@@ -202,6 +207,13 @@ init_ruleset_base() {
     append_nft_line "add rule ip6 ${TABLE_NAME} prerouting jump ${CHAIN_PRE}"
     append_nft_line "add rule ip6 ${TABLE_NAME} postrouting jump ${CHAIN_POST}"
     append_nft_line "add rule ip6 ${TABLE_NAME} ${CHAIN_POST} ct status dnat masquerade"
+
+    # --- filter 表（quota 流量统计 + 超额阻断，forward hook 每包执行）---
+    append_nft_line "add table ip ${FILTER_TABLE_NAME}"
+    append_nft_line "add chain ip ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} { type filter hook forward priority 0; policy accept; }"
+
+    append_nft_line "add table ip6 ${FILTER_TABLE_NAME}"
+    append_nft_line "add chain ip6 ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} { type filter hook forward priority 0; policy accept; }"
 }
 
 ensure_quota_obj() {
@@ -218,10 +230,11 @@ ensure_quota_obj() {
     [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
 
+    # quota 对象放在 filter 表中，forward hook 每包计数
     if [[ "$used" -gt 0 ]]; then
-        append_nft_line "add quota ${family} ${TABLE_NAME} ${qname} { over ${bytes} bytes ; used ${used} bytes ; }"
+        append_nft_line "add quota ${family} ${FILTER_TABLE_NAME} ${qname} { over ${bytes} bytes ; used ${used} bytes ; }"
     else
-        append_nft_line "add quota ${family} ${TABLE_NAME} ${qname} { over ${bytes} bytes ; }"
+        append_nft_line "add quota ${family} ${FILTER_TABLE_NAME} ${qname} { over ${bytes} bytes ; }"
     fi
 }
 
@@ -240,18 +253,20 @@ add_single_nft_rule() {
     append_nft_line "$line"
 }
 
-add_single_post_quota_rule() {
+add_filter_quota_drop_rules() {
+    # 在 filter forward 链中：
+    # 1) 正向：客户端 -> 后端（daddr/dport）
+    # 2) 反向：后端 -> 客户端（saddr/sport）
+    # 这样可覆盖双向流量统计，避免仅统计单向导致配额显示偏小。
     local family="$1" proto="$2" dst_ip="$3" dst_port="$4" quota_name="$5"
     [[ -z "$quota_name" ]] && return 0
 
-    local line="add rule ${family} ${TABLE_NAME} ${CHAIN_POST} ct status dnat "
-    if [[ "$family" == "ip" ]]; then
-        line+="ip saddr ${dst_ip} "
-    else
-        line+="ip6 saddr ${dst_ip} "
-    fi
-    line+="${proto} sport ${dst_port} quota name \"${quota_name}\""
-    append_nft_line "$line"
+    local addr_kw="ip"
+    [[ "$family" == "ip6" ]] && addr_kw="ip6"
+
+    # 兼容写法：quota name "xxx" over
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} daddr ${dst_ip} ${proto} dport ${dst_port} quota name \"${quota_name}\" over drop"
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} saddr ${dst_ip} ${proto} sport ${dst_port} quota name \"${quota_name}\" over drop"
 }
 
 add_nft_rule() {
@@ -280,7 +295,7 @@ add_nft_rule() {
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
         add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}"
-        add_single_post_quota_rule "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name"
+        add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name"
         return
     fi
 
@@ -289,7 +304,7 @@ add_nft_rule() {
         [[ "$src_len" -gt 1000 ]] && return 1
         for ((offset=0; offset<src_len; offset++)); do
             add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
-            add_single_post_quota_rule "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name"
+            add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name"
         done
         return
     fi
@@ -342,7 +357,8 @@ run_apply() {
 get_quota_used_bytes() {
     local family="$1" qname="$2"
     local out used
-    out=$(nft list quota "$family" "$TABLE_NAME" "$qname" 2>/dev/null || true)
+    # quota 对象现在位于 filter 表
+    out=$(nft list quota "$family" "$FILTER_TABLE_NAME" "$qname" 2>/dev/null || true)
     used=$(echo "$out" | grep -oE 'used[[:space:]]+[0-9]+[[:space:]]+bytes' | head -n1 | grep -oE '[0-9]+' | head -n1)
     [[ "$used" =~ ^[0-9]+$ ]] || used=0
     echo "$used"

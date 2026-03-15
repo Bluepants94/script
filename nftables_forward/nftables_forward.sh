@@ -246,6 +246,8 @@ sync_cron_tasks_from_config() {
 # ---------- 自定义表清理 ----------
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "nftfwd_filter" >/dev/null 2>&1 || true
+    nft delete table ip6 "nftfwd_filter" >/dev/null 2>&1 || true
     nft delete table ip "nftfwd" >/dev/null 2>&1 || true
     nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
 }
@@ -780,6 +782,10 @@ print_rules_home_style() {
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
         echo -e "  ${YELLOW}(暂无转发规则)${NC}"; return
     fi
+    # 展示前尽量刷新一次 quota 状态，减少页面显示与 nft 实时值不一致
+    if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
+        "$SCRIPT_INSTALL_PATH" --save-quota-state >/dev/null 2>&1 || true
+    fi
     load_quota_used_display_map
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local proto_str mark=""
@@ -792,7 +798,12 @@ print_rules_home_style() {
             local used_gb
             used_gb=$(format_bytes_to_gb_2f "$used_bytes")
             quota_mark=" [流量:${used_gb}/${q_gb}G]"
-            reset_mark=" [重置:${rules_reset_days[$i]:-30}天]"
+            local rd="${rules_reset_days[$i]:-30}"
+            if [[ "$rd" -eq 0 ]]; then
+                reset_mark=" [重置:不重置]"
+            else
+                reset_mark=" [重置:${rd}天]"
+            fi
         fi
         if [[ "${rules_expire_ts[$i]:-0}" -gt 0 ]]; then
             expire_mark=" [到期:$(date -d @"${rules_expire_ts[$i]}" +%F 2>/dev/null || echo ${rules_expire_ts[$i]})]"
@@ -908,28 +919,31 @@ do_add() {
             print_error "输入无效，请输入正整数或回车跳过。"
         done
 
-        while true; do
-            read -r -p "请输入转发规则有效期 (回车默认: 空，即长期有效不限制，单位: 天): " expire_days_input
-            if [[ -z "$expire_days_input" ]]; then
-                expire_days="0"; expire_ts="0"; break
-            fi
-            if [[ "$expire_days_input" =~ ^[0-9]+$ ]] && [[ "$expire_days_input" -gt 0 ]]; then
-                expire_days="$expire_days_input"
-                expire_ts=$((now_ts + expire_days_input * 86400))
-                break
-            fi
-            print_error "输入无效，请输入正整数天数或回车跳过。"
-        done
+        # 只有当流量限制实际启用时，才询问有效期和重置周期
+        if [[ "$quota_enable" == "1" ]]; then
+            while true; do
+                read -r -p "请输入转发规则有效期 (回车默认: 空，即长期有效不限制，单位: 天): " expire_days_input
+                if [[ -z "$expire_days_input" ]]; then
+                    expire_days="0"; expire_ts="0"; break
+                fi
+                if [[ "$expire_days_input" =~ ^[0-9]+$ ]] && [[ "$expire_days_input" -gt 0 ]]; then
+                    expire_days="$expire_days_input"
+                    expire_ts=$((now_ts + expire_days_input * 86400))
+                    break
+                fi
+                print_error "输入无效，请输入正整数天数或回车跳过。"
+            done
 
-        while true; do
-            read -r -p "请输入流量重置间隔周期 (回车默认: 30，单位: 天): " reset_days_input
-            reset_days_input=${reset_days_input:-30}
-            if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -ge 0 ]]; then
-                reset_days="$reset_days_input"
-                break
-            fi
-            print_error "输入无效，请输入非负整数天数。"
-        done
+            while true; do
+                read -r -p "请输入流量重置间隔周期 (回车默认: 30，单位: 天): " reset_days_input
+                reset_days_input=${reset_days_input:-30}
+                if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -ge 0 ]]; then
+                    reset_days="$reset_days_input"
+                    break
+                fi
+                print_error "输入无效，请输入非负整数天数。"
+            done
+        fi
     fi
 
     echo ""
