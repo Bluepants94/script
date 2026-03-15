@@ -924,11 +924,11 @@ do_add() {
         while true; do
             read -r -p "请输入流量重置间隔周期 (回车默认: 30，单位: 天): " reset_days_input
             reset_days_input=${reset_days_input:-30}
-            if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -gt 0 ]]; then
+            if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -ge 0 ]]; then
                 reset_days="$reset_days_input"
                 break
             fi
-            print_error "输入无效，请输入正整数天数。"
+            print_error "输入无效，请输入非负整数天数。"
         done
     fi
 
@@ -949,7 +949,11 @@ do_add() {
         else
             echo -e "  有效期:   ${CYAN}长期有效${NC}"
         fi
-        echo -e "  重置周期: ${CYAN}${reset_days} 天${NC}"
+        if [[ "$reset_days" -eq 0 ]]; then
+            echo -e "  重置周期: ${CYAN}不重置${NC}"
+        else
+            echo -e "  重置周期: ${CYAN}${reset_days} 天${NC}"
+        fi
     else
         echo -e "  流量限制: ${YELLOW}不限制${NC}"
     fi
