@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
 # ============================================================
-#  nftables 端口转发统一脚本（apply + watch）
-#  --apply : 读取 rules.conf 并重建 nftables 规则
-#  --watch : 解析域名并按需触发规则重建
+#  nftables 端口转发统一脚本（apply + watch + quota-maintain）
+#  --apply             : 读取 rules.conf 并重建 nftables 规则（含 named quota）
+#  --watch             : 域名解析并按需触发规则重建
+#  --save-quota-state  : 持久化当前 counter 已用流量到本地状态文件
+#  --maintain          : 到期清理 + 周期重置（必要时触发重建）
 # ============================================================
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
@@ -11,15 +13,34 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH
 CONFIG_DIR="/etc/nftables-forward"
 CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
+QUOTA_STATE_FILE="${CONFIG_DIR}/quota.state"
 CHAIN_PRE="NFTFWD-PRE"
 CHAIN_POST="NFTFWD-POST"
 TABLE_NAME="nftfwd"
+FILTER_TABLE_NAME="nftfwd_filter"
+FILTER_CHAIN_FWD="NFTFWD-FWD"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
 GLOBAL_WATCH_ENABLED=1
 MANUAL_MODE=0
 change_records=()
 NFT_RULE_LINES=()
+
+# apply 用规则数组
+rules_listen_ip=()
+rules_src_port=()
+rules_dst_port=()
+rules_resolved_ip=()
+rules_proto=()
+rules_id=()
+rules_quota_enable=()
+rules_quota_bytes=()
+
+declare -A QUOTA_USED_MAP
+declare -A QUOTA_OBJ_ADDED_IP
+declare -A QUOTA_OBJ_ADDED_IP6
+declare -A COUNTER_OBJ_ADDED_IP
+declare -A COUNTER_OBJ_ADDED_IP6
 
 log_watch() {
     command -v logger >/dev/null 2>&1 && logger -t nftables-forward "$1"
@@ -43,6 +64,23 @@ is_valid_ipv6() {
 
 is_valid_ip() {
     is_valid_ipv4 "$1" || is_valid_ipv6 "$1"
+}
+
+sanitize_rule_id() {
+    local rid="$1"
+    rid=$(echo "$rid" | tr -c 'a-zA-Z0-9_' '_')
+    [[ -z "$rid" ]] && rid="r_unknown"
+    echo "$rid"
+}
+
+quota_name_by_rule_id() {
+    local rid="$1"
+    echo "q_$(sanitize_rule_id "$rid")"
+}
+
+counter_name_by_rule_id() {
+    local rid="$1"
+    echo "c_$(sanitize_rule_id "$rid")"
 }
 
 read_global_watch_enabled() {
@@ -84,43 +122,67 @@ parse_port_expr() {
     return 1
 }
 
-# ---------- apply 用规则数组 ----------
-rules_listen_ip=()
-rules_src_port=()
-rules_dst_port=()
-rules_resolved_ip=()
-rules_proto=()
+load_quota_state_map() {
+    QUOTA_USED_MAP=()
+    [[ -f "$QUOTA_STATE_FILE" ]] || return 0
+
+    local rid qname used saved
+    while IFS='|' read -r rid qname used saved; do
+        [[ -z "$rid" || "$rid" == \#* ]] && continue
+        [[ "$used" =~ ^[0-9]+$ ]] || used=0
+        QUOTA_USED_MAP["$rid"]="$used"
+    done < "$QUOTA_STATE_FILE"
+}
 
 load_rules_for_apply() {
     [[ -f "$CONFIG_FILE" ]] || return 1
 
-    rules_listen_ip=(); rules_src_port=(); rules_dst_port=()
-    rules_resolved_ip=(); rules_proto=()
+    rules_listen_ip=(); rules_src_port=(); rules_dst_port=(); rules_resolved_ip=(); rules_proto=()
+    rules_id=(); rules_quota_enable=(); rules_quota_bytes=()
 
-    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17; do
         [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]] && continue
 
-        local listen_ip src_port dst_port resolved proto
+        local listen_ip src_port dst_port resolved proto rid quota_enable quota_bytes
 
-        if [[ -n "$c9" ]]; then
+        if [[ -n "$c17" ]]; then
             listen_ip="$c1"; src_port="$c2"; dst_port="$c4"; proto="$c5"
             resolved="$c6"; is_valid_ip "$resolved" || resolved="$c3"
+            rid="$c10"; quota_enable="$c11"; quota_bytes="$c12"
+        elif [[ -n "$c9" ]]; then
+            listen_ip="$c1"; src_port="$c2"; dst_port="$c4"; proto="$c5"
+            resolved="$c6"; is_valid_ip "$resolved" || resolved="$c3"
+            rid="r_legacy_${RANDOM}_$(date +%s%N)"; quota_enable=0; quota_bytes=0
         elif [[ -n "$c5" ]]; then
             listen_ip="$c1"; src_port="$c2"; dst_port="$c4"; proto="$c5"; resolved="$c3"
+            rid="r_legacy_${RANDOM}_$(date +%s%N)"; quota_enable=0; quota_bytes=0
         elif [[ -n "$c4" ]]; then
             listen_ip="0.0.0.0"; src_port="$c1"; dst_port="$c3"; proto="$c4"; resolved="$c2"
+            rid="r_legacy_${RANDOM}_$(date +%s%N)"; quota_enable=0; quota_bytes=0
         else
             continue
         fi
 
         is_valid_ip "$resolved" || continue
-        rules_listen_ip+=("$listen_ip"); rules_src_port+=("$src_port")
-        rules_dst_port+=("$dst_port"); rules_resolved_ip+=("$resolved"); rules_proto+=("$proto")
+        [[ "$quota_enable" == "1" ]] || quota_enable=0
+        [[ "$quota_bytes" =~ ^[0-9]+$ ]] || quota_bytes=0
+        [[ -n "$rid" ]] || rid="r_$(date +%s%N)_$RANDOM"
+
+        rules_listen_ip+=("$listen_ip")
+        rules_src_port+=("$src_port")
+        rules_dst_port+=("$dst_port")
+        rules_resolved_ip+=("$resolved")
+        rules_proto+=("$proto")
+        rules_id+=("$rid")
+        rules_quota_enable+=("$quota_enable")
+        rules_quota_bytes+=("$quota_bytes")
     done < "$CONFIG_FILE"
 }
 
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "$FILTER_TABLE_NAME" >/dev/null 2>&1 || true
+    nft delete table ip6 "$FILTER_TABLE_NAME" >/dev/null 2>&1 || true
     nft delete table ip "$TABLE_NAME" >/dev/null 2>&1 || true
     nft delete table ip6 "$TABLE_NAME" >/dev/null 2>&1 || true
 }
@@ -131,7 +193,12 @@ append_nft_line() {
 
 init_ruleset_base() {
     NFT_RULE_LINES=()
+    QUOTA_OBJ_ADDED_IP=()
+    QUOTA_OBJ_ADDED_IP6=()
+    COUNTER_OBJ_ADDED_IP=()
+    COUNTER_OBJ_ADDED_IP6=()
 
+    # --- nat 表（DNAT + masquerade）---
     append_nft_line "add table ip ${TABLE_NAME}"
     append_nft_line "add chain ip ${TABLE_NAME} prerouting { type nat hook prerouting priority dstnat; policy accept; }"
     append_nft_line "add chain ip ${TABLE_NAME} postrouting { type nat hook postrouting priority srcnat; policy accept; }"
@@ -149,6 +216,50 @@ init_ruleset_base() {
     append_nft_line "add rule ip6 ${TABLE_NAME} prerouting jump ${CHAIN_PRE}"
     append_nft_line "add rule ip6 ${TABLE_NAME} postrouting jump ${CHAIN_POST}"
     append_nft_line "add rule ip6 ${TABLE_NAME} ${CHAIN_POST} ct status dnat masquerade"
+
+    # --- filter 表（quota 流量统计 + 超额阻断，forward hook 每包执行）---
+    append_nft_line "add table ip ${FILTER_TABLE_NAME}"
+    append_nft_line "add chain ip ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} { type filter hook forward priority 0; policy accept; }"
+
+    append_nft_line "add table ip6 ${FILTER_TABLE_NAME}"
+    append_nft_line "add chain ip6 ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} { type filter hook forward priority 0; policy accept; }"
+}
+
+ensure_quota_obj() {
+    local family="$1" qname="$2" bytes="$3" used="$4"
+
+    if [[ "$family" == "ip" ]]; then
+        [[ -n "${QUOTA_OBJ_ADDED_IP[$qname]}" ]] && return 0
+        QUOTA_OBJ_ADDED_IP[$qname]=1
+    else
+        [[ -n "${QUOTA_OBJ_ADDED_IP6[$qname]}" ]] && return 0
+        QUOTA_OBJ_ADDED_IP6[$qname]=1
+    fi
+
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    [[ "$used" =~ ^[0-9]+$ ]] || used=0
+
+    # quota 对象放在 filter 表中，forward hook 每包计数
+    if [[ "$used" -gt 0 ]]; then
+        append_nft_line "add quota ${family} ${FILTER_TABLE_NAME} ${qname} { over ${bytes} bytes ; used ${used} bytes ; }"
+    else
+        append_nft_line "add quota ${family} ${FILTER_TABLE_NAME} ${qname} { over ${bytes} bytes ; }"
+    fi
+}
+
+ensure_counter_obj() {
+    local family="$1" cname="$2"
+
+    if [[ "$family" == "ip" ]]; then
+        [[ -n "${COUNTER_OBJ_ADDED_IP[$cname]}" ]] && return 0
+        COUNTER_OBJ_ADDED_IP[$cname]=1
+    else
+        [[ -n "${COUNTER_OBJ_ADDED_IP6[$cname]}" ]] && return 0
+        COUNTER_OBJ_ADDED_IP6[$cname]=1
+    fi
+
+    # counter 对象放在 filter 表中，供 forward 规则引用（显式 {} 提升兼容性）
+    append_nft_line "add counter ${family} ${FILTER_TABLE_NAME} ${cname} {}"
 }
 
 add_single_nft_rule() {
@@ -161,17 +272,46 @@ add_single_nft_rule() {
         [[ "$listen_ip" != "::" && "$listen_ip" != "0.0.0.0" ]] && line+="ip6 daddr ${listen_ip} "
     fi
 
-    line+="${proto} dport ${dport} dnat to ${dnat_target}"
+    line+="${proto} dport ${dport} "
+    line+="dnat to ${dnat_target}"
     append_nft_line "$line"
 }
 
+add_filter_quota_drop_rules() {
+    # 在 filter forward 链中：
+    # 1) 正向：客户端 -> 后端（daddr/dport）
+    # 2) 反向：后端 -> 客户端（saddr/sport）
+    # 这样可覆盖双向流量统计，避免仅统计单向导致配额显示偏小。
+    local family="$1" proto="$2" dst_ip="$3" dst_port="$4" quota_name="$5" counter_name="$6"
+    [[ -z "$quota_name" ]] && return 0
+
+    local addr_kw="ip"
+    [[ "$family" == "ip6" ]] && addr_kw="ip6"
+
+    # 方案：保留 quota 做超额阻断，同时用 named counter 记录已放行流量
+    # 先做 over/drop，再计数；超额被 drop 的包不会进入 counter。
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} daddr ${dst_ip} ${proto} dport ${dst_port} quota name ${quota_name} over drop"
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} daddr ${dst_ip} ${proto} dport ${dst_port} counter name ${counter_name}"
+
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} saddr ${dst_ip} ${proto} sport ${dst_port} quota name ${quota_name} over drop"
+    append_nft_line "add rule ${family} ${FILTER_TABLE_NAME} ${FILTER_CHAIN_FWD} ${addr_kw} saddr ${dst_ip} ${proto} sport ${dst_port} counter name ${counter_name}"
+}
+
 add_nft_rule() {
-    local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
+    local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5" rid="$6" q_enable="$7" q_bytes="$8"
 
     local family="ip" dst_target_ip="$dst_ip"
     if is_valid_ipv6 "$dst_ip"; then
         family="ip6"
         dst_target_ip="[${dst_ip}]"
+    fi
+
+    local quota_name="" counter_name=""
+    if [[ "$q_enable" == "1" && "$q_bytes" -gt 0 ]]; then
+        quota_name=$(quota_name_by_rule_id "$rid")
+        counter_name=$(counter_name_by_rule_id "$rid")
+        ensure_quota_obj "$family" "$quota_name" "$q_bytes" "${QUOTA_USED_MAP[$rid]:-0}"
+        ensure_counter_obj "$family" "$counter_name"
     fi
 
     local src_meta dst_meta
@@ -185,17 +325,16 @@ add_nft_rule() {
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
         add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}"
+        add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name" "$counter_name"
         return
     fi
 
     if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
         local src_len=$(( src_end - src_start + 1 ))
-        if [[ "$src_len" -gt 1000 ]]; then
-            echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
-            return 1
-        fi
+        [[ "$src_len" -gt 1000 ]] && return 1
         for ((offset=0; offset<src_len; offset++)); do
             add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
+            add_filter_quota_drop_rules "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name" "$counter_name"
         done
         return
     fi
@@ -208,6 +347,7 @@ run_apply() {
         { echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || return 1; }
 
     load_rules_for_apply
+    load_quota_state_map
     remove_all_custom_tables
     init_ruleset_base
 
@@ -215,14 +355,15 @@ run_apply() {
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local listen_ip="${rules_listen_ip[$i]}" src_port="${rules_src_port[$i]}"
         local dst_ip="${rules_resolved_ip[$i]}" dst_port="${rules_dst_port[$i]}"
-        local proto="${rules_proto[$i]}"
+        local proto="${rules_proto[$i]}" rid="${rules_id[$i]}"
+        local q_enable="${rules_quota_enable[$i]}" q_bytes="${rules_quota_bytes[$i]}"
 
         case "$proto" in
-            tcp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++)) ;;
-            udp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++)) ;;
+            tcp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" "$rid" "$q_enable" "$q_bytes" || ((fail_count++)) ;;
+            udp)  add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" "$rid" "$q_enable" "$q_bytes" || ((fail_count++)) ;;
             both)
-                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" || ((fail_count++))
-                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" || ((fail_count++))
+                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "tcp" "$rid" "$q_enable" "$q_bytes" || ((fail_count++))
+                add_nft_rule "$listen_ip" "$src_port" "$dst_ip" "$dst_port" "udp" "$rid" "$q_enable" "$q_bytes" || ((fail_count++))
                 ;;
         esac
     done
@@ -243,6 +384,153 @@ run_apply() {
     return 0
 }
 
+get_counter_used_bytes() {
+    local family="$1" cname="$2"
+    local out used
+    # counter 对象位于 filter 表
+    out=$(nft list counter "$family" "$FILTER_TABLE_NAME" "$cname" 2>/dev/null || true)
+    used=$(echo "$out" | grep -oE 'bytes[[:space:]]+[0-9]+' | head -n1 | grep -oE '[0-9]+' | head -n1)
+    if [[ -z "$used" ]]; then
+        used=$(echo "$out" | grep -oE 'counter[[:space:]]+[^\{]+\{[^\}]*bytes[[:space:]]+[0-9]+' | head -n1 | grep -oE 'bytes[[:space:]]+[0-9]+' | grep -oE '[0-9]+' | head -n1)
+    fi
+    [[ "$used" =~ ^[0-9]+$ ]] || used=0
+    echo "$used"
+}
+
+run_save_quota_state() {
+    mkdir -p "$CONFIG_DIR"
+    load_rules_for_apply
+
+    local tmp_file now
+    tmp_file="${QUOTA_STATE_FILE}.tmp.$$"
+    now=$(date +%s)
+    : > "$tmp_file"
+
+    local i rid q_enable q_bytes qname cname family used
+    declare -A seen
+    for ((i=0; i<${#rules_id[@]}; i++)); do
+        rid="${rules_id[$i]}"
+        q_enable="${rules_quota_enable[$i]}"
+        q_bytes="${rules_quota_bytes[$i]}"
+        [[ "$q_enable" == "1" && "$q_bytes" -gt 0 ]] || continue
+
+        qname=$(quota_name_by_rule_id "$rid")
+        cname=$(counter_name_by_rule_id "$rid")
+        [[ -n "${seen[$rid]}" ]] && continue
+        seen[$rid]=1
+
+        if is_valid_ipv6 "${rules_resolved_ip[$i]}"; then family="ip6"; else family="ip"; fi
+        used=$(get_counter_used_bytes "$family" "$cname")
+        echo "${rid}|${qname}|${used}|${now}" >> "$tmp_file"
+    done
+
+    mv -f "$tmp_file" "$QUOTA_STATE_FILE"
+}
+
+rewrite_quota_state_with_keep_and_resets() {
+    local keep_csv="$1" reset_csv="$2"
+    local tmp_file="${QUOTA_STATE_FILE}.tmp.$$"
+    local now
+    now=$(date +%s)
+
+    : > "$tmp_file"
+    if [[ -f "$QUOTA_STATE_FILE" ]]; then
+        local rid qname used ts
+        while IFS='|' read -r rid qname used ts; do
+            [[ -z "$rid" || "$rid" == \#* ]] && continue
+            [[ ",$keep_csv," == *",$rid,"* ]] || continue
+            [[ "$used" =~ ^[0-9]+$ ]] || used=0
+            if [[ ",$reset_csv," == *",$rid,"* ]]; then
+                used=0
+                ts="$now"
+            fi
+            [[ -n "$qname" ]] || qname=$(quota_name_by_rule_id "$rid")
+            echo "${rid}|${qname}|${used}|${ts}" >> "$tmp_file"
+        done < "$QUOTA_STATE_FILE"
+    fi
+
+    mv -f "$tmp_file" "$QUOTA_STATE_FILE"
+}
+
+run_maintain() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    exec 201>"$LOCK_FILE"
+    flock -n 201 || return 0
+
+    local tmp_file raw_line now changed
+    tmp_file=$(mktemp)
+    now=$(date +%s)
+    changed=0
+
+    local keep_ids=()
+    local reset_ids=()
+
+    while IFS= read -r raw_line; do
+        IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17 <<< "$raw_line"
+
+        if [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]]; then
+            printf '%s\n' "$raw_line" >> "$tmp_file"
+            continue
+        fi
+
+        local listen_ip="$c1" src_port="$c2" dst_host="$c3" dst_port="$c4" proto="$c5"
+        local resolved_ip="$c6" check_interval="$c7" last_check_ts="$c8" is_domain="$c9"
+        local rid="$c10" q_enable="$c11" q_bytes="$c12" expire_days="$c13" expire_ts="$c14" reset_days="$c15" last_reset_ts="$c16" created_ts="$c17"
+
+        [[ -n "$created_ts" ]] || created_ts="$now"
+        [[ -n "$rid" ]] || rid="r_$(date +%s%N)_$RANDOM"
+        [[ "$q_enable" == "1" ]] || q_enable=0
+        [[ "$q_bytes" =~ ^[0-9]+$ ]] || q_bytes=0
+        [[ "$expire_days" =~ ^[0-9]+$ ]] || expire_days=0
+        [[ "$expire_ts" =~ ^[0-9]+$ ]] || expire_ts=0
+        [[ "$reset_days" =~ ^[0-9]+$ ]] || reset_days=30
+        [[ "$last_reset_ts" =~ ^[0-9]+$ ]] || last_reset_ts=0
+
+        if [[ "$q_enable" == "1" && "$expire_ts" -gt 0 && "$now" -ge "$expire_ts" ]]; then
+            changed=1
+            continue
+        fi
+
+        if [[ "$q_enable" == "1" && "$reset_days" -gt 0 ]]; then
+            local need_reset=0
+            if [[ "$last_reset_ts" -le 0 ]]; then
+                need_reset=1
+            elif (( now - last_reset_ts >= reset_days * 86400 )); then
+                need_reset=1
+            fi
+
+            if [[ "$need_reset" -eq 1 ]]; then
+                last_reset_ts="$now"
+                reset_ids+=("$rid")
+                changed=1
+            fi
+        fi
+
+        keep_ids+=("$rid")
+        echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}|${rid}|${q_enable}|${q_bytes}|${expire_days}|${expire_ts}|${reset_days}|${last_reset_ts}|${created_ts}" >> "$tmp_file"
+    done < "$CONFIG_FILE"
+
+    if [[ "$changed" -eq 1 ]] || ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
+        mv -f "$tmp_file" "$CONFIG_FILE"
+    else
+        rm -f "$tmp_file"
+    fi
+
+    local keep_csv reset_csv
+    keep_csv=$(IFS=','; echo "${keep_ids[*]}")
+    reset_csv=$(IFS=','; echo "${reset_ids[*]}")
+    rewrite_quota_state_with_keep_and_resets "$keep_csv" "$reset_csv"
+
+    if [[ "$changed" -eq 1 ]]; then
+        local apply_cmd="$SCRIPT_SELF"
+        [[ -x "$apply_cmd" ]] || apply_cmd="/usr/local/bin/nftables-forward"
+        "$apply_cmd" --apply >/dev/null 2>&1 || true
+    fi
+
+    exec 201>&-
+}
+
 run_watch() {
     [[ -f "$CONFIG_FILE" ]] || return 0
     read_global_watch_enabled
@@ -258,7 +546,8 @@ run_watch() {
     changed=0
 
     while IFS= read -r raw_line; do
-        IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<< "$raw_line"
+        IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17 <<< "$raw_line"
+
         if [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]]; then
             printf '%s\n' "$raw_line" >> "$tmp_file"
             continue
@@ -266,9 +555,18 @@ run_watch() {
 
         local listen_ip="$c1" src_port="$c2" dst_host="$c3" dst_port="$c4" proto="$c5"
         local resolved_ip="$c6" check_interval="$c7" last_check_ts="$c8" is_domain="$c9"
+        local rid="$c10" q_enable="$c11" q_bytes="$c12" expire_days="$c13" expire_ts="$c14" reset_days="$c15" last_reset_ts="$c16" created_ts="$c17"
 
         [[ "$check_interval" =~ ^[0-9]+$ ]] || check_interval=0
         [[ "$last_check_ts" =~ ^[0-9]+$ ]] || last_check_ts=0
+        [[ -n "$rid" ]] || rid="r_$(date +%s%N)_$RANDOM"
+        [[ "$q_enable" == "1" ]] || q_enable=0
+        [[ "$q_bytes" =~ ^[0-9]+$ ]] || q_bytes=0
+        [[ "$expire_days" =~ ^[0-9]+$ ]] || expire_days=0
+        [[ "$expire_ts" =~ ^[0-9]+$ ]] || expire_ts=0
+        [[ "$reset_days" =~ ^[0-9]+$ ]] || reset_days=30
+        [[ "$last_reset_ts" =~ ^[0-9]+$ ]] || last_reset_ts=0
+        [[ "$created_ts" =~ ^[0-9]+$ ]] || created_ts="$now"
 
         if [[ "$is_domain" == "1" ]]; then
             [[ "$check_interval" -le 0 ]] && check_interval=300
@@ -291,13 +589,13 @@ run_watch() {
             fi
         fi
 
-        echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}" >> "$tmp_file"
+        echo "${listen_ip}|${src_port}|${dst_host}|${dst_port}|${proto}|${resolved_ip}|${check_interval}|${last_check_ts}|${is_domain}|${rid}|${q_enable}|${q_bytes}|${expire_days}|${expire_ts}|${reset_days}|${last_reset_ts}|${created_ts}" >> "$tmp_file"
     done < "$CONFIG_FILE"
 
     if [[ "$changed" -eq 1 ]]; then
         mv -f "$tmp_file" "$CONFIG_FILE"
         if [[ "$MANUAL_MODE" -eq 0 ]]; then
-            sleep 3
+            sleep 1
             local apply_cmd="$SCRIPT_SELF"
             [[ -x "$apply_cmd" ]] || apply_cmd="/usr/local/bin/nftables-forward"
 
@@ -320,7 +618,6 @@ run_watch() {
         rm -f "$tmp_file"
     fi
 
-    # 释放文件锁
     exec 200>&-
 }
 
@@ -328,6 +625,9 @@ main() {
     local mode="apply"
     case "${1:-}" in
         --watch) mode="watch" ;;
+        --save-quota-state) mode="save_quota" ;;
+        --maintain) mode="maintain" ;;
+        --apply|"") mode="apply" ;;
         *) mode="apply" ;;
     esac
 
@@ -343,11 +643,14 @@ main() {
         return 1
     fi
 
-    if [[ "$mode" == "watch" ]]; then
-        run_watch
-    else
-        run_apply
-    fi
+    mkdir -p "$CONFIG_DIR"
+
+    case "$mode" in
+        watch) run_watch ;;
+        save_quota) run_save_quota_state ;;
+        maintain) run_maintain ;;
+        apply) run_apply ;;
+    esac
 }
 
 main "$@"
