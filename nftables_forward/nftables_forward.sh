@@ -27,8 +27,11 @@ RAW_SCRIPT_COMPAT_URL="${RAW_BASE_URL}/nftables-forward-apply"
 RAW_SERVICE_URL="${RAW_BASE_URL}/nftables-forward.service"
 WATCH_CRON_TAG="# nftables-forward-domain"
 RESTART_CRON_TAG="# nftables-forward-restart"
+QUOTA_SAVE_CRON_TAG="# nftables-forward-quota-save"
+QUOTA_MAINTAIN_CRON_TAG="# nftables-forward-quota-maintain"
 LEGACY_WATCH_CRON_TAG="# nftables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
+QUOTA_STATE_FILE="${CONFIG_DIR}/quota.state"
 # 注意: CHAIN_PRE/CHAIN_POST 由 nftables-forward 执行脚本使用，管理脚本仅在卸载时清理表
 
 # ---------- 全局数组 ----------
@@ -41,9 +44,22 @@ rules_resolved_ip=()
 rules_check_interval=()
 rules_last_check_ts=()
 rules_is_domain=()
+rules_id=()
+rules_quota_enable=()
+rules_quota_bytes=()
+rules_expire_days=()
+rules_expire_ts=()
+rules_reset_days=()
+rules_last_reset_ts=()
+rules_created_ts=()
+declare -A QUOTA_USED_DISPLAY_MAP
 GLOBAL_WATCH_ENABLED=1
 GLOBAL_WATCH_INTERVAL_MINUTES=1
 GLOBAL_RESTART_INTERVAL_MINUTES=0
+# 配额状态保存周期（分钟，0=关闭）
+QUOTA_SAVE_INTERVAL_MINUTES=1
+# 配额维护周期（分钟，0=关闭；负责到期清理与周期重置）
+QUOTA_MAINTAIN_INTERVAL_MINUTES=1
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
 
@@ -98,6 +114,10 @@ read_confirm_yn_default() {
             *)   print_error "输入无效，请重新输入！" ;;
         esac
     done
+}
+
+gen_rule_id() {
+    echo "r_$(date +%s%N)_$RANDOM"
 }
 
 proto_to_label() {
@@ -162,6 +182,8 @@ normalize_interval_var() {
 normalize_global_settings() {
     normalize_interval_var GLOBAL_WATCH_INTERVAL_MINUTES
     normalize_interval_var GLOBAL_RESTART_INTERVAL_MINUTES
+    normalize_interval_var QUOTA_SAVE_INTERVAL_MINUTES
+    normalize_interval_var QUOTA_MAINTAIN_INTERVAL_MINUTES
     [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -eq 0 ]] && GLOBAL_WATCH_ENABLED=0 || GLOBAL_WATCH_ENABLED=1
 }
 
@@ -217,11 +239,15 @@ sync_cron_tasks_from_config() {
     normalize_global_settings
     set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" "$GLOBAL_WATCH_INTERVAL_MINUTES" >/dev/null 2>&1 || true
     set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" "$GLOBAL_RESTART_INTERVAL_MINUTES" >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_SAVE_CRON_TAG" "$SCRIPT_INSTALL_PATH --save-quota-state" "$QUOTA_SAVE_INTERVAL_MINUTES" >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_MAINTAIN_CRON_TAG" "$SCRIPT_INSTALL_PATH --maintain" "$QUOTA_MAINTAIN_INTERVAL_MINUTES" >/dev/null 2>&1 || true
 }
 
 # ---------- 自定义表清理 ----------
 remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
+    nft delete table ip "nftfwd_filter" >/dev/null 2>&1 || true
+    nft delete table ip6 "nftfwd_filter" >/dev/null 2>&1 || true
     nft delete table ip "nftfwd" >/dev/null 2>&1 || true
     nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
 }
@@ -239,6 +265,8 @@ do_uninstall() {
     set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" 0 >/dev/null 2>&1 || true
     set_cron_task_minutes "$LEGACY_WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" 0 >/dev/null 2>&1 || true
     set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" 0 >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_SAVE_CRON_TAG" "$SCRIPT_INSTALL_PATH --save-quota-state" 0 >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_MAINTAIN_CRON_TAG" "$SCRIPT_INSTALL_PATH --maintain" 0 >/dev/null 2>&1 || true
 
     remove_all_custom_tables
 
@@ -492,28 +520,48 @@ load_rules() {
     rules_listen_ip=(); rules_src_port=(); rules_dst_ip=(); rules_dst_port=()
     rules_proto=(); rules_resolved_ip=(); rules_check_interval=()
     rules_last_check_ts=(); rules_is_domain=()
+    rules_id=(); rules_quota_enable=(); rules_quota_bytes=()
+    rules_expire_days=(); rules_expire_ts=(); rules_reset_days=()
+    rules_last_reset_ts=(); rules_created_ts=()
 
     [[ -f "$CONFIG_FILE" ]] || return
 
-    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11 c12 c13 c14 c15 c16 c17; do
         [[ -z "$c1" || "$c1" == \#* ]] && continue
         [[ "$c1" =~ ^GLOBAL_ ]] && continue
 
-        if [[ -n "$c9" ]]; then
+        if [[ -n "$c17" ]]; then
+            # 17列格式
+            rules_listen_ip+=("$c1"); rules_src_port+=("$c2"); rules_dst_ip+=("$c3")
+            rules_dst_port+=("$c4"); rules_proto+=("$c5"); rules_resolved_ip+=("$c6")
+            rules_check_interval+=("$c7"); rules_last_check_ts+=("$c8"); rules_is_domain+=("$c9")
+            rules_id+=("$c10"); rules_quota_enable+=("$c11"); rules_quota_bytes+=("$c12")
+            rules_expire_days+=("$c13"); rules_expire_ts+=("$c14"); rules_reset_days+=("$c15")
+            rules_last_reset_ts+=("$c16"); rules_created_ts+=("$c17")
+        elif [[ -n "$c9" ]]; then
             # 9列格式
             rules_listen_ip+=("$c1"); rules_src_port+=("$c2"); rules_dst_ip+=("$c3")
             rules_dst_port+=("$c4"); rules_proto+=("$c5"); rules_resolved_ip+=("$c6")
             rules_check_interval+=("$c7"); rules_last_check_ts+=("$c8"); rules_is_domain+=("$c9")
+            rules_id+=("r_$(date +%s%N)_${#rules_src_port[@]}"); rules_quota_enable+=("0"); rules_quota_bytes+=("0")
+            rules_expire_days+=("0"); rules_expire_ts+=("0"); rules_reset_days+=("30")
+            rules_last_reset_ts+=("0"); rules_created_ts+=("$(date +%s)")
         elif [[ -n "$c5" ]]; then
             # 5列格式
             rules_listen_ip+=("$c1"); rules_src_port+=("$c2"); rules_dst_ip+=("$c3")
             rules_dst_port+=("$c4"); rules_proto+=("$c5"); rules_resolved_ip+=("$c3")
             rules_check_interval+=("0"); rules_last_check_ts+=("0"); rules_is_domain+=("0")
+            rules_id+=("r_$(date +%s%N)_${#rules_src_port[@]}"); rules_quota_enable+=("0"); rules_quota_bytes+=("0")
+            rules_expire_days+=("0"); rules_expire_ts+=("0"); rules_reset_days+=("30")
+            rules_last_reset_ts+=("0"); rules_created_ts+=("$(date +%s)")
         elif [[ -n "$c4" ]]; then
             # 4列旧格式
             rules_listen_ip+=("0.0.0.0"); rules_src_port+=("$c1"); rules_dst_ip+=("$c2")
             rules_dst_port+=("$c3"); rules_proto+=("$c4"); rules_resolved_ip+=("$c2")
             rules_check_interval+=("0"); rules_last_check_ts+=("0"); rules_is_domain+=("0")
+            rules_id+=("r_$(date +%s%N)_${#rules_src_port[@]}"); rules_quota_enable+=("0"); rules_quota_bytes+=("0")
+            rules_expire_days+=("0"); rules_expire_ts+=("0"); rules_reset_days+=("30")
+            rules_last_reset_ts+=("0"); rules_created_ts+=("$(date +%s)")
         fi
     done < "$CONFIG_FILE"
 }
@@ -533,6 +581,7 @@ GLOBAL_WATCH_INTERVAL_MINUTES=${GLOBAL_WATCH_INTERVAL_MINUTES}
 GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # -------------------------------------------------
 # 格式: 监听IP|源端口|目标主机|目标端口|协议|解析IP|检查间隔秒|上次检查时间戳|是否域名(1/0)
+# 格式(扩展): ...|RULE_ID|QUOTA_ENABLE|QUOTA_BYTES|EXPIRE_DAYS|EXPIRE_TS|RESET_DAYS|LAST_RESET_TS|CREATED_TS
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
@@ -541,13 +590,29 @@ EOF_CONF
         local d_interval="${rules_check_interval[$i]}"
         local d_last="${rules_last_check_ts[$i]}"
         local d_is_domain="${rules_is_domain[$i]}"
+        local d_rule_id="${rules_id[$i]}"
+        local d_quota_enable="${rules_quota_enable[$i]}"
+        local d_quota_bytes="${rules_quota_bytes[$i]}"
+        local d_expire_days="${rules_expire_days[$i]}"
+        local d_expire_ts="${rules_expire_ts[$i]}"
+        local d_reset_days="${rules_reset_days[$i]}"
+        local d_last_reset_ts="${rules_last_reset_ts[$i]}"
+        local d_created_ts="${rules_created_ts[$i]}"
 
         [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
         [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
         [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
         [[ "$d_is_domain" == "1" ]] || d_is_domain=0
+        [[ -n "$d_rule_id" ]] || d_rule_id="r_$(date +%s%N)_${i}"
+        [[ "$d_quota_enable" == "1" ]] || d_quota_enable=0
+        [[ "$d_quota_bytes" =~ ^[0-9]+$ ]] || d_quota_bytes=0
+        [[ "$d_expire_days" =~ ^[0-9]+$ ]] || d_expire_days=0
+        [[ "$d_expire_ts" =~ ^[0-9]+$ ]] || d_expire_ts=0
+        [[ "$d_reset_days" =~ ^[0-9]+$ ]] || d_reset_days=30
+        [[ "$d_last_reset_ts" =~ ^[0-9]+$ ]] || d_last_reset_ts=0
+        [[ "$d_created_ts" =~ ^[0-9]+$ ]] || d_created_ts=$(date +%s)
 
-        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$tmp_conf"
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}|${d_rule_id}|${d_quota_enable}|${d_quota_bytes}|${d_expire_days}|${d_expire_ts}|${d_reset_days}|${d_last_reset_ts}|${d_created_ts}" >> "$tmp_conf"
     done
 
     # 原子替换：先写临时文件再 mv，避免写入中断导致配置丢失
@@ -647,6 +712,8 @@ clear_all_rules() {
     rules_listen_ip=(); rules_src_port=(); rules_dst_ip=(); rules_dst_port=()
     rules_proto=(); rules_resolved_ip=(); rules_check_interval=()
     rules_last_check_ts=(); rules_is_domain=()
+    rules_id=(); rules_quota_enable=(); rules_quota_bytes=(); rules_expire_days=()
+    rules_expire_ts=(); rules_reset_days=(); rules_last_reset_ts=(); rules_created_ts=()
 }
 
 remove_rule_at_index() {
@@ -662,6 +729,40 @@ remove_rule_at_index() {
     new=(); for i in "${!rules_check_interval[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_check_interval[$i]}"); done; rules_check_interval=("${new[@]}")
     new=(); for i in "${!rules_last_check_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_last_check_ts[$i]}"); done; rules_last_check_ts=("${new[@]}")
     new=(); for i in "${!rules_is_domain[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_is_domain[$i]}"); done; rules_is_domain=("${new[@]}")
+    new=(); for i in "${!rules_id[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_id[$i]}"); done; rules_id=("${new[@]}")
+    new=(); for i in "${!rules_quota_enable[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_quota_enable[$i]}"); done; rules_quota_enable=("${new[@]}")
+    new=(); for i in "${!rules_quota_bytes[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_quota_bytes[$i]}"); done; rules_quota_bytes=("${new[@]}")
+    new=(); for i in "${!rules_expire_days[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_expire_days[$i]}"); done; rules_expire_days=("${new[@]}")
+    new=(); for i in "${!rules_expire_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_expire_ts[$i]}"); done; rules_expire_ts=("${new[@]}")
+    new=(); for i in "${!rules_reset_days[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_reset_days[$i]}"); done; rules_reset_days=("${new[@]}")
+    new=(); for i in "${!rules_last_reset_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_last_reset_ts[$i]}"); done; rules_last_reset_ts=("${new[@]}")
+    new=(); for i in "${!rules_created_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_created_ts[$i]}"); done; rules_created_ts=("${new[@]}")
+}
+
+remove_quota_state_by_rule_id() {
+    local rid="$1"
+    [[ -z "$rid" || ! -f "$QUOTA_STATE_FILE" ]] && return 0
+    local tmp_state="${QUOTA_STATE_FILE}.tmp.$$"
+    awk -F'|' -v rid="$rid" 'NF<1{next} $1!=rid{print $0}' "$QUOTA_STATE_FILE" > "$tmp_state" 2>/dev/null || true
+    mv -f "$tmp_state" "$QUOTA_STATE_FILE" 2>/dev/null || rm -f "$tmp_state" 2>/dev/null || true
+}
+
+load_quota_used_display_map() {
+    QUOTA_USED_DISPLAY_MAP=()
+    [[ -f "$QUOTA_STATE_FILE" ]] || return 0
+
+    local rid qname used ts
+    while IFS='|' read -r rid qname used ts; do
+        [[ -z "$rid" || "$rid" == \#* ]] && continue
+        [[ "$used" =~ ^[0-9]+$ ]] || used=0
+        QUOTA_USED_DISPLAY_MAP["$rid"]="$used"
+    done < "$QUOTA_STATE_FILE"
+}
+
+format_bytes_to_gb_2f() {
+    local bytes="$1"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v b="$bytes" 'BEGIN { printf "%.2fG", b/1073741824 }'
 }
 
 # ---------- 自动保存并应用 ----------
@@ -681,11 +782,31 @@ print_rules_home_style() {
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
         echo -e "  ${YELLOW}(暂无转发规则)${NC}"; return
     fi
+    load_quota_used_display_map
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local proto_str mark=""
         proto_str=$(proto_to_label "${rules_proto[$i]}")
         [[ "${rules_is_domain[$i]}" == "1" ]] && mark=" [域名→${rules_resolved_ip[$i]}]"
-        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})${mark}"
+        local quota_mark="" expire_mark="" reset_mark=""
+        if [[ "${rules_quota_enable[$i]}" == "1" ]]; then
+            local q_gb=$(( ${rules_quota_bytes[$i]:-0} / 1024 / 1024 / 1024 ))
+            local used_bytes="${QUOTA_USED_DISPLAY_MAP[${rules_id[$i]}]:-0}"
+            local used_gb
+            used_gb=$(format_bytes_to_gb_2f "$used_bytes")
+            quota_mark=" [流量:${used_gb}/${q_gb}G]"
+            local rd="${rules_reset_days[$i]:-30}"
+            if [[ "$rd" -eq 0 ]]; then
+                reset_mark=" [重置:不重置]"
+            else
+                reset_mark=" [重置:${rd}天]"
+            fi
+        fi
+        if [[ "${rules_expire_ts[$i]:-0}" -gt 0 ]]; then
+            expire_mark=" [到期:$(date -d @"${rules_expire_ts[$i]}" +%F 2>/dev/null || echo ${rules_expire_ts[$i]})]"
+        elif [[ "${rules_quota_enable[$i]}" == "1" ]]; then
+            expire_mark=" [到期:长期]"
+        fi
+        echo -e "  ${GREEN}[$((i+1))]${NC} ${CYAN}${rules_listen_ip[$i]}${NC} ${CYAN}${rules_src_port[$i]}${NC} → ${CYAN}${rules_dst_ip[$i]}:${rules_dst_port[$i]}${NC} (${proto_str})${mark}${quota_mark}${expire_mark}${reset_mark}"
     done
     echo ""
 }
@@ -771,6 +892,56 @@ do_add() {
         esac
     done
 
+    # 流量限制与有效期管理
+    local quota_enable="0" quota_bytes="0" expire_days="0" expire_ts="0" reset_days="30"
+    local now_ts
+    now_ts=$(date +%s)
+
+    echo ""
+    local add_quota
+    add_quota=$(read_confirm_yn_default "是否添加流量限制？(Y/N) [默认为 N]: " "N")
+    if [[ "$add_quota" == "Y" ]]; then
+        local quota_gb_input expire_days_input reset_days_input
+        while true; do
+            read -r -p "请输入流量限制 (回车默认: 空，即不限制流量，单位: G): " quota_gb_input
+            if [[ -z "$quota_gb_input" ]]; then
+                quota_enable="0"; quota_bytes="0"; break
+            fi
+            if [[ "$quota_gb_input" =~ ^[0-9]+$ ]] && [[ "$quota_gb_input" -gt 0 ]]; then
+                quota_enable="1"
+                quota_bytes=$((quota_gb_input * 1024 * 1024 * 1024))
+                break
+            fi
+            print_error "输入无效，请输入正整数或回车跳过。"
+        done
+
+        # 只有当流量限制实际启用时，才询问有效期和重置周期
+        if [[ "$quota_enable" == "1" ]]; then
+            while true; do
+                read -r -p "请输入转发规则有效期 (回车默认: 空，即长期有效不限制，单位: 天): " expire_days_input
+                if [[ -z "$expire_days_input" ]]; then
+                    expire_days="0"; expire_ts="0"; break
+                fi
+                if [[ "$expire_days_input" =~ ^[0-9]+$ ]] && [[ "$expire_days_input" -gt 0 ]]; then
+                    expire_days="$expire_days_input"
+                    expire_ts=$((now_ts + expire_days_input * 86400))
+                    break
+                fi
+                print_error "输入无效，请输入正整数天数或回车跳过。"
+            done
+
+            while true; do
+                read -r -p "请输入流量重置间隔周期 (回车默认: 30，单位: 天): " reset_days_input
+                reset_days_input=${reset_days_input:-30}
+                if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -ge 0 ]]; then
+                    reset_days="$reset_days_input"
+                    break
+                fi
+                print_error "输入无效，请输入非负整数天数。"
+            done
+        fi
+    fi
+
     echo ""
     echo -e "${GREEN}即将添加转发:${NC}"
     echo -e "  监听IP:   ${CYAN}${listen_ip}${NC}"
@@ -781,6 +952,21 @@ do_add() {
         echo -e "  检测间隔: ${CYAN}${GLOBAL_WATCH_INTERVAL_MINUTES} 分钟（全局）${NC}"
     fi
     echo -e "  协议:     ${CYAN}$(proto_to_label "$proto")${NC}"
+    if [[ "$quota_enable" == "1" ]]; then
+        echo -e "  流量限制: ${CYAN}$((quota_bytes / 1024 / 1024 / 1024))G${NC}"
+        if [[ "$expire_ts" -gt 0 ]]; then
+            echo -e "  有效期:   ${CYAN}${expire_days}天（到期: $(date -d @"$expire_ts" +%F 2>/dev/null || echo "$expire_ts")）${NC}"
+        else
+            echo -e "  有效期:   ${CYAN}长期有效${NC}"
+        fi
+        if [[ "$reset_days" -eq 0 ]]; then
+            echo -e "  重置周期: ${CYAN}不重置${NC}"
+        else
+            echo -e "  重置周期: ${CYAN}${reset_days} 天${NC}"
+        fi
+    else
+        echo -e "  流量限制: ${YELLOW}不限制${NC}"
+    fi
 
     # 检查重复规则
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
@@ -805,6 +991,14 @@ do_add() {
     rules_proto+=("$proto"); rules_resolved_ip+=("$resolved_ip")
     rules_check_interval+=("$check_interval_seconds"); rules_last_check_ts+=("0")
     rules_is_domain+=("$is_domain")
+    rules_id+=("$(gen_rule_id)")
+    rules_quota_enable+=("$quota_enable")
+    rules_quota_bytes+=("$quota_bytes")
+    rules_expire_days+=("$expire_days")
+    rules_expire_ts+=("$expire_ts")
+    rules_reset_days+=("$reset_days")
+    rules_last_reset_ts+=("$now_ts")
+    rules_created_ts+=("$now_ts")
 
     auto_save_and_apply "添加成功！" "添加失败：规则已保存，但应用失败，请检查 nftables 环境"
 }
@@ -835,6 +1029,7 @@ do_delete() {
             local confirm
             confirm=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
             [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
+            : > "$QUOTA_STATE_FILE" 2>/dev/null || true
             clear_all_rules
             auto_save_and_apply "已删除全部转发规则！" "删除失败：规则已保存，但应用失败，请检查 nftables 环境"
             return
@@ -848,6 +1043,7 @@ do_delete() {
         confirm=$(read_confirm_yn_default "确认删除该规则？[Y/N]（默认: N）: " "N")
         [[ "$confirm" == "N" ]] && { set_last_result "warn" "已取消删除"; return; }
 
+        remove_quota_state_by_rule_id "${rules_id[$((del_input - 1))]}"
         remove_rule_at_index $((del_input - 1))
         auto_save_and_apply "删除成功！" "删除失败：规则已保存，但应用失败，请检查 nftables 环境"
         return
