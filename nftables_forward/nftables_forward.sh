@@ -52,9 +52,14 @@ rules_expire_ts=()
 rules_reset_days=()
 rules_last_reset_ts=()
 rules_created_ts=()
+declare -A QUOTA_USED_DISPLAY_MAP
 GLOBAL_WATCH_ENABLED=1
 GLOBAL_WATCH_INTERVAL_MINUTES=1
 GLOBAL_RESTART_INTERVAL_MINUTES=0
+# 配额状态保存周期（分钟，0=关闭）
+QUOTA_SAVE_INTERVAL_MINUTES=1
+# 配额维护周期（分钟，0=关闭；负责到期清理与周期重置）
+QUOTA_MAINTAIN_INTERVAL_MINUTES=1
 LAST_RESULT_TYPE=""
 LAST_RESULT_MSG=""
 
@@ -177,6 +182,8 @@ normalize_interval_var() {
 normalize_global_settings() {
     normalize_interval_var GLOBAL_WATCH_INTERVAL_MINUTES
     normalize_interval_var GLOBAL_RESTART_INTERVAL_MINUTES
+    normalize_interval_var QUOTA_SAVE_INTERVAL_MINUTES
+    normalize_interval_var QUOTA_MAINTAIN_INTERVAL_MINUTES
     [[ "$GLOBAL_WATCH_INTERVAL_MINUTES" -eq 0 ]] && GLOBAL_WATCH_ENABLED=0 || GLOBAL_WATCH_ENABLED=1
 }
 
@@ -232,8 +239,8 @@ sync_cron_tasks_from_config() {
     normalize_global_settings
     set_cron_task_minutes "$WATCH_CRON_TAG" "$SCRIPT_INSTALL_PATH --watch" "$GLOBAL_WATCH_INTERVAL_MINUTES" >/dev/null 2>&1 || true
     set_cron_task_minutes "$RESTART_CRON_TAG" "$SCRIPT_INSTALL_PATH" "$GLOBAL_RESTART_INTERVAL_MINUTES" >/dev/null 2>&1 || true
-    set_cron_task_minutes "$QUOTA_SAVE_CRON_TAG" "$SCRIPT_INSTALL_PATH --save-quota-state" 5 >/dev/null 2>&1 || true
-    set_cron_task_minutes "$QUOTA_MAINTAIN_CRON_TAG" "$SCRIPT_INSTALL_PATH --maintain" 5 >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_SAVE_CRON_TAG" "$SCRIPT_INSTALL_PATH --save-quota-state" "$QUOTA_SAVE_INTERVAL_MINUTES" >/dev/null 2>&1 || true
+    set_cron_task_minutes "$QUOTA_MAINTAIN_CRON_TAG" "$SCRIPT_INSTALL_PATH --maintain" "$QUOTA_MAINTAIN_INTERVAL_MINUTES" >/dev/null 2>&1 || true
 }
 
 # ---------- 自定义表清理 ----------
@@ -738,6 +745,24 @@ remove_quota_state_by_rule_id() {
     mv -f "$tmp_state" "$QUOTA_STATE_FILE" 2>/dev/null || rm -f "$tmp_state" 2>/dev/null || true
 }
 
+load_quota_used_display_map() {
+    QUOTA_USED_DISPLAY_MAP=()
+    [[ -f "$QUOTA_STATE_FILE" ]] || return 0
+
+    local rid qname used ts
+    while IFS='|' read -r rid qname used ts; do
+        [[ -z "$rid" || "$rid" == \#* ]] && continue
+        [[ "$used" =~ ^[0-9]+$ ]] || used=0
+        QUOTA_USED_DISPLAY_MAP["$rid"]="$used"
+    done < "$QUOTA_STATE_FILE"
+}
+
+format_bytes_to_gb_2f() {
+    local bytes="$1"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+    awk -v b="$bytes" 'BEGIN { printf "%.2fG", b/1073741824 }'
+}
+
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
     local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 nftables 环境}"
@@ -755,6 +780,7 @@ print_rules_home_style() {
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
         echo -e "  ${YELLOW}(暂无转发规则)${NC}"; return
     fi
+    load_quota_used_display_map
     for ((i=0; i<${#rules_src_port[@]}; i++)); do
         local proto_str mark=""
         proto_str=$(proto_to_label "${rules_proto[$i]}")
@@ -762,7 +788,10 @@ print_rules_home_style() {
         local quota_mark="" expire_mark="" reset_mark=""
         if [[ "${rules_quota_enable[$i]}" == "1" ]]; then
             local q_gb=$(( ${rules_quota_bytes[$i]:-0} / 1024 / 1024 / 1024 ))
-            quota_mark=" [限流:${q_gb}G]"
+            local used_bytes="${QUOTA_USED_DISPLAY_MAP[${rules_id[$i]}]:-0}"
+            local used_gb
+            used_gb=$(format_bytes_to_gb_2f "$used_bytes")
+            quota_mark=" [流量:${used_gb}/${q_gb}G]"
             reset_mark=" [重置:${rules_reset_days[$i]:-30}天]"
         fi
         if [[ "${rules_expire_ts[$i]:-0}" -gt 0 ]]; then
@@ -867,7 +896,7 @@ do_add() {
     if [[ "$add_quota" == "Y" ]]; then
         local quota_gb_input expire_days_input reset_days_input
         while true; do
-            read -r -p "选项A： 请输入流量限制 (单位: G) [回车默认: 空，即不限制流量]: " quota_gb_input
+            read -r -p "请输入流量限制 (回车默认: 空，即不限制流量，单位: G): " quota_gb_input
             if [[ -z "$quota_gb_input" ]]; then
                 quota_enable="0"; quota_bytes="0"; break
             fi
@@ -880,7 +909,7 @@ do_add() {
         done
 
         while true; do
-            read -r -p "选项B： 请输入转发规则有效期 (单位: 天) [回车默认: 空，即长期有效不限制]: " expire_days_input
+            read -r -p "请输入转发规则有效期 (回车默认: 空，即长期有效不限制，单位: 天): " expire_days_input
             if [[ -z "$expire_days_input" ]]; then
                 expire_days="0"; expire_ts="0"; break
             fi
@@ -893,7 +922,7 @@ do_add() {
         done
 
         while true; do
-            read -r -p "选项C： 请输入流量重置间隔周期 (单位: 天) [回车默认: 30]: " reset_days_input
+            read -r -p "请输入流量重置间隔周期 (回车默认: 30，单位: 天): " reset_days_input
             reset_days_input=${reset_days_input:-30}
             if [[ "$reset_days_input" =~ ^[0-9]+$ ]] && [[ "$reset_days_input" -gt 0 ]]; then
                 reset_days="$reset_days_input"

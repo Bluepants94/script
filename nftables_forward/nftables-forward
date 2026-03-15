@@ -226,7 +226,7 @@ ensure_quota_obj() {
 }
 
 add_single_nft_rule() {
-    local family="$1" listen_ip="$2" proto="$3" dport="$4" dnat_target="$5" quota_name="$6"
+    local family="$1" listen_ip="$2" proto="$3" dport="$4" dnat_target="$5"
     local line="add rule ${family} ${TABLE_NAME} ${CHAIN_PRE} "
 
     if [[ "$family" == "ip" ]]; then
@@ -236,8 +236,21 @@ add_single_nft_rule() {
     fi
 
     line+="${proto} dport ${dport} "
-    [[ -n "$quota_name" ]] && line+="quota name \"${quota_name}\" "
     line+="dnat to ${dnat_target}"
+    append_nft_line "$line"
+}
+
+add_single_post_quota_rule() {
+    local family="$1" proto="$2" dst_ip="$3" dst_port="$4" quota_name="$5"
+    [[ -z "$quota_name" ]] && return 0
+
+    local line="add rule ${family} ${TABLE_NAME} ${CHAIN_POST} ct status dnat "
+    if [[ "$family" == "ip" ]]; then
+        line+="ip saddr ${dst_ip} "
+    else
+        line+="ip6 saddr ${dst_ip} "
+    fi
+    line+="${proto} sport ${dst_port} quota name \"${quota_name}\""
     append_nft_line "$line"
 }
 
@@ -266,7 +279,8 @@ add_nft_rule() {
 
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
-        add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}" "$quota_name"
+        add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}"
+        add_single_post_quota_rule "$family" "$proto" "$dst_ip" "$dst_port" "$quota_name"
         return
     fi
 
@@ -274,7 +288,8 @@ add_nft_rule() {
         local src_len=$(( src_end - src_start + 1 ))
         [[ "$src_len" -gt 1000 ]] && return 1
         for ((offset=0; offset<src_len; offset++)); do
-            add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))" "$quota_name"
+            add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
+            add_single_post_quota_rule "$family" "$proto" "$dst_ip" "$((dst_start + offset))" "$quota_name"
         done
         return
     fi
