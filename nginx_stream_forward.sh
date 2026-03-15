@@ -49,29 +49,38 @@ print_error()   { echo -e "${RED}[错误]${NC} $1"; }
 print_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 print_invalid_input() { print_warn "输入无效，请重新输入！"; }
 
-is_yes() {
-    [[ "$1" == "y" || "$1" == "Y" ]]
-}
-
-ask_yes_no() {
+read_menu_choice() {
     local prompt="$1"
-    local default_value="$2"
-    local input
-
-    if [[ "$default_value" != "Y" && "$default_value" != "N" ]]; then
-        default_value="N"
-    fi
+    local regex="$2"
+    local default_value="${3:-}"
+    local value
 
     while true; do
-        read -r -p "${prompt} [Y/N]（默认${default_value}）: " input
-        input=${input:-$default_value}
-        case "$input" in
-            y|Y)
-                READ_YN_RESULT="Y"
+        read -r -p "$prompt" value
+        [[ -z "$value" && -n "$default_value" ]] && value="$default_value"
+        if [[ "$value" =~ $regex ]]; then
+            echo "$value"
+            return 0
+        fi
+        print_invalid_input
+    done
+}
+
+read_confirm_yn_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local value
+
+    while true; do
+        read -r -p "$prompt" value
+        value=${value:-$default_value}
+        case "$value" in
+            Y|y)
+                echo "Y"
                 return 0
                 ;;
-            n|N)
-                READ_YN_RESULT="N"
+            N|n)
+                echo "N"
                 return 0
                 ;;
             *)
@@ -79,6 +88,10 @@ ask_yes_no() {
                 ;;
         esac
     done
+}
+
+is_yes() {
+    [[ "$1" == "y" || "$1" == "Y" ]]
 }
 
 set_last_result() {
@@ -166,9 +179,7 @@ validate_target() {
     local target="$1"
     # 格式: IP:port 或 domain:port
     if [[ "$target" =~ ^([a-zA-Z0-9.-]+):([0-9]+)$ ]]; then
-        local host="${BASH_REMATCH[1]}"
-        local port="${BASH_REMATCH[2]}"
-        if validate_port "$port"; then
+        if validate_port "${BASH_REMATCH[2]}"; then
             return 0
         fi
     fi
@@ -191,7 +202,8 @@ validate_ip_cidr() {
 
 # ---------- 生成安全的 zone 名称 ----------
 build_zone_name() {
-    echo "backend_zone"
+    local node="$1"
+    echo "backend_zone_${node}"
 }
 
 # ---------- 转义正则特殊字符 ----------
@@ -216,8 +228,9 @@ parse_config() {
     local current_whitelist=""
 
     while IFS= read -r line; do
-        # 清除首尾空格
-        line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        # 清除首尾空格（Bash 内置，避免 fork sed）
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
 
         # 跳过注释行（示例注释不参与规则识别）
         [[ "$line" =~ ^# ]] && continue
@@ -417,7 +430,7 @@ test_and_reload_nginx() {
         print_info "正在测试 Nginx 配置..."
     fi
 
-    if nginx -t 2>&1 | grep -q "successful"; then
+    if nginx -t >/dev/null 2>&1; then
         if [[ "$silent" != "true" ]]; then
             print_success "配置测试通过"
             print_info "正在重载 Nginx..."
@@ -541,8 +554,9 @@ delete_rule_from_config() {
     local in_target_upstream=false
     
     while IFS= read -r line; do
-        local trimmed
-        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        local trimmed="$line"
+        trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
 
         # 检测是否是目标 upstream 块
         if [[ "$trimmed" =~ ^upstream[[:space:]]+backend_stream_${node_regex}[[:space:]]*\{$ ]]; then
@@ -594,8 +608,9 @@ delete_all_rules_from_config() {
     local pending_server=false
 
     while IFS= read -r line; do
-        local trimmed
-        trimmed=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        local trimmed="$line"
+        trimmed="${trimmed#"${trimmed%%[![:space:]]*}"}"
+        trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
 
         # 识别脚本管理的 upstream
         if [[ "$trimmed" =~ ^upstream[[:space:]]+backend_stream_.*[[:space:]]*\{$ ]]; then
@@ -611,7 +626,12 @@ delete_all_rules_from_config() {
             continue
         fi
 
-        # 跳过紧随其后的 server 块
+        # 跳过紧随其后的 server 块（允许中间有空行）
+        if $pending_server && [[ -n "$trimmed" ]] && [[ "$trimmed" != "server {" ]]; then
+            # 遇到非空、非 server{ 的行，说明不是紧随的 server 块，重置
+            pending_server=false
+        fi
+
         if $pending_server && [[ "$trimmed" == "server {" ]]; then
             skip_server=true
             pending_server=false
@@ -689,8 +709,8 @@ do_add() {
 
     # 配置白名单
     echo ""
-    ask_yes_no "是否配置白名单？" "N"
-    local setup_whitelist="$READ_YN_RESULT"
+    local setup_whitelist
+    setup_whitelist=$(read_confirm_yn_default "是否配置白名单？[Y/N]（默认: N）: " "N")
     
     local whitelist=""
     if is_yes "$setup_whitelist"; then
@@ -716,8 +736,8 @@ do_add() {
             fi
             wl_count=$((wl_count + 1))
 
-            ask_yes_no "是否继续添加 allow？" "N"
-            local add_more="$READ_YN_RESULT"
+            local add_more
+            add_more=$(read_confirm_yn_default "是否继续添加 allow？[Y/N]（默认: N）: " "N")
             if ! is_yes "$add_more"; then
                 break
             fi
@@ -742,10 +762,10 @@ do_add() {
     fi
     
     echo ""
-    ask_yes_no "确认添加？" "Y"
-    local confirm="$READ_YN_RESULT"
+    local confirm
+    confirm=$(read_confirm_yn_default "确认添加？[Y/N]（默认: Y）: " "Y")
     if ! is_yes "$confirm"; then
-        print_warn "已取消添加"
+        set_last_result "warn" "已取消添加"
         return
     fi
 
@@ -793,8 +813,7 @@ do_delete() {
 
     parse_config
     if [[ ${#rule_nodes[@]} -eq 0 ]]; then
-        print_warn "当前没有转发规则"
-        read -r -p "按回车返回主菜单..."
+        set_last_result "warn" "当前没有转发规则"
         return
     fi
 
@@ -804,6 +823,7 @@ do_delete() {
     while true; do
         echo ""
         echo -e "输入序号（${CYAN}1-${#rule_nodes[@]}${NC}），输入 ${YELLOW}all${NC} 删除全部，输入 ${NC}0${NC} 返回"
+        local del_input
         read -r -p "请选择: " del_input
 
         if [[ "$del_input" == "0" ]]; then
@@ -811,8 +831,8 @@ do_delete() {
         fi
 
         if [[ "$del_input" == "all" || "$del_input" == "ALL" ]]; then
-            ask_yes_no "确认删除全部规则？" "N"
-            local confirm="$READ_YN_RESULT"
+            local confirm
+            confirm=$(read_confirm_yn_default "确认删除全部规则？[Y/N]（默认: N）: " "N")
             if is_yes "$confirm"; then
                 backup_config
 
@@ -833,6 +853,8 @@ do_delete() {
                     restore_config
                     set_last_result "error" "删除失败，配置已回滚"
                 fi
+            else
+                set_last_result "warn" "已取消删除"
             fi
             return
         fi
@@ -848,8 +870,8 @@ do_delete() {
 
         echo ""
         echo -e "${YELLOW}即将删除:${NC} ${del_info}"
-        ask_yes_no "确认删除？" "N"
-        local confirm="$READ_YN_RESULT"
+        local confirm
+        confirm=$(read_confirm_yn_default "确认删除？[Y/N]（默认: N）: " "N")
         if ! is_yes "$confirm"; then
             set_last_result "warn" "已取消删除"
             return
@@ -908,34 +930,30 @@ do_autostart() {
     echo -e "  ${RED}2)${NC} 关闭自启"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
-    while true; do
-        read -r -p "请选择 [0-2]: " choice
+    local choice
+    choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
 
-        case "$choice" in
-            1)
-                if enable_autostart; then
-                    set_last_result "success" "已开启 Nginx 开机自启"
-                else
-                    set_last_result "error" "开启失败，请检查 systemd 环境"
-                fi
-                return
-                ;;
-            2)
-                if disable_autostart; then
-                    set_last_result "success" "已关闭 Nginx 开机自启"
-                else
-                    set_last_result "error" "关闭失败，请检查 systemd 环境"
-                fi
-                return
-                ;;
-            0)
-                return
-                ;;
-            *)
-                print_invalid_input
-                ;;
-        esac
-    done
+    case "$choice" in
+        1)
+            if enable_autostart; then
+                set_last_result "success" "已开启 Nginx 开机自启"
+            else
+                set_last_result "error" "开启失败，请检查 systemd 环境"
+            fi
+            return
+            ;;
+        2)
+            if disable_autostart; then
+                set_last_result "success" "已关闭 Nginx 开机自启"
+            else
+                set_last_result "error" "关闭失败，请检查 systemd 环境"
+            fi
+            return
+            ;;
+        0)
+            return
+            ;;
+    esac
 }
 
 # ---------- 管理 Nginx 启动/关闭 ----------
@@ -955,34 +973,30 @@ do_service_control() {
     echo -e "  ${RED}2)${NC} 关闭 Nginx"
     echo -e "  ${NC}0)${NC} 返回"
     echo ""
-    while true; do
-        read -r -p "请选择 [0-2]: " choice
+    local choice
+    choice=$(read_menu_choice "请选择 [0-2]: " '^[0-2]$')
 
-        case "$choice" in
-            1)
-                if start_nginx_service; then
-                    set_last_result "success" "Nginx 已启动"
-                else
-                    set_last_result "error" "启动失败，请检查 Nginx 配置或 systemd 日志"
-                fi
-                return
-                ;;
-            2)
-                if stop_nginx_service; then
-                    set_last_result "success" "Nginx 已关闭"
-                else
-                    set_last_result "error" "关闭失败，请检查 systemd 环境"
-                fi
-                return
-                ;;
-            0)
-                return
-                ;;
-            *)
-                print_invalid_input
-                ;;
-        esac
-    done
+    case "$choice" in
+        1)
+            if start_nginx_service; then
+                set_last_result "success" "Nginx 已启动"
+            else
+                set_last_result "error" "启动失败，请检查 Nginx 配置或 systemd 日志"
+            fi
+            return
+            ;;
+        2)
+            if stop_nginx_service; then
+                set_last_result "success" "Nginx 已关闭"
+            else
+                set_last_result "error" "关闭失败，请检查 systemd 环境"
+            fi
+            return
+            ;;
+        0)
+            return
+            ;;
+    esac
 }
 
 # ---------- 主菜单 ----------
@@ -993,6 +1007,7 @@ show_menu() {
     parse_config
     local rule_count=${#rule_nodes[@]}
 
+    echo -e "${BOLD}${BLUE}运行状态:${NC}"
     echo -e "  配置文件: ${CYAN}${CONFIG_FILE}${NC}"
     echo -e "  转发规则: ${CYAN}${rule_count} 条${NC}"
     
@@ -1005,9 +1020,9 @@ show_menu() {
 
     refresh_autostart_state
     if $AUTOSTART_ENABLED; then
-        echo -e "  开机自启: ${GREEN}● 已启用${NC}"
+        echo -e "  开机自启:   ${GREEN}● 已启用${NC}"
     else
-        echo -e "  开机自启: ${YELLOW}● 未启用${NC}"
+        echo -e "  开机自启:   ${YELLOW}● 未启用${NC}"
     fi
     echo ""
 
@@ -1024,13 +1039,7 @@ show_menu() {
     echo -e "  ${NC}0)${NC} 退出"
     echo ""
 
-    while true; do
-        read -r -p "请选择操作 [0-5]: " choice
-        if [[ "$choice" =~ ^[0-5]$ ]]; then
-            break
-        fi
-        print_invalid_input
-    done
+    choice=$(read_menu_choice "请选择操作 [0-5]: " '^[0-5]$')
 }
 
 # ---------- 主入口 ----------
