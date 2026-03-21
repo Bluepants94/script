@@ -52,3 +52,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/docker-compose-auto-update/install.sh)
 ```
+# 网卡出口切换
+```
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/docker-compose-auto-update/install.sh)
+```
+
