@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 注意：本脚本为交互式运维脚本，未启用 set -e（允许部分命令失败后继续）
 set -u
 set -o pipefail
 
@@ -16,7 +17,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-BOLD='\033[1m'
 NC='\033[0m'
 
 # ---------- 路径与常量 ----------
@@ -27,6 +27,7 @@ APPLY_BIN="/usr/local/sbin/default-src-ip-apply"
 SERVICE_NAME="default-src-ip.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 SYSCTL_FILE="/etc/sysctl.d/90-default-src-ip.conf"
+PROBE_TARGET="1.1.1.1"
 
 RULE_PREF_PRIVATE=100
 RULE_PREF_PUBLIC=110
@@ -47,6 +48,8 @@ PUBLIC_CIDR=""
 PRIVATE_IP=""
 PRIVATE_CIDR=""
 
+LOCK_PID_FILE="${LOCK_DIR}/pid"
+
 # ---------- UI ----------
 print_banner() {
   clear 2>/dev/null || true
@@ -59,7 +62,7 @@ print_banner() {
 
 print_section() {
   echo
-  echo -e "${BOLD}${BLUE}[ $1 ]${NC}"
+  echo -e "${BLUE}[ $1 ]${NC}"
   echo "------------------------------------------------------------"
 }
 
@@ -84,7 +87,8 @@ show_last_result() {
 }
 
 kv() {
-  printf "  %-12s %s\n" "$1" "$2"
+  # 使用制表符分隔，减少中文字段在不同终端下的对齐偏差
+  printf "  %s\t%s\n" "$1" "$2"
 }
 
 pause() {
@@ -141,13 +145,31 @@ init_runtime() {
 }
 
 acquire_lock() {
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    print_error "检测到另一个实例正在运行，请稍后再试。"
-    exit 1
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_PID_FILE" 2>/dev/null || true
+    return 0
   fi
+
+  if [[ -f "$LOCK_PID_FILE" ]]; then
+    local lock_pid
+    lock_pid="$(sed -n '1p' "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+      print_warn "检测到陈旧锁，正在清理..."
+      rm -f "$LOCK_PID_FILE" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_PID_FILE" 2>/dev/null || true
+        return 0
+      fi
+    fi
+  fi
+
+  print_error "检测到另一个实例正在运行，请稍后再试。"
+  exit 1
 }
 
 release_lock() {
+  rm -f "$LOCK_PID_FILE" 2>/dev/null || true
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
@@ -189,14 +211,22 @@ get_field_after_token() {
 # ---------- 状态读取与保存（安全解析，不 source） ----------
 save_state() {
   local tmp_file="${STATE_FILE}.tmp.$$"
-  cat > "$tmp_file" <<EOF_STATE
-IFACE=${IFACE}
-PUBLIC_GW=${PUBLIC_GW}
-PUBLIC_IP=${PUBLIC_IP}
-PUBLIC_CIDR=${PUBLIC_CIDR}
-PRIVATE_IP=${PRIVATE_IP}
-PRIVATE_CIDR=${PRIVATE_CIDR}
-EOF_STATE
+
+  # 仅允许单行值，避免破坏 key=value 结构
+  case "$IFACE$PUBLIC_GW$PUBLIC_IP$PUBLIC_CIDR$PRIVATE_IP$PRIVATE_CIDR" in
+    *$'\n'*|*$'\r'*|'='*)
+      return 1
+      ;;
+  esac
+
+  {
+    printf 'IFACE=%s\n' "$IFACE"
+    printf 'PUBLIC_GW=%s\n' "$PUBLIC_GW"
+    printf 'PUBLIC_IP=%s\n' "$PUBLIC_IP"
+    printf 'PUBLIC_CIDR=%s\n' "$PUBLIC_CIDR"
+    printf 'PRIVATE_IP=%s\n' "$PRIVATE_IP"
+    printf 'PRIVATE_CIDR=%s\n' "$PRIVATE_CIDR"
+  } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
 
   chmod 600 "$tmp_file" || { rm -f "$tmp_file"; return 1; }
   mv -f "$tmp_file" "$STATE_FILE" || { rm -f "$tmp_file"; return 1; }
@@ -239,15 +269,15 @@ detect_env() {
   default_line="$(ip -4 route show default 2>/dev/null | awk 'NR==1')"
   [[ -n "$default_line" ]] || return 1
 
-  IFACE="$(awk '{print $5}' <<< "$default_line")"
-  PUBLIC_GW="$(awk '{print $3}' <<< "$default_line")"
+  IFACE="$(get_field_after_token "$default_line" "dev")"
+  PUBLIC_GW="$(get_field_after_token "$default_line" "via")"
   PUBLIC_IP=""
   PUBLIC_CIDR=""
   PRIVATE_IP=""
   PRIVATE_CIDR=""
 
   local preferred_src
-  preferred_src="$(get_field_after_token "$(ip -4 route get 1.1.1.1 2>/dev/null | awk 'NR==1')" "src")"
+  preferred_src="$(get_field_after_token "$(ip -4 route get "$PROBE_TARGET" 2>/dev/null | awk 'NR==1')" "src")"
 
   [[ -n "$IFACE" ]] || return 1
 
@@ -340,8 +370,8 @@ restore_default_route_snapshot() {
 }
 
 clean_policy_only() {
-  ip rule del pref "$RULE_PREF_PRIVATE" >/dev/null 2>&1 || true
-  ip rule del pref "$RULE_PREF_PUBLIC" >/dev/null 2>&1 || true
+  while ip rule del pref "$RULE_PREF_PRIVATE" >/dev/null 2>&1; do :; done
+  while ip rule del pref "$RULE_PREF_PUBLIC" >/dev/null 2>&1; do :; done
   ip route flush table "$TABLE_PRIVATE" >/dev/null 2>&1 || true
   ip route flush table "$TABLE_PUBLIC" >/dev/null 2>&1 || true
   flush_route_cache
@@ -401,16 +431,16 @@ rollback_public_as_default_src() {
 
 current_mode() {
   local line default_line default_src
-  line="$(ip -4 route get 1.1.1.1 2>/dev/null | awk 'NR==1')"
+  line="$(ip -4 route get "$PROBE_TARGET" 2>/dev/null | awk 'NR==1')"
   default_line="$(ip -4 route show default 2>/dev/null | awk 'NR==1')"
   default_src="$(get_field_after_token "$default_line" "src")"
 
   if [[ -n "${PRIVATE_IP:-}" ]] && { grep -Eq "src ${PRIVATE_IP}( |$)" <<< "$line" || [[ "$default_src" == "$PRIVATE_IP" ]]; }; then
-    echo "默认源地址 = 内网IP"
+    echo "${PRIVATE_IP}(内网)"
   elif [[ -n "${PUBLIC_IP:-}" ]] && { grep -Eq "src ${PUBLIC_IP}( |$)" <<< "$line" || [[ "$default_src" == "$PUBLIC_IP" ]]; }; then
-    echo "默认源地址 = 公网IP"
+    echo "${PUBLIC_IP}(公网)"
   else
-    echo "默认源地址 = 未识别"
+    echo "未识别"
   fi
 }
 
@@ -433,7 +463,7 @@ show_summary() {
   fi
 
   print_section "当前环境"
-  kv "网卡" "$IFACE"
+  kv "网卡名称" "$IFACE"
   kv "公网IP" "$PUBLIC_IP"
   kv "内网IP" "$PRIVATE_IP"
   kv "公网网关" "$PUBLIC_GW"
@@ -447,7 +477,7 @@ show_route_status() {
   fi
 
   print_section "当前详细状态"
-  kv "网卡" "$IFACE"
+  kv "网卡名称" "$IFACE"
   kv "公网IP" "$PUBLIC_IP/$PUBLIC_CIDR"
   kv "内网IP" "$PRIVATE_IP/$PRIVATE_CIDR"
   kv "公网网关" "$PUBLIC_GW"
@@ -479,20 +509,20 @@ test_now() {
 
   print_section "测试当前出站效果"
   echo -e "${CYAN}默认新连接选路${NC}"
-  ip route get 1.1.1.1 | sed 's/^/  /'
+  ip route get "$PROBE_TARGET" | sed 's/^/  /'
   echo
 
   echo -e "${CYAN}从内网IP出站选路${NC}"
-  ip route get 1.1.1.1 from "$PRIVATE_IP" | sed 's/^/  /'
+  ip route get "$PROBE_TARGET" from "$PRIVATE_IP" | sed 's/^/  /'
   echo
 
   echo -e "${CYAN}从公网IP出站选路${NC}"
-  ip route get 1.1.1.1 from "$PUBLIC_IP" | sed 's/^/  /'
+  ip route get "$PROBE_TARGET" from "$PUBLIC_IP" | sed 's/^/  /'
   echo
 
   if command -v ping >/dev/null 2>&1; then
     echo -e "${CYAN}Ping（绑定内网IP）${NC}"
-    ping -I "$PRIVATE_IP" -c 3 1.1.1.1 || true
+    ping -I "$PRIVATE_IP" -c 3 "$PROBE_TARGET" || true
     echo
   fi
 
@@ -511,6 +541,7 @@ test_now() {
 install_apply_bin() {
   cat > "$APPLY_BIN" <<'EOF_APPLY'
 #!/usr/bin/env bash
+set -e
 set -u
 set -o pipefail
 
@@ -555,8 +586,8 @@ load_state() {
 
 load_state || exit 1
 
-ip rule del pref "$RULE_PREF_PRIVATE" >/dev/null 2>&1 || true
-ip rule del pref "$RULE_PREF_PUBLIC" >/dev/null 2>&1 || true
+while ip rule del pref "$RULE_PREF_PRIVATE" >/dev/null 2>&1; do :; done
+while ip rule del pref "$RULE_PREF_PUBLIC" >/dev/null 2>&1; do :; done
 ip route flush table "$TABLE_PRIVATE" >/dev/null 2>&1 || true
 ip route flush table "$TABLE_PUBLIC" >/dev/null 2>&1 || true
 
@@ -715,14 +746,78 @@ menu_loop() {
   done
 }
 
+usage() {
+  cat <<'EOF_USAGE'
+用法:
+  hkt.sh                 进入交互菜单
+  hkt.sh --apply         应用内网IP默认出站
+  hkt.sh --rollback      回滚为公网IP默认出站
+  hkt.sh --status        查看当前详细状态
+  hkt.sh --refresh       重新自动识别环境
+  hkt.sh --clean         仅清理策略规则
+  hkt.sh --install-service   安装开机自动应用
+  hkt.sh --remove-service    移除开机自动应用
+  hkt.sh --uninstall     卸载并恢复默认（含确认）
+  hkt.sh --help          显示帮助
+EOF_USAGE
+}
+
+run_non_interactive() {
+  case "${1:-}" in
+    --apply)
+      apply_private_as_default_src
+      show_last_result
+      ;;
+    --rollback)
+      rollback_public_as_default_src
+      show_last_result
+      ;;
+    --status)
+      show_route_status
+      ;;
+    --refresh)
+      if refresh_state; then set_last_result "success" "自动识别完成"; else set_last_result "error" "自动识别失败"; fi
+      show_last_result
+      ;;
+    --clean)
+      clean_policy_only
+      set_last_result "success" "策略规则已清理"
+      show_last_result
+      ;;
+    --install-service)
+      install_service
+      show_last_result
+      ;;
+    --remove-service)
+      remove_service
+      show_last_result
+      ;;
+    --uninstall)
+      full_uninstall
+      show_last_result
+      ;;
+    --help)
+      usage
+      ;;
+    "")
+      menu_loop
+      ;;
+    *)
+      print_error "未知参数: $1"
+      usage
+      return 1
+      ;;
+  esac
+}
+
 main() {
   require_root
   check_dependencies
   init_runtime
   check_route_manager_conflict
   acquire_lock
-  trap release_lock EXIT INT TERM
-  menu_loop
+  trap release_lock EXIT INT TERM HUP
+  run_non_interactive "${1:-}"
 }
 
 main "$@"
