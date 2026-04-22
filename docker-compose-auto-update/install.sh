@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -u -o pipefail
 
 INSTALL_DIR="/opt/docker-compose-auto-update"
 
@@ -16,12 +16,27 @@ CONFIG_URL="${BASE_URL}/${TARGET_CONFIG}"
 CRON_TAG="# docker-compose-auto-update-managed"
 DEFAULT_INTERVAL_HOURS=6
 
+clear_screen() {
+  if command -v clear >/dev/null 2>&1; then
+    clear
+  fi
+}
+
 get_crontab_content() {
   crontab -l 2>/dev/null || true
 }
 
 get_managed_cron_line() {
-  get_crontab_content | grep -F "$CRON_TAG" | tail -n 1 || true
+  get_crontab_content \
+    | grep -F "\"${TARGET_SCRIPT_PATH}\"" \
+    | grep -F "$CRON_TAG" \
+    | tail -n 1 || true
+}
+
+filter_out_managed_cron() {
+  get_crontab_content | awk -v script="$TARGET_SCRIPT_PATH" -v tag="$CRON_TAG" '
+    !(index($0, script) > 0 && index($0, tag) > 0)
+  '
 }
 
 get_managed_schedule() {
@@ -62,7 +77,7 @@ script_status() {
 }
 
 render_home() {
-  clear
+  clear_screen
   echo "=============================================="
   echo " docker-compose-auto-update 控制台"
   echo "=============================================="
@@ -74,6 +89,7 @@ render_home() {
   echo "1) 安装/更新"
   echo "2) 卸载"
   echo "3) 更新间隔（crontab 定时间隔）"
+  echo "4) 立即更新（立刻执行一次）"
   echo "0) 退出"
   echo "=============================================="
 }
@@ -95,7 +111,29 @@ safe_download() {
     return 1
   fi
 
-  mv "$tmp_file" "$dest"
+  if ! mv "$tmp_file" "$dest"; then
+    echo "[错误] 写入文件失败: $dest"
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  return 0
+}
+
+ensure_installed_script() {
+  if [[ ! -f "$TARGET_SCRIPT_PATH" ]]; then
+    echo "[错误] 未检测到更新脚本：$TARGET_SCRIPT_PATH"
+    echo "请先执行“1) 安装/更新”。"
+    return 1
+  fi
+
+  if [[ ! -x "$TARGET_SCRIPT_PATH" ]]; then
+    if ! chmod +x "$TARGET_SCRIPT_PATH"; then
+      echo "[错误] 更新脚本不可执行，且无法自动修复权限：$TARGET_SCRIPT_PATH"
+      return 1
+    fi
+  fi
+
   return 0
 }
 
@@ -104,24 +142,37 @@ write_managed_cron() {
   local cron_line current
 
   cron_line="0 */${interval} * * * \"${TARGET_SCRIPT_PATH}\" ${CRON_TAG}"
-  current="$(get_crontab_content | grep -vF "$CRON_TAG" || true)"
+  current="$(filter_out_managed_cron || true)"
 
-  {
+  if ! {
     if [[ -n "${current//[[:space:]]/}" ]]; then
       echo "$current"
     fi
     echo "$cron_line"
-  } | crontab -
+  } | crontab -; then
+    echo "[错误] 写入 crontab 失败。"
+    return 1
+  fi
+
+  return 0
 }
 
 remove_managed_cron() {
   local current
-  current="$(get_crontab_content | grep -vF "$CRON_TAG" || true)"
+  current="$(filter_out_managed_cron || true)"
   if [[ -n "${current//[[:space:]]/}" ]]; then
-    echo "$current" | crontab -
+    if ! echo "$current" | crontab -; then
+      echo "[错误] 更新 crontab 失败。"
+      return 1
+    fi
   else
-    crontab -r 2>/dev/null || true
+    if ! crontab -r 2>/dev/null; then
+      echo "[错误] 清空 crontab 失败。"
+      return 1
+    fi
   fi
+
+  return 0
 }
 
 install_or_update() {
@@ -145,7 +196,10 @@ install_or_update() {
     return
   fi
 
-  chmod +x "$TARGET_SCRIPT_PATH"
+  if ! chmod +x "$TARGET_SCRIPT_PATH"; then
+    echo "[错误] 无法设置可执行权限：$TARGET_SCRIPT_PATH"
+    return
+  fi
 
   if [[ -f "$TARGET_CONFIG_PATH" ]]; then
     echo "[提示] 检测到已存在配置文件，默认保留本地配置：$TARGET_CONFIG_PATH"
@@ -162,7 +216,11 @@ install_or_update() {
     interval="$DEFAULT_INTERVAL_HOURS"
   fi
 
-  write_managed_cron "$interval"
+  if ! write_managed_cron "$interval"; then
+    echo "[失败] 定时任务写入失败。"
+    return
+  fi
+
   echo "[成功] 安装/更新完成，当前定时：每 ${interval} 小时执行一次。"
 }
 
@@ -174,7 +232,10 @@ uninstall_all() {
     return
   fi
 
-  remove_managed_cron
+  if ! remove_managed_cron; then
+    echo "[失败] 卸载过程中移除 crontab 失败。"
+    return
+  fi
 
   rm -f \
     "$TARGET_SCRIPT_PATH" \
@@ -194,20 +255,36 @@ update_interval() {
     return
   fi
 
-  if [[ ! -f "$TARGET_SCRIPT_PATH" ]]; then
-    echo "[错误] 未检测到更新脚本：$TARGET_SCRIPT_PATH"
-    echo "请先执行“1) 安装/更新”。"
+  if ! ensure_installed_script; then
     return
   fi
 
-  write_managed_cron "$hours"
+  if ! write_managed_cron "$hours"; then
+    echo "[失败] 定时更新失败。"
+    return
+  fi
+
   echo "[成功] 定时已更新为每 ${hours} 小时执行一次。"
+}
+
+run_update_now() {
+  echo
+  if ! ensure_installed_script; then
+    return
+  fi
+
+  echo "[执行] 正在立即运行更新脚本..."
+  if "$TARGET_SCRIPT_PATH"; then
+    echo "[成功] 立即更新执行完成。"
+  else
+    echo "[失败] 立即更新执行失败，请检查日志：$TARGET_LOG_PATH"
+  fi
 }
 
 main() {
   while true; do
     render_home
-    read -r -p "请选择操作 [0-3]: " choice
+    read -r -p "请选择操作 [0-4]: " choice
     case "$choice" in
       1)
         install_or_update
@@ -218,12 +295,15 @@ main() {
       3)
         update_interval
         ;;
+      4)
+        run_update_now
+        ;;
       0)
         echo "已退出。"
         exit 0
         ;;
       *)
-        echo "无效选择，请输入 0-3。"
+        echo "无效选择，请输入 0-4。"
         ;;
     esac
 
