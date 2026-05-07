@@ -113,7 +113,8 @@ load_rules_for_apply() {
             continue
         fi
 
-        is_valid_ip "$resolved" || continue
+        # 允许 "localhost" 作为本机转发标记，或有效 IP 地址
+        [[ "$resolved" == "localhost" ]] || is_valid_ip "$resolved" || continue
         rules_listen_ip+=("$listen_ip"); rules_src_port+=("$src_port")
         rules_dst_port+=("$dst_port"); rules_resolved_ip+=("$resolved"); rules_proto+=("$proto")
     done < "$CONFIG_FILE"
@@ -165,8 +166,43 @@ add_single_nft_rule() {
     append_nft_line "$line"
 }
 
+# 本机端口重定向（redirect）：不做 DNAT，仅改变目标端口
+add_single_redirect_rule() {
+    local family="$1" proto="$2" src_dport="$3" dst_port="$4"
+    local line="add rule ${family} ${TABLE_NAME} ${CHAIN_PRE} ${proto} dport ${src_dport} redirect to :${dst_port}"
+    append_nft_line "$line"
+}
+
 add_nft_rule() {
     local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
+
+    # 本机转发（localhost）：使用 redirect 而非 dnat
+    if [[ "$dst_ip" == "localhost" || "$dst_ip" == "127.0.0.1" ]]; then
+        local src_meta dst_meta
+        src_meta=$(parse_port_expr "$src_port") || return 1
+        dst_meta=$(parse_port_expr "$dst_port") || return 1
+
+        local src_type src_start src_end dst_type dst_start dst_end
+        IFS='|' read -r src_type src_start src_end <<< "$src_meta"
+        IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
+
+        if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
+            add_single_redirect_rule "ip" "$proto" "$src_port" "$dst_port"
+            return
+        fi
+        if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+            local src_len=$(( src_end - src_start + 1 ))
+            if [[ "$src_len" -gt 1000 ]]; then
+                echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
+                return 1
+            fi
+            for ((offset=0; offset<src_len; offset++)); do
+                add_single_redirect_rule "ip" "$proto" "$((src_start + offset))" "$((dst_start + offset))"
+            done
+            return
+        fi
+        return 1
+    fi
 
     local family="ip" dst_target_ip="$dst_ip"
     if is_valid_ipv6 "$dst_ip"; then
