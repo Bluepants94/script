@@ -106,18 +106,6 @@ proto_to_label() {
     esac
 }
 
-is_private_ip() {
-    local ip="$1"
-    [[ "$ip" =~ ^10\. ]] && return 0
-    [[ "$ip" =~ ^192\.168\. ]] && return 0
-    if [[ "$ip" =~ ^172\.([0-9]{1,2})\. ]]; then
-        local second="${BASH_REMATCH[1]}"
-        [[ "$second" -ge 16 && "$second" -le 31 ]] && return 0
-    fi
-    [[ "$ip" =~ ^127\. ]] && return 0
-    return 1
-}
-
 is_valid_ipv4() {
     local ip="$1"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -425,51 +413,28 @@ init_env() {
     sync_cron_tasks_from_config
 }
 
-# ---------- 本机IP探测 ----------
-get_local_ipv4_list() {
-    local_ips=()
-    local_ifaces=()
-    while IFS='|' read -r iface cidr; do
-        [[ -z "$iface" || -z "$cidr" ]] && continue
-        local_ips+=("${cidr%%/*}")
-        local_ifaces+=("$iface")
-    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2"|"$4}')
-}
-
 choose_listen_ip() {
     SELECTED_LISTEN_IP="0.0.0.0"
-    get_local_ipv4_list
 
     echo ""
     echo -e "${CYAN}请选择监听IP:${NC}"
-    echo "  1) 0.0.0.0"
-
-    local next_idx=2
-    for ((i=0; i<${#local_ips[@]}; i++)); do
-        local tag="公网"
-        is_private_ip "${local_ips[$i]}" && tag="内网"
-        echo "  ${next_idx}) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
-        next_idx=$((next_idx + 1))
-    done
-
-    local manual_idx=$next_idx
-    echo "  ${manual_idx}) 手动输入IP"
-    echo -e "  ${NC}0) 返回主菜单${NC}"
+    echo "  1) localhost"
+    echo "  2) 0.0.0.0"
+    echo "  3) 161.129.35.217 (eth0, 公网)"
+    echo "  4) 手动输入IP"
+    echo "  0) 返回主菜单"
 
     local choice
     while true; do
-        read -r -p "请选择 [0-${manual_idx}]（默认: 1）: " choice
-        choice=${choice:-1}
+        read -r -p "请选择 [0-4]（默认: 2）: " choice
+        choice=${choice:-2}
 
         [[ "$choice" == "0" ]] && return 1
-        [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
+        [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="127.0.0.1"; return 0; }
+        [[ "$choice" == "2" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
+        [[ "$choice" == "3" ]] && { SELECTED_LISTEN_IP="161.129.35.217"; return 0; }
 
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 2 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-            SELECTED_LISTEN_IP="${local_ips[$((choice - 2))]}"
-            return 0
-        fi
-
-        if [[ "$choice" == "$manual_idx" ]]; then
+        if [[ "$choice" == "4" ]]; then
             while true; do
                 local manual_ip
                 read -r -p "请输入监听IP: " manual_ip
@@ -717,23 +682,28 @@ do_add() {
         break
     done
 
-    # 输入目标地址
+    # 输入目标地址（localhost 本机转发时无需输入目标地址，使用 nft redirect）
     local dst_host resolved_ip is_domain check_interval_seconds
-    while true; do
-        read -r -p "请输入目标地址（IPv4或域名）: " dst_host
-        if is_valid_ipv4 "$dst_host"; then
-            is_domain="0"; resolved_ip="$dst_host"; check_interval_seconds=0; break
-        fi
-        if is_valid_domain "$dst_host"; then
-            is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-            resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
-            if ! is_valid_ipv4 "$resolved_ip"; then
-                print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
+    if [[ "$listen_ip" == "127.0.0.1" ]]; then
+        dst_host="localhost"; is_domain="0"; resolved_ip="localhost"; check_interval_seconds=0
+        print_info "本机端口转发（将使用 nft redirect）"
+    else
+        while true; do
+            read -r -p "请输入目标地址（IPv4或域名）: " dst_host
+            if is_valid_ipv4 "$dst_host"; then
+                is_domain="0"; resolved_ip="$dst_host"; check_interval_seconds=0; break
             fi
-            break
-        fi
-        print_error "输入无效，请重新输入！"
-    done
+            if is_valid_domain "$dst_host"; then
+                is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
+                resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
+                if ! is_valid_ipv4 "$resolved_ip"; then
+                    print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
+                fi
+                break
+            fi
+            print_error "输入无效，请重新输入！"
+        done
+    fi
 
     # 输入目标端口
     local dst_port_input dst_port dst_meta dst_type dst_start dst_end
@@ -762,6 +732,7 @@ do_add() {
     echo "  1) TCP+UDP（默认）"
     echo "  2) 仅 TCP"
     echo "  3) 仅 UDP"
+    local proto_choice
     while true; do
         read -r -p "请选择 [1-3]（默认: 1）: " proto_choice
         proto_choice=${proto_choice:-1}
