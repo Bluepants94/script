@@ -31,6 +31,7 @@ LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
+CHAIN_FWD="IPTFWD-FWD"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -230,12 +231,21 @@ remove_custom_chain() {
     "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
 }
 
+remove_forward_chain() {
+    local cmd="$1"
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+    while "$cmd" -D FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1; do :; done
+    "$cmd" -F "$CHAIN_FWD" >/dev/null 2>&1 || true
+    "$cmd" -X "$CHAIN_FWD" >/dev/null 2>&1 || true
+}
+
 remove_all_custom_chains() {
     local cmd chain
     for cmd in iptables ip6tables; do
         for chain in "$CHAIN_PRE" "$CHAIN_POST"; do
             remove_custom_chain "$cmd" "$chain"
         done
+        remove_forward_chain "$cmd"
     done
 }
 

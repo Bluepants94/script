@@ -13,6 +13,7 @@ CONFIG_FILE="${CONFIG_DIR}/rules.conf"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
+CHAIN_FWD="IPTFWD-FWD"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
 GLOBAL_WATCH_ENABLED=1
@@ -91,6 +92,7 @@ ensure_ip6_chains() {
     ip6tables -t nat -N "$CHAIN_POST" 2>/dev/null || ip6tables -t nat -F "$CHAIN_POST"
     ip6tables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || ip6tables -t nat -A PREROUTING -j "$CHAIN_PRE"
     ip6tables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || ip6tables -t nat -A POSTROUTING -j "$CHAIN_POST"
+    init_forward_chain ip6tables
 
     IP6_CHAINS_READY=1
 }
@@ -141,6 +143,10 @@ remove_all_custom_chains() {
             "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
             "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
         done
+        # 清理 filter/FORWARD 中的跳转与自定义链
+        while "$cmd" -D FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1; do :; done
+        "$cmd" -F "$CHAIN_FWD" >/dev/null 2>&1 || true
+        "$cmd" -X "$CHAIN_FWD" >/dev/null 2>&1 || true
     done
     IP6_CHAINS_READY=0
 }
@@ -150,6 +156,28 @@ init_custom_chains() {
     iptables -t nat -N "$CHAIN_POST" 2>/dev/null || iptables -t nat -F "$CHAIN_POST"
     iptables -t nat -C PREROUTING -j "$CHAIN_PRE" 2>/dev/null || iptables -t nat -A PREROUTING -j "$CHAIN_PRE"
     iptables -t nat -C POSTROUTING -j "$CHAIN_POST" 2>/dev/null || iptables -t nat -A POSTROUTING -j "$CHAIN_POST"
+}
+
+# 创建 filter/FORWARD 自定义链，并插到 FORWARD 顶部，避免被 Docker/DROP 提前丢弃。
+# 第一条放行 ESTABLISHED,RELATED 回程包；后续逐条 ACCEPT 由 add_forward_accept_rule 添加。
+init_forward_chain() {
+    local cmd="$1"
+    "$cmd" -N "$CHAIN_FWD" 2>/dev/null || "$cmd" -F "$CHAIN_FWD"
+    # 插到 FORWARD 顶部（-I FORWARD 1），如已存在跳转则跳过
+    "$cmd" -C FORWARD -j "$CHAIN_FWD" >/dev/null 2>&1 || \
+        "$cmd" -I FORWARD 1 -j "$CHAIN_FWD" >/dev/null 2>&1 || true
+    # 回程放行
+    "$cmd" -A "$CHAIN_FWD" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+        "$cmd" -A "$CHAIN_FWD" -m state --state ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || true
+}
+
+# 为单条 DNAT 规则在 FORWARD 链放行：
+# 注意 FORWARD 看到的是 DNAT 之后的包，所以匹配解析后的 dst_ip 与 dst_port。
+add_forward_accept_rule() {
+    local cmd="$1" dst_ip="$2" proto="$3" dport="$4"
+    [[ "$dst_ip" == "localhost" || "$dst_ip" == "127.0.0.1" ]] && return 0
+    "$cmd" -A "$CHAIN_FWD" -d "$dst_ip" -p "$proto" --dport "$dport" -j ACCEPT >/dev/null 2>&1 || \
+        echo "[错误] FORWARD 放行失败: -d ${dst_ip} -p ${proto} --dport ${dport}" >&2
 }
 
 add_masquerade_rules() {
@@ -226,7 +254,10 @@ add_iptables_rule() {
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
         local src_dport="${src_port//-/:}"
+        local fwd_dport="${dst_port//-/:}"
         add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$src_dport" "${dst_target_ip}:${dst_port}"
+        # 同步在 filter/FORWARD 放行 DNAT 后的目标（解决 Docker 等场景下 FORWARD policy=DROP）
+        add_forward_accept_rule "$ip_cmd" "$dst_ip" "$proto" "$fwd_dport"
         return
     fi
 
@@ -239,6 +270,7 @@ add_iptables_rule() {
         fi
         for ((offset=0; offset<src_len; offset++)); do
             add_single_iptables_rule "$ip_cmd" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
+            add_forward_accept_rule "$ip_cmd" "$dst_ip" "$proto" "$((dst_start + offset))"
         done
         return
     fi
@@ -253,6 +285,7 @@ run_apply() {
     load_rules_for_apply
     remove_all_custom_chains
     init_custom_chains || return 1
+    init_forward_chain iptables
 
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
         add_masquerade_rules; return $?
