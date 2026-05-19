@@ -106,6 +106,18 @@ proto_to_label() {
     esac
 }
 
+is_private_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^10\. ]] && return 0
+    [[ "$ip" =~ ^192\.168\. ]] && return 0
+    if [[ "$ip" =~ ^172\.([0-9]{1,2})\. ]]; then
+        local second="${BASH_REMATCH[1]}"
+        [[ "$second" -ge 16 && "$second" -le 31 ]] && return 0
+    fi
+    [[ "$ip" =~ ^127\. ]] && return 0
+    return 1
+}
+
 is_valid_ipv4() {
     local ip="$1"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -413,28 +425,58 @@ init_env() {
     sync_cron_tasks_from_config
 }
 
+# ---------- 本机IP探测 ----------
+get_local_ipv4_list() {
+    local_ips=()
+    local_ifaces=()
+    command -v ip >/dev/null 2>&1 || return 0
+    while IFS='|' read -r iface cidr; do
+        [[ -z "$iface" || -z "$cidr" ]] && continue
+        local ip_only="${cidr%%/*}"
+        # 跳过回环地址，回环已通过 "localhost" 选项单独提供
+        [[ "$ip_only" =~ ^127\. ]] && continue
+        local_ips+=("$ip_only")
+        local_ifaces+=("$iface")
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2"|"$4}')
+}
+
 choose_listen_ip() {
     SELECTED_LISTEN_IP="0.0.0.0"
+    local local_ips=() local_ifaces=()
+    get_local_ipv4_list
 
     echo ""
     echo -e "${CYAN}请选择监听IP:${NC}"
     echo "  1) localhost"
     echo "  2) 0.0.0.0"
-    echo "  3) 161.129.35.217 (eth0, 公网)"
-    echo "  4) 手动输入IP"
+
+    local next_idx=3
+    for ((i=0; i<${#local_ips[@]}; i++)); do
+        local tag="公网"
+        is_private_ip "${local_ips[$i]}" && tag="内网"
+        echo "  ${next_idx}) ${local_ips[$i]} (${local_ifaces[$i]}, ${tag})"
+        next_idx=$((next_idx + 1))
+    done
+
+    local manual_idx=$next_idx
+    echo "  ${manual_idx}) 手动输入IP"
     echo "  0) 返回主菜单"
 
     local choice
     while true; do
-        read -r -p "请选择 [0-4]（默认: 2）: " choice
+        read -r -p "请选择 [0-${manual_idx}]（默认: 2）: " choice
         choice=${choice:-2}
 
         [[ "$choice" == "0" ]] && return 1
         [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="127.0.0.1"; return 0; }
         [[ "$choice" == "2" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
-        [[ "$choice" == "3" ]] && { SELECTED_LISTEN_IP="161.129.35.217"; return 0; }
 
-        if [[ "$choice" == "4" ]]; then
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 3 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
+            SELECTED_LISTEN_IP="${local_ips[$((choice - 3))]}"
+            return 0
+        fi
+
+        if [[ "$choice" == "$manual_idx" ]]; then
             while true; do
                 local manual_ip
                 read -r -p "请输入监听IP: " manual_ip
