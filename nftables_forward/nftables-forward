@@ -14,7 +14,10 @@ LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="NFTFWD-PRE"
 CHAIN_POST="NFTFWD-POST"
 TABLE_NAME="nftfwd"
+# 与 iptables 共用的 FORWARD 自定义链（用于 Docker 等场景下 FORWARD policy=DROP 时放行 DNAT 后的流量）
+IPT_FWD_CHAIN="NFTFWD-FWD"
 SCRIPT_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
 
 GLOBAL_WATCH_ENABLED=1
 MANUAL_MODE=0
@@ -124,6 +127,41 @@ remove_all_custom_tables() {
     command -v nft >/dev/null 2>&1 || return 0
     nft delete table ip "$TABLE_NAME" >/dev/null 2>&1 || true
     nft delete table ip6 "$TABLE_NAME" >/dev/null 2>&1 || true
+    cleanup_iptables_forward_chain
+}
+
+# ---------- iptables FORWARD 放行 ----------
+# Docker 等会把 filter/FORWARD 默认策略设为 DROP，仅在 nat 表做 DNAT 不够，
+# 这里用 iptables（在 nftables 后端上同样可用）在 FORWARD 顶部插入 ACCEPT 链。
+init_iptables_forward_chain() {
+    local cmd
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        "$cmd" -N "$IPT_FWD_CHAIN" 2>/dev/null || "$cmd" -F "$IPT_FWD_CHAIN"
+        "$cmd" -C FORWARD -j "$IPT_FWD_CHAIN" >/dev/null 2>&1 || \
+            "$cmd" -I FORWARD 1 -j "$IPT_FWD_CHAIN" >/dev/null 2>&1 || true
+        "$cmd" -A "$IPT_FWD_CHAIN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || \
+            "$cmd" -A "$IPT_FWD_CHAIN" -m state --state ESTABLISHED,RELATED -j ACCEPT >/dev/null 2>&1 || true
+    done
+}
+
+cleanup_iptables_forward_chain() {
+    local cmd
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        while "$cmd" -D FORWARD -j "$IPT_FWD_CHAIN" >/dev/null 2>&1; do :; done
+        "$cmd" -F "$IPT_FWD_CHAIN" >/dev/null 2>&1 || true
+        "$cmd" -X "$IPT_FWD_CHAIN" >/dev/null 2>&1 || true
+    done
+}
+
+# 为单条 DNAT 规则在 FORWARD 链放行：FORWARD 看到的是 DNAT 之后的目标 IP/端口
+add_iptables_forward_accept() {
+    local cmd="$1" dst_ip="$2" proto="$3" dport="$4"
+    [[ "$dst_ip" == "localhost" || "$dst_ip" == "127.0.0.1" ]] && return 0
+    command -v "$cmd" >/dev/null 2>&1 || return 0
+    "$cmd" -A "$IPT_FWD_CHAIN" -d "$dst_ip" -p "$proto" --dport "$dport" -j ACCEPT >/dev/null 2>&1 || \
+        echo "[错误] FORWARD 放行失败: -d ${dst_ip} -p ${proto} --dport ${dport}" >&2
 }
 
 append_nft_line() {
@@ -176,6 +214,10 @@ add_single_redirect_rule() {
 add_nft_rule() {
     local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
 
+    # 决定 FORWARD 放行用哪个 ip 命令
+    local fwd_cmd="iptables"
+    is_valid_ipv6 "$dst_ip" && fwd_cmd="ip6tables"
+
     # 本机转发（localhost）：使用 redirect 而非 dnat
     if [[ "$dst_ip" == "localhost" || "$dst_ip" == "127.0.0.1" ]]; then
         local src_meta dst_meta
@@ -221,6 +263,15 @@ add_nft_rule() {
     if [[ "$src_type" == "single" && "$dst_type" == "single" ]] || \
        [[ "$src_type" == "range" && "$dst_type" == "range" && "$src_start" == "$dst_start" && "$src_end" == "$dst_end" ]]; then
         add_single_nft_rule "$family" "$listen_ip" "$proto" "$src_port" "${dst_target_ip}:${dst_port}"
+        # 同步在 filter/FORWARD 放行 DNAT 后的目标
+        if [[ "$dst_type" == "single" ]]; then
+            add_iptables_forward_accept "$fwd_cmd" "$dst_ip" "$proto" "$dst_port"
+        else
+            local off
+            for ((off=0; off<=dst_end-dst_start; off++)); do
+                add_iptables_forward_accept "$fwd_cmd" "$dst_ip" "$proto" "$((dst_start + off))"
+            done
+        fi
         return
     fi
 
@@ -232,6 +283,7 @@ add_nft_rule() {
         fi
         for ((offset=0; offset<src_len; offset++)); do
             add_single_nft_rule "$family" "$listen_ip" "$proto" "$((src_start + offset))" "${dst_target_ip}:$((dst_start + offset))"
+            add_iptables_forward_accept "$fwd_cmd" "$dst_ip" "$proto" "$((dst_start + offset))"
         done
         return
     fi
@@ -246,6 +298,7 @@ run_apply() {
     load_rules_for_apply
     remove_all_custom_tables
     init_ruleset_base
+    init_iptables_forward_chain
 
     local fail_count=0
     for ((i=0; i<${#rules_src_port[@]}; i++)); do

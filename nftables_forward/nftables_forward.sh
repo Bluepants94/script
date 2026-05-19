@@ -30,6 +30,8 @@ RESTART_CRON_TAG="# nftables-forward-restart"
 LEGACY_WATCH_CRON_TAG="# nftables-forward-watch"
 LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 # 注意: CHAIN_PRE/CHAIN_POST 由 nftables-forward 执行脚本使用，管理脚本仅在卸载时清理表
+# IPT_FWD_CHAIN: 与 Docker 共存时，由执行脚本通过 iptables 在 filter/FORWARD 顶部插入的 ACCEPT 链
+IPT_FWD_CHAIN="NFTFWD-FWD"
 
 # ---------- 全局数组 ----------
 rules_listen_ip=()
@@ -220,10 +222,22 @@ sync_cron_tasks_from_config() {
 }
 
 # ---------- 自定义表清理 ----------
+remove_iptables_forward_chain() {
+    local cmd
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        while "$cmd" -D FORWARD -j "$IPT_FWD_CHAIN" >/dev/null 2>&1; do :; done
+        "$cmd" -F "$IPT_FWD_CHAIN" >/dev/null 2>&1 || true
+        "$cmd" -X "$IPT_FWD_CHAIN" >/dev/null 2>&1 || true
+    done
+}
+
 remove_all_custom_tables() {
-    command -v nft >/dev/null 2>&1 || return 0
-    nft delete table ip "nftfwd" >/dev/null 2>&1 || true
-    nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
+    command -v nft >/dev/null 2>&1 && {
+        nft delete table ip "nftfwd" >/dev/null 2>&1 || true
+        nft delete table ip6 "nftfwd" >/dev/null 2>&1 || true
+    }
+    remove_iptables_forward_chain
 }
 
 # ---------- 卸载 ----------
