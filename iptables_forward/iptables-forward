@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================
 #  iptables 端口转发统一脚本（apply + watch）
@@ -29,6 +29,8 @@ is_valid_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
     for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        [[ "${#o}" -gt 1 && "$o" == 0* ]] && return 1
         [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
     done
     return 0
@@ -122,10 +124,25 @@ load_rules_for_apply() {
             continue
         fi
 
-        is_valid_ip "$resolved" || continue
+        # 允许 "localhost" 作为本机转发标记，或有效 IP 地址
+        [[ "$resolved" == "localhost" ]] || is_valid_ip "$resolved" || continue
         rules_listen_ip+=("$listen_ip"); rules_src_port+=("$src_port")
         rules_dst_port+=("$dst_port"); rules_resolved_ip+=("$resolved"); rules_proto+=("$proto")
     done < "$CONFIG_FILE"
+}
+
+remove_all_custom_chains() {
+    local cmd chain
+    for cmd in iptables ip6tables; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        for chain in "$CHAIN_PRE" "$CHAIN_POST"; do
+            while "$cmd" -t nat -D PREROUTING -j "$chain" >/dev/null 2>&1; do :; done
+            while "$cmd" -t nat -D POSTROUTING -j "$chain" >/dev/null 2>&1; do :; done
+            "$cmd" -t nat -F "$chain" >/dev/null 2>&1 || true
+            "$cmd" -t nat -X "$chain" >/dev/null 2>&1 || true
+        done
+    done
+    IP6_CHAINS_READY=0
 }
 
 init_custom_chains() {
@@ -153,8 +170,43 @@ add_single_iptables_rule() {
     fi
 }
 
+# 本机端口重定向（REDIRECT）：不做 DNAT，仅改变目标端口
+add_single_redirect_rule() {
+    local proto="$1" src_dport="$2" dst_port="$3"
+    iptables -t nat -A "$CHAIN_PRE" -p "$proto" --dport "$src_dport" -j REDIRECT --to-ports "$dst_port" || \
+        echo "[错误] REDIRECT 添加失败: ${src_dport} -> :${dst_port} (${proto})" >&2
+}
+
 add_iptables_rule() {
     local listen_ip="$1" src_port="$2" dst_ip="$3" dst_port="$4" proto="$5"
+
+    # 本机转发（localhost）：使用 REDIRECT 而非 DNAT
+    if [[ "$dst_ip" == "localhost" || "$dst_ip" == "127.0.0.1" ]]; then
+        local src_meta dst_meta
+        src_meta=$(parse_port_expr "$src_port") || return 1
+        dst_meta=$(parse_port_expr "$dst_port") || return 1
+
+        local src_type src_start src_end dst_type dst_start dst_end
+        IFS='|' read -r src_type src_start src_end <<< "$src_meta"
+        IFS='|' read -r dst_type dst_start dst_end <<< "$dst_meta"
+
+        if [[ "$src_type" == "single" && "$dst_type" == "single" ]]; then
+            add_single_redirect_rule "$proto" "$src_port" "$dst_port"
+            return
+        fi
+        if [[ "$src_type" == "range" && "$dst_type" == "range" ]]; then
+            local src_len=$(( src_end - src_start + 1 ))
+            if [[ "$src_len" -gt 1000 ]]; then
+                echo "[警告] 端口段过大 (${src_len} 端口)，跳过此规则" >&2
+                return 1
+            fi
+            for ((offset=0; offset<src_len; offset++)); do
+                add_single_redirect_rule "$proto" "$((src_start + offset))" "$((dst_start + offset))"
+            done
+            return
+        fi
+        return 1
+    fi
 
     local ip_cmd="iptables" dst_target_ip="$dst_ip"
     if is_valid_ipv6 "$dst_ip"; then
@@ -199,6 +251,7 @@ run_apply() {
         { echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || return 1; }
 
     load_rules_for_apply
+    remove_all_custom_chains
     init_custom_chains || return 1
 
     if [[ ${#rules_src_port[@]} -eq 0 ]]; then
@@ -235,15 +288,15 @@ run_watch() {
     exec 200>"$LOCK_FILE"
     flock -n 200 || return 0
 
-    local tmp_file now changed
+    local tmp_file now changed raw_line
     tmp_file=$(mktemp)
     now=$(date +%s)
     changed=0
 
-    while IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
-        # 注释行 / 空行 / 全局设置行直接透传
+    while IFS= read -r raw_line; do
+        IFS='|' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9 <<< "$raw_line"
         if [[ -z "$c1" || "$c1" == \#* || "$c1" =~ ^GLOBAL_ ]]; then
-            echo "$c1${c2:+|$c2}${c3:+|$c3}${c4:+|$c4}${c5:+|$c5}${c6:+|$c6}${c7:+|$c7}${c8:+|$c8}${c9:+|$c9}" >> "$tmp_file"
+            printf '%s\n' "$raw_line" >> "$tmp_file"
             continue
         fi
 
@@ -278,7 +331,7 @@ run_watch() {
     done < "$CONFIG_FILE"
 
     if [[ "$changed" -eq 1 ]]; then
-        cp "$tmp_file" "$CONFIG_FILE"
+        mv -f "$tmp_file" "$CONFIG_FILE"
         if [[ "$MANUAL_MODE" -eq 0 ]]; then
             sleep 3
             local apply_cmd="$SCRIPT_SELF"
@@ -298,16 +351,20 @@ run_watch() {
             done
         fi
     elif ! cmp -s "$tmp_file" "$CONFIG_FILE"; then
-        cp "$tmp_file" "$CONFIG_FILE"
+        mv -f "$tmp_file" "$CONFIG_FILE"
+    else
+        rm -f "$tmp_file"
     fi
 
-    rm -f "$tmp_file"
+    # 释放文件锁
+    exec 200>&-
 }
 
 main() {
     local mode="apply"
     case "${1:-}" in
         --watch) mode="watch" ;;
+        --apply) mode="apply" ;;
         *) mode="apply" ;;
     esac
 

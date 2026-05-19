@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================
 #  iptables 端口转发管理脚本（增强版）
@@ -28,6 +28,7 @@ RAW_SERVICE_URL="${RAW_BASE_URL}/iptables-forward.service"
 WATCH_CRON_TAG="# iptables-forward-domain"
 RESTART_CRON_TAG="# iptables-forward-restart"
 LEGACY_WATCH_CRON_TAG="# iptables-forward-watch"
+LOCK_FILE="${CONFIG_DIR}/rules.conf.lock"
 CHAIN_PRE="IPTFWD-PRE"
 CHAIN_POST="IPTFWD-POST"
 
@@ -123,8 +124,9 @@ is_valid_ipv4() {
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
     for o in "$o1" "$o2" "$o3" "$o4"; do
-        # 拒绝前导零（如 099、01）
-        [[ "$o" =~ ^0[0-9]+ ]] && return 1
+        # 检查纯数字、拒绝前导零（如 010）、范围 0-255
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        [[ "${#o}" -gt 1 && "$o" == 0* ]] && return 1
         [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
     done
     return 0
@@ -254,7 +256,7 @@ do_uninstall() {
     remove_all_custom_chains
 
     rm -f "$SCRIPT_INSTALL_PATH" "/usr/local/bin/iptables-forward-apply" >/dev/null 2>&1 || true
-    rm -f "$CONFIG_FILE" >/dev/null 2>&1 || true
+    rm -f "$CONFIG_FILE" "$LOCK_FILE" >/dev/null 2>&1 || true
     rm -rf "$CONFIG_DIR" >/dev/null 2>&1 || true
 
     set_last_result "success" "移除完成：已清理脚本相关文件、cron 任务与自定义链"
@@ -304,12 +306,8 @@ read_global_settings_from_config() {
     local val
     for key in GLOBAL_WATCH_ENABLED GLOBAL_WATCH_INTERVAL_MINUTES GLOBAL_RESTART_INTERVAL_MINUTES; do
         val=$(grep -m1 "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2)
-        if [[ -n "$val" ]]; then
-            # 安全校验：仅接受纯数字，防止注入
-            if [[ "$val" =~ ^[0-9]+$ ]]; then
-                printf -v "$key" '%s' "$val"
-            fi
-        fi
+        # 仅接受纯数字，防止配置被篡改后注入
+        [[ "$val" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "$val"
     done
     normalize_global_settings
 }
@@ -338,13 +336,16 @@ download_file_silent() {
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
+    # 统一换行为 LF，避免 Windows CRLF 导致 Linux 执行报错
+    sed -i 's/\r$//' "$tmp_file" >/dev/null 2>&1 || true
+
     # 校验下载文件：非空且以 shebang 或 [Unit] 开头
     if [[ ! -s "$tmp_file" ]]; then
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
     local head_line
-    head_line=$(head -c 20 "$tmp_file" 2>/dev/null)
-    if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "[Unit]"* ]]; then
+    head_line=$(head -c 32 "$tmp_file" 2>/dev/null)
+    if [[ "$head_line" != "#!/bin/bash"* && "$head_line" != "#!/usr/bin/env bash"* && "$head_line" != "[Unit]"* ]]; then
         rm -f "$tmp_file" >/dev/null 2>&1; return 1
     fi
 
@@ -414,9 +415,16 @@ init_env() {
         fi
     fi
 
-    sync_support_files false || {
-        print_error "必需文件同步失败，请检查网络连接或 GitHub 地址"; exit 1
-    }
+    # 检查必需文件是否存在（不自动下载，需用户手动更新）
+    if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+        print_warn "应用脚本 ${SCRIPT_INSTALL_PATH} 不存在，正在尝试首次下载..."
+        if ! sync_support_files true; then
+            print_error "首次下载失败，请检查网络连接或 GitHub 地址"
+            print_info "也可手动放置文件后重试，或稍后通过菜单「更新脚本文件」下载"
+            exit 1
+        fi
+        print_success "首次下载完成"
+    fi
 
     read_global_settings_from_config
 
@@ -434,22 +442,28 @@ init_env() {
 get_local_ipv4_list() {
     local_ips=()
     local_ifaces=()
+    command -v ip >/dev/null 2>&1 || return 0
     while IFS='|' read -r iface cidr; do
         [[ -z "$iface" || -z "$cidr" ]] && continue
-        local_ips+=("${cidr%%/*}")
+        local ip_only="${cidr%%/*}"
+        # 跳过回环地址，回环已通过 "localhost" 选项单独提供
+        [[ "$ip_only" =~ ^127\. ]] && continue
+        local_ips+=("$ip_only")
         local_ifaces+=("$iface")
     done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2"|"$4}')
 }
 
 choose_listen_ip() {
     SELECTED_LISTEN_IP="0.0.0.0"
+    local local_ips=() local_ifaces=()
     get_local_ipv4_list
 
     echo ""
     echo -e "${CYAN}请选择监听IP:${NC}"
-    echo "  1) 0.0.0.0"
+    echo "  1) localhost"
+    echo "  2) 0.0.0.0"
 
-    local next_idx=2
+    local next_idx=3
     for ((i=0; i<${#local_ips[@]}; i++)); do
         local tag="公网"
         is_private_ip "${local_ips[$i]}" && tag="内网"
@@ -459,18 +473,19 @@ choose_listen_ip() {
 
     local manual_idx=$next_idx
     echo "  ${manual_idx}) 手动输入IP"
-    echo -e "  ${NC}0) 返回主菜单${NC}"
+    echo "  0) 返回主菜单"
 
     local choice
     while true; do
-        read -r -p "请选择 [0-${manual_idx}]（默认: 1）: " choice
-        choice=${choice:-1}
+        read -r -p "请选择 [0-${manual_idx}]（默认: 2）: " choice
+        choice=${choice:-2}
 
         [[ "$choice" == "0" ]] && return 1
-        [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
+        [[ "$choice" == "1" ]] && { SELECTED_LISTEN_IP="127.0.0.1"; return 0; }
+        [[ "$choice" == "2" ]] && { SELECTED_LISTEN_IP="0.0.0.0"; return 0; }
 
-        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 2 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
-            SELECTED_LISTEN_IP="${local_ips[$((choice - 2))]}"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 3 ]] && [[ "$choice" -lt "$manual_idx" ]]; then
+            SELECTED_LISTEN_IP="${local_ips[$((choice - 3))]}"
             return 0
         fi
 
@@ -527,8 +542,8 @@ load_rules() {
 save_rules() {
     normalize_global_settings
 
-    {
-        cat <<EOF_CONF
+    local tmp_conf="${CONFIG_FILE}.tmp.$$"
+    cat > "$tmp_conf" <<EOF_CONF
 # iptables 端口转发规则配置
 # 全局域名解析开关(1=启动,0=暂停)
 GLOBAL_WATCH_ENABLED=${GLOBAL_WATCH_ENABLED}
@@ -541,31 +556,39 @@ GLOBAL_RESTART_INTERVAL_MINUTES=${GLOBAL_RESTART_INTERVAL_MINUTES}
 # 自动生成，请勿手动修改（可通过脚本管理）
 EOF_CONF
 
-        for ((i=0; i<${#rules_src_port[@]}; i++)); do
-            local d_resolved="${rules_resolved_ip[$i]:-${rules_dst_ip[$i]}}"
-            local d_interval="${rules_check_interval[$i]}"
-            local d_last="${rules_last_check_ts[$i]}"
-            local d_is_domain="${rules_is_domain[$i]}"
+    for ((i=0; i<${#rules_src_port[@]}; i++)); do
+        local d_resolved="${rules_resolved_ip[$i]:-${rules_dst_ip[$i]}}"
+        local d_interval="${rules_check_interval[$i]}"
+        local d_last="${rules_last_check_ts[$i]}"
+        local d_is_domain="${rules_is_domain[$i]}"
 
-            [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-            [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
-            [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
-            [[ "$d_is_domain" == "1" ]] || d_is_domain=0
+        [[ "$d_is_domain" == "1" ]] && d_interval=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
+        [[ "$d_interval" =~ ^[0-9]+$ ]] || d_interval=0
+        [[ "$d_last" =~ ^[0-9]+$ ]] || d_last=0
+        [[ "$d_is_domain" == "1" ]] || d_is_domain=0
 
-            echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}"
-        done
-    } > "$CONFIG_FILE"
+        echo "${rules_listen_ip[$i]}|${rules_src_port[$i]}|${rules_dst_ip[$i]}|${rules_dst_port[$i]}|${rules_proto[$i]}|${d_resolved}|${d_interval}|${d_last}|${d_is_domain}" >> "$tmp_conf"
+    done
+
+    # 原子替换：先写临时文件再 mv，避免写入中断导致配置丢失
+    mv -f "$tmp_conf" "$CONFIG_FILE" || { rm -f "$tmp_conf"; return 1; }
 }
 
 # ---------- 应用 iptables 规则 ----------
 apply_rules_core() {
-    [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false
+    if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+        print_error "应用脚本不存在，请先通过菜单「更新脚本文件」下载"
+        return 1
+    fi
     "$SCRIPT_INSTALL_PATH" >/dev/null 2>&1
 }
 
 # ---------- 创建 systemd 服务 ----------
 create_service() {
-    sync_support_files false || return 1
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        print_warn "服务文件不存在，请先通过菜单「更新脚本文件」下载"
+        return 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1
     systemctl is-enabled --quiet iptables-forward.service 2>/dev/null || \
         systemctl enable iptables-forward.service 2>/dev/null
@@ -623,9 +646,9 @@ do_interval_manage() {
             ;;
         2)
             if [[ "$mode" == "watch" ]]; then
-                [[ -x "$SCRIPT_INSTALL_PATH" ]] || sync_support_files false || {
-                    set_last_result "error" "立即解析失败：脚本不存在且下载失败"; return
-                }
+                if [[ ! -x "$SCRIPT_INSTALL_PATH" ]]; then
+                    set_last_result "error" "立即解析失败：应用脚本不存在，请先通过菜单「更新脚本文件」下载"; return
+                fi
                 if "$SCRIPT_INSTALL_PATH" --watch >/dev/null 2>&1; then
                     set_last_result "success" "已立即执行一次域名解析"
                 else
@@ -648,22 +671,23 @@ clear_all_rules() {
 
 remove_rule_at_index() {
     local idx="$1"
-    local arr
-    for arr in rules_listen_ip rules_src_port rules_dst_ip rules_dst_port rules_proto \
-               rules_resolved_ip rules_check_interval rules_last_check_ts rules_is_domain; do
-        unset "${arr}[idx]"
-        eval "$arr=(\"\${${arr}[@]}\")"
-    done
+    # 通过重建新数组方式避免 eval，同时正确压缩稀疏数组
+    local i new=()
+    new=(); for i in "${!rules_listen_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_listen_ip[$i]}"); done; rules_listen_ip=("${new[@]}")
+    new=(); for i in "${!rules_src_port[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_src_port[$i]}"); done; rules_src_port=("${new[@]}")
+    new=(); for i in "${!rules_dst_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_dst_ip[$i]}"); done; rules_dst_ip=("${new[@]}")
+    new=(); for i in "${!rules_dst_port[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_dst_port[$i]}"); done; rules_dst_port=("${new[@]}")
+    new=(); for i in "${!rules_proto[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_proto[$i]}"); done; rules_proto=("${new[@]}")
+    new=(); for i in "${!rules_resolved_ip[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_resolved_ip[$i]}"); done; rules_resolved_ip=("${new[@]}")
+    new=(); for i in "${!rules_check_interval[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_check_interval[$i]}"); done; rules_check_interval=("${new[@]}")
+    new=(); for i in "${!rules_last_check_ts[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_last_check_ts[$i]}"); done; rules_last_check_ts=("${new[@]}")
+    new=(); for i in "${!rules_is_domain[@]}"; do [[ "$i" -ne "$idx" ]] && new+=("${rules_is_domain[$i]}"); done; rules_is_domain=("${new[@]}")
 }
 
 # ---------- 自动保存并应用 ----------
 auto_save_and_apply() {
     local success_msg="${1:-操作成功！}" fail_msg="${2:-操作失败，请检查 iptables 环境}"
     save_rules
-    if ! sync_support_files false; then
-        set_last_result "error" "操作失败：应用脚本下载失败，请检查网络连接或 GitHub 地址"
-        return 1
-    fi
     if apply_rules_core; then
         set_last_result "success" "$success_msg"
     else
@@ -713,23 +737,28 @@ do_add() {
         break
     done
 
-    # 输入目标地址
+    # 输入目标地址（localhost 本机转发时无需输入目标地址，使用 iptables REDIRECT）
     local dst_host resolved_ip is_domain check_interval_seconds
-    while true; do
-        read -r -p "请输入目标地址（IPv4或域名）: " dst_host
-        if is_valid_ipv4 "$dst_host"; then
-            is_domain="0"; resolved_ip="$dst_host"; check_interval_seconds=0; break
-        fi
-        if is_valid_domain "$dst_host"; then
-            is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
-            resolved_ip=$(resolve_domain_ipv4_once "$dst_host") || resolved_ip=""
-            if ! is_valid_ipv4 "$resolved_ip"; then
-                print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
+    if [[ "$listen_ip" == "127.0.0.1" ]]; then
+        dst_host="localhost"; is_domain="0"; resolved_ip="localhost"; check_interval_seconds=0
+        print_info "本机端口转发（将使用 iptables REDIRECT）"
+    else
+        while true; do
+            read -r -p "请输入目标地址（IPv4或域名）: " dst_host
+            if is_valid_ipv4 "$dst_host"; then
+                is_domain="0"; resolved_ip="$dst_host"; check_interval_seconds=0; break
             fi
-            break
-        fi
-        print_error "输入无效，请重新输入！"
-    done
+            if is_valid_domain "$dst_host"; then
+                is_domain="1"; check_interval_seconds=$((GLOBAL_WATCH_INTERVAL_MINUTES * 60))
+                resolved_ip=$(resolve_domain_ipv4_once "$dst_host" || true)
+                if ! is_valid_ipv4 "$resolved_ip"; then
+                    print_error "域名解析失败，请检查域名是否正确或网络是否可用！"; continue
+                fi
+                break
+            fi
+            print_error "输入无效，请重新输入！"
+        done
+    fi
 
     # 输入目标端口
     local dst_port_input dst_port dst_meta dst_type dst_start dst_end
@@ -747,10 +776,8 @@ do_add() {
             if [[ "$src_len" -eq "$dst_len" ]]; then
                 dst_port="$dst_port_input"; break
             fi
-            print_error "源端口段与目标端口段长度不一致（源=${src_len}，目标=${dst_len}），请重新输入！"
-            continue
         fi
-        print_error "源端口与目标端口类型需匹配（同为单端口或同为端口段），请重新输入！"
+        print_error "输入无效，请重新输入！"
     done
 
     # 选择协议
@@ -760,6 +787,7 @@ do_add() {
     echo "  1) TCP+UDP（默认）"
     echo "  2) 仅 TCP"
     echo "  3) 仅 UDP"
+    local proto_choice
     while true; do
         read -r -p "请选择 [1-3]（默认: 1）: " proto_choice
         proto_choice=${proto_choice:-1}
@@ -824,6 +852,7 @@ do_delete() {
     while true; do
         echo ""
         echo -e "输入序号（${CYAN}1-${#rules_src_port[@]}${NC}），输入 ${YELLOW}all${NC} 删除全部，输入 ${NC}0${NC} 返回"
+        local del_input
         read -r -p "请选择: " del_input
 
         [[ "$del_input" == "0" ]] && return
@@ -942,8 +971,8 @@ show_menu() {
     echo -e "  ${GREEN}1)${NC} 添加转发规则"
     echo -e "  ${RED}2)${NC} 删除转发规则"
     echo -e "  ${CYAN}3)${NC} 重启 iptables 转发"
-    echo -e "  ${CYAN}4)${NC} 域名解析间隔"
-    echo -e "  ${CYAN}5)${NC} 自动重启间隔"
+    echo -e "  ${CYAN}4)${NC} 自动重启间隔"
+    echo -e "  ${CYAN}5)${NC} 域名解析间隔"
     echo -e "  ${YELLOW}6)${NC} 开机自启管理"
     echo -e "  ${BLUE}7)${NC} 更新脚本文件"
     echo -e "  ${RED}8)${NC} 移除脚本"
@@ -965,8 +994,8 @@ main() {
             1) do_add ;;
             2) do_delete ;;
             3) do_restart ;;
-            4) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
-            5) do_interval_manage "restart" "自动重启间隔" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            4) do_interval_manage "restart" "自动重启间隔" "GLOBAL_RESTART_INTERVAL_MINUTES" "重启" ;;
+            5) do_interval_manage "watch" "域名解析间隔" "GLOBAL_WATCH_INTERVAL_MINUTES" "解析" ;;
             6) do_autostart ;;
             7) do_update ;;
             8) do_uninstall ;;
