@@ -91,19 +91,19 @@ backup_conf() {
 }
 
 # --- 域名白名单 ---
-# 通用：设置某个配置项（精确匹配行首关键字）
+# 通用：设置配置项。存在未注释的则修改；否则追加到末尾。不修改带 # 的系统注释说明。
 conf_set() {
   local key="$1" val="$2"
-  if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$CONF" 2>/dev/null; then
-    sudo sed -i -E "s|^#?[[:space:]]*(${key})[[:space:]].*|${key} ${val}|" "$CONF"
+  if grep -qE "^[[:space:]]*${key}[[:space:]]" "$CONF" 2>/dev/null; then
+    sudo sed -i -E "s|^[[:space:]]*(${key})[[:space:]].*|${key} ${val}|" "$CONF"
   else
     echo "${key} ${val}" | sudo tee -a "$CONF" >/dev/null
   fi
 }
-# 通用：注释某个配置项
-conf_comment() {
+# 通用：删除生效的配置项（恢复默认行为）
+conf_delete() {
   local key="$1"
-  sudo sed -i -E "s|^(${key}[[:space:]])|#\\1|" "$CONF"
+  sudo sed -i -E "/^[[:space:]]*${key}[[:space:]]/d" "$CONF"
 }
 
 enable_domain_whitelist() {
@@ -120,12 +120,12 @@ enable_domain_whitelist() {
 
 disable_domain_whitelist() {
   backup_conf
-  # 将 Filter 相关行全部注释掉
-  conf_comment 'Filter'
-  conf_comment 'FilterDefaultDeny'
-  conf_comment 'FilterExtended'
-  conf_comment 'FilterCaseSensitive'
-  conf_comment 'FilterURLs'
+  # 删除我们添加的生效配置项（恢复默认状态）
+  conf_delete 'Filter'
+  conf_delete 'FilterDefaultDeny'
+  conf_delete 'FilterExtended'
+  conf_delete 'FilterCaseSensitive'
+  conf_delete 'FilterURLs'
 }
 
 # --- IP 白名单 ---
@@ -140,8 +140,12 @@ enable_ip_whitelist() {
 # 例如: 192.168.1.0/24
 IPEOF
   fi
-  # 先清除已有的 Allow 行（脚本管理的）
-  sudo sed -i '/^Allow[[:space:]]/d' "$CONF"
+  # 先清除外部的 Allow 行，但保留默认的 127.0.0.1 和 ::1
+  sudo sed -i -E '/^Allow[[:space:]]+(127\.0\.0\.1|::1)[[:space:]]*$/!{/^Allow[[:space:]]/d;}' "$CONF"
+  # 确保默认的 localhost 在文件里
+  grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
+  grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
+
   # 从 allow_ip.txt 读取并追加
   if allow_has_ips "$IP_ALLOW_FILE"; then
     awk 'NF>0 && !/^[[:space:]]*#/{print "Allow "$0}' "$IP_ALLOW_FILE" \
@@ -151,8 +155,11 @@ IPEOF
 
 disable_ip_whitelist() {
   backup_conf
-  # 删除所有 Allow 行
-  sudo sed -i '/^Allow[[:space:]]/d' "$CONF"
+  # 删除外部 Allow 行，保留默认的 127.0.0.1 和 ::1
+  sudo sed -i -E '/^Allow[[:space:]]+(127\.0\.0\.1|::1)[[:space:]]*$/!{/^Allow[[:space:]]/d;}' "$CONF"
+  # 确保默认的 localhost 在文件里
+  grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
+  grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
 }
 
 # ---------- 状态读取 ----------
@@ -163,7 +170,8 @@ is_domain_whitelist_on() {
 
 # IP 白名单是否开启：检查 conf 中是否存在未注释的 Allow 行
 is_ip_whitelist_on() {
-  grep -qE '^Allow[[:space:]]' "$CONF" 2>/dev/null
+  # 检查是否存在除 127.0.0.1 和 ::1 之外的 Allow 行
+  grep -E '^Allow[[:space:]]' "$CONF" 2>/dev/null | grep -qvE 'Allow[[:space:]]+(127\.0\.0\.1|::1)[[:space:]]*$'
 }
 
 # ---------- 代理控制 ----------
@@ -281,3 +289,4 @@ run_ui() {
 }
 
 run_ui
+
