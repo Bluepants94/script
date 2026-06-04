@@ -78,7 +78,7 @@ save_state() {
 install_gost() {
     check_sudo
     print_info "正在自动下载并安装 Gost v3..."
-    sudo bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) || {
+    curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh | sudo bash || {
         print_err "Gost 安装失败，请检查网络。"
         exit 1
     }
@@ -111,7 +111,7 @@ update_gost() {
     check_sudo
     echo ""
     print_info "开始拉取并更新 Gost v3 至最新版本..."
-    if sudo bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh); then
+    if curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh | sudo bash; then
         if is_active; then
             sudo systemctl restart gost 2>/dev/null
             print_ok "Gost 更新成功，并且代理服务已重启！"
