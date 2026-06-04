@@ -9,7 +9,6 @@ CONF="/etc/tinyproxy/tinyproxy.conf"
 CONF_BAK="/etc/tinyproxy/tinyproxy.conf.bak"
 WHITELIST_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy/whitelist"
 WHITELIST_FILE="/etc/tinyproxy/whitelist"
-IP_ALLOW_FILE="/etc/tinyproxy/allow_ip.txt"
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -76,10 +75,6 @@ filter_has_rules() {
   awk 'NF>0 && !/^[[:space:]]*#/{exit 0} END{exit 1}' "$1"
 }
 
-allow_has_ips() {
-  [ -f "$1" ] && [ -s "$1" ] || return 1
-  awk 'NF>0 && !/^[[:space:]]*#/{exit 0} END{exit 1}' "$1"
-}
 
 # ================================================================
 #  配置修改（sed 原地编辑 /etc/tinyproxy/tinyproxy.conf）
@@ -132,35 +127,20 @@ disable_domain_whitelist() {
 enable_ip_whitelist() {
   backup_conf
   check_sudo
-  sudo mkdir -p /etc/tinyproxy 2>/dev/null || true
-  # 如果 allow_ip.txt 不存在，创建模板
-  if [ ! -f "$IP_ALLOW_FILE" ]; then
-    sudo tee "$IP_ALLOW_FILE" >/dev/null <<'IPEOF'
-# 每行一个 IP 或 CIDR
-# 例如: 192.168.1.0/24
-IPEOF
-  fi
-  # 先清除外部的 Allow 行，但保留默认的 127.0.0.1 和 ::1
-  sudo sed -i -E -e '/^Allow[[:space:]]+127\.0\.0\.1[[:space:]]*$/b' \
-                 -e '/^Allow[[:space:]]+::1[[:space:]]*$/b' \
-                 -e '/^Allow[[:space:]]/d' "$CONF"
+  # 恢复被我们注释的 Allow 行
+  sudo sed -i -E 's/^##+(Allow[[:space:]].*)/\1/' "$CONF"
   # 确保默认的 localhost 在文件里
   grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
   grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
-
-  # 从 allow_ip.txt 读取并追加（兼容用户手写了 Allow 关键字的情况）
-  if allow_has_ips "$IP_ALLOW_FILE"; then
-    awk 'NF>0 && !/^[[:space:]]*#/{sub(/^Allow[[:space:]]+/, ""); print "Allow "$0}' "$IP_ALLOW_FILE" \
-      | sudo tee -a "$CONF" >/dev/null
-  fi
 }
 
 disable_ip_whitelist() {
   backup_conf
-  # 删除外部 Allow 行，保留默认的 127.0.0.1 和 ::1
+  check_sudo
+  # 将所有外部 Allow 行加上 ## 注释，保留默认的 127.0.0.1 和 ::1
   sudo sed -i -E -e '/^Allow[[:space:]]+127\.0\.0\.1[[:space:]]*$/b' \
                  -e '/^Allow[[:space:]]+::1[[:space:]]*$/b' \
-                 -e '/^Allow[[:space:]]/d' "$CONF"
+                 -e 's/^(Allow[[:space:]].*)/##\1/' "$CONF"
   # 确保默认的 localhost 在文件里
   grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
   grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
