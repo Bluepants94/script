@@ -91,55 +91,41 @@ backup_conf() {
 }
 
 # --- 域名白名单 ---
+# 通用：设置某个配置项（精确匹配行首关键字）
+conf_set() {
+  local key="$1" val="$2"
+  if grep -qE "^#?[[:space:]]*${key}[[:space:]]" "$CONF" 2>/dev/null; then
+    sudo sed -i -E "s|^#?[[:space:]]*(${key})[[:space:]].*|${key} ${val}|" "$CONF"
+  else
+    echo "${key} ${val}" | sudo tee -a "$CONF" >/dev/null
+  fi
+}
+# 通用：注释某个配置项
+conf_comment() {
+  local key="$1"
+  sudo sed -i -E "s|^(${key}[[:space:]])|#\\1|" "$CONF"
+}
+
 enable_domain_whitelist() {
   backup_conf
   # 确保 whitelist 文件已下载
   download_whitelist || { print_err "白名单文件下载失败。"; return 1; }
 
-  # 1) Filter 行：如果存在注释行则取消注释并修正路径，否则追加
-  if grep -qE '^#?[[:space:]]*Filter[[:space:]]' "$CONF" 2>/dev/null; then
-    sudo sed -i -E 's|^#?[[:space:]]*(Filter[[:space:]]+).*|Filter "/etc/tinyproxy/whitelist"|' "$CONF"
-  else
-    echo 'Filter "/etc/tinyproxy/whitelist"' | sudo tee -a "$CONF" >/dev/null
-  fi
-
-  # 2) FilterDefaultDeny
-  if grep -qE '^#?[[:space:]]*FilterDefaultDeny' "$CONF" 2>/dev/null; then
-    sudo sed -i -E 's|^#?[[:space:]]*(FilterDefaultDeny).*|FilterDefaultDeny Yes|' "$CONF"
-  else
-    echo 'FilterDefaultDeny Yes' | sudo tee -a "$CONF" >/dev/null
-  fi
-
-  # 3) FilterExtended
-  if grep -qE '^#?[[:space:]]*FilterExtended' "$CONF" 2>/dev/null; then
-    sudo sed -i -E 's|^#?[[:space:]]*(FilterExtended).*|FilterExtended On|' "$CONF"
-  else
-    echo 'FilterExtended On' | sudo tee -a "$CONF" >/dev/null
-  fi
-
-  # 4) FilterCaseSensitive
-  if grep -qE '^#?[[:space:]]*FilterCaseSensitive' "$CONF" 2>/dev/null; then
-    sudo sed -i -E 's|^#?[[:space:]]*(FilterCaseSensitive).*|FilterCaseSensitive No|' "$CONF"
-  else
-    echo 'FilterCaseSensitive No' | sudo tee -a "$CONF" >/dev/null
-  fi
-
-  # 5) FilterURLs
-  if grep -qE '^#?[[:space:]]*FilterURLs' "$CONF" 2>/dev/null; then
-    sudo sed -i -E 's|^#?[[:space:]]*(FilterURLs).*|FilterURLs No|' "$CONF"
-  else
-    echo 'FilterURLs No' | sudo tee -a "$CONF" >/dev/null
-  fi
+  conf_set 'Filter'              '"/etc/tinyproxy/whitelist"'
+  conf_set 'FilterDefaultDeny'   'Yes'
+  conf_set 'FilterExtended'      'On'
+  conf_set 'FilterCaseSensitive' 'No'
+  conf_set 'FilterURLs'          'No'
 }
 
 disable_domain_whitelist() {
   backup_conf
   # 将 Filter 相关行全部注释掉
-  sudo sed -i -E 's|^(Filter[[:space:]]).*|#\1"/etc/tinyproxy/whitelist"|'         "$CONF"
-  sudo sed -i -E 's|^(FilterDefaultDeny).*|#\1 Yes|'    "$CONF"
-  sudo sed -i -E 's|^(FilterExtended).*|#\1 On|'        "$CONF"
-  sudo sed -i -E 's|^(FilterCaseSensitive).*|#\1 No|'   "$CONF"
-  sudo sed -i -E 's|^(FilterURLs).*|#\1 No|'            "$CONF"
+  conf_comment 'Filter'
+  conf_comment 'FilterDefaultDeny'
+  conf_comment 'FilterExtended'
+  conf_comment 'FilterCaseSensitive'
+  conf_comment 'FilterURLs'
 }
 
 # --- IP 白名单 ---
@@ -182,9 +168,23 @@ is_ip_whitelist_on() {
 
 # ---------- 代理控制 ----------
 start_proxy() {
-  check_tinyproxy; check_sudo
-  sudo systemctl start tinyproxy 2>/dev/null \
-    && print_ok "代理已启动。" \
+  check_tinyproxy; check_sudo; backup_conf
+
+  # 读取当前配置端口
+  local cur_port
+  cur_port="$(awk '/^Port[[:space:]]+/{print $2;exit}' "$CONF" 2>/dev/null || echo "8888")"
+
+  local input_port
+  read -r -p "代理端口 (默认 ${cur_port}): " input_port
+  input_port="${input_port:-$cur_port}"
+
+  # 如果端口变了，写入配置
+  if [ "$input_port" != "$cur_port" ]; then
+    sudo sed -i -E "s|^(Port[[:space:]]+).*|Port ${input_port}|" "$CONF"
+  fi
+
+  sudo systemctl restart tinyproxy 2>/dev/null \
+    && print_ok "代理已启动（端口 ${input_port}）。" \
     || print_err "启动失败。"
 }
 
