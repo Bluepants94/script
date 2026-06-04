@@ -1,12 +1,6 @@
 #!/bin/bash
 # ============================================================================
 # Tinyproxy HTTP 代理管理脚本
-# 功能：检查/安装 tinyproxy → 配置并启动代理 → 关闭并清理
-# 用法：
-#   ./http_proxy.sh             交互菜单模式
-#   ./http_proxy.sh start       非交互启动（环境变量传参）
-#   ./http_proxy.sh stop        非交互关闭
-#   ./http_proxy.sh status      查看状态
 # ============================================================================
 set -Euo pipefail
 
@@ -15,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG_FILE="${TINYPROXY_CONFIG:-/tmp/tinyproxy_custom.conf}"
 PID_FILE="${TINYPROXY_PID:-/tmp/tinyproxy_custom.pid}"
 LOG_FILE="${TINYPROXY_LOG:-/tmp/tinyproxy_custom.log}"
+RUNTIME_FILE="${TINYPROXY_RUNTIME:-/tmp/tinyproxy_runtime.state}"
 DEFAULT_PORT="${TINYPROXY_PORT:-8888}"
 FILTER_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy/tinyproxy_filter.txt"
 FILTER_FILE="${SCRIPT_DIR}/tinyproxy_filter.txt"
@@ -30,19 +25,19 @@ print_ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
 print_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 print_err()   { echo -e "${RED}[ERR]${NC}   $1"; }
 
-# ---------- 信号/状态管理 ----------
+# ---------- 信号 ----------
 cleanup_on_exit() {
-  local exit_code=$?
-  if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 130 ]; then
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 130 ]; then
     print_warn "脚本异常退出，残留文件：${CONFIG_FILE}"
   fi
 }
 trap cleanup_on_exit EXIT
 trap '' INT
 
+# ---------- 状态（持久化） ----------
 load_state() {
-  IP_WHITELIST=off
-  DOMAIN_WHITELIST=off
+  IP_WHITELIST=off; DOMAIN_WHITELIST=off
   [ -f "$STATE_FILE" ] && . "$STATE_FILE"
 }
 
@@ -53,13 +48,30 @@ DOMAIN_WHITELIST=${DOMAIN_WHITELIST:-off}
 EOF
 }
 
-# ---------- 工具函数 ----------
+# ---------- 运行时参数（重启时直接用，不用解析配置） ----------
+save_runtime() {
+  cat > "$RUNTIME_FILE" <<EOF
+PROXY_PORT=${PROXY_PORT}
+LISTEN_ADDR=${LISTEN_ADDR}
+PROXY_USER=${PROXY_USER}
+PROXY_PASS=${PROXY_PASS}
+EOF
+}
+
+load_runtime() {
+  if [ -f "$RUNTIME_FILE" ]; then
+    . "$RUNTIME_FILE" && return 0
+  fi
+  PROXY_PORT="$DEFAULT_PORT"; LISTEN_ADDR="0.0.0.0"
+  PROXY_USER=""; PROXY_PASS=""
+  return 1
+}
+
+# ---------- 工具 ----------
 die() { print_err "$1"; exit "${2:-1}"; }
 
 check_sudo() {
-  if ! command -v sudo &>/dev/null; then
-    die "未找到 sudo 命令，请安装 sudo 或手动安装 tinyproxy。"
-  fi
+  command -v sudo &>/dev/null || die "未找到 sudo 命令。"
 }
 
 detect_pkg_manager() {
@@ -71,20 +83,27 @@ detect_pkg_manager() {
 
 is_port_used() {
   local port="$1"
-  if command -v ss &>/dev/null; then
-    ss -tln 2>/dev/null | grep -qP "[: ]${port}\b" && return 0 || return 1
-  fi
-  if command -v netstat &>/dev/null; then
-    netstat -tln 2>/dev/null | grep -qP "[: ]${port}\b" && return 0 || return 1
-  fi
+  { command -v ss &>/dev/null && ss -tln 2>/dev/null; } \
+    || { command -v netstat &>/dev/null && netstat -tln 2>/dev/null; } \
+    | awk -v p="$port" '$0 ~ ":"p"[[:space:]]" {exit 1}' && return 0
   return 1
 }
 
-# ---------- 静默下载域名白名单 ----------
+# ---------- 文件有效性检查 ----------
+filter_has_rules() {
+  [ -f "$1" ] && [ -s "$1" ] || return 1
+  awk 'NF>0 && !/^[[:space:]]*#/{exit 0} END{exit 1}' "$1"
+}
+
+allow_has_ips() {
+  [ -f "$1" ] && [ -s "$1" ] || return 1
+  awk 'NF>0 && !/^[[:space:]]*#/{exit 0} END{exit 1}' "$1"
+}
+
+# ---------- 下载 ----------
 download_filter() {
   [ -s "$FILTER_FILE" ] && return 0
-  local tool=""
-  command -v curl &>/dev/null && tool="curl"
+  local tool=""; command -v curl &>/dev/null && tool="curl"
   command -v wget &>/dev/null && tool="wget"
   [ -z "$tool" ] && return 1
   if [ "$tool" = "curl" ]; then
@@ -95,42 +114,16 @@ download_filter() {
   [ -s "$FILTER_FILE" ] && return 0 || { rm -f "$FILTER_FILE"; return 1; }
 }
 
-# ---------- 检查过滤文件是否有有效规则（非空行/非注释） ----------
-filter_has_rules() {
-  [ -f "$1" ] || return 1
-  while IFS= read -r line; do
-    line="$(echo "$line" | xargs)"
-    [ -z "$line" ] && continue
-    [[ "$line" == \#* ]] && continue
-    return 0
-  done < "$1"
-  return 1
-}
-
-# ---------- 检查 IP allow 文件是否有有效 IP ----------
-allow_has_ips() {
-  [ -f "$1" ] || return 1
-  [ -s "$1" ] || return 1
-  while IFS= read -r line; do
-    line="$(echo "$line" | xargs)"
-    [ -z "$line" ] && continue
-    [[ "$line" == \#* ]] && continue
-    return 0
-  done < "$1"
-  return 1
-}
-
 # ---------- 安装 ----------
 install_tinyproxy() {
-  local pm
-  pm="$(detect_pkg_manager)"
-  [ -z "$pm" ] && die "未识别到支持的包管理器，请手动安装 tinyproxy。"
+  local pm; pm="$(detect_pkg_manager)"
+  [ -z "$pm" ] && die "未识别包管理器，请手动安装 tinyproxy。"
   check_sudo
-  print_info "通过 ${pm} 安装 tinyproxy（需要 sudo 权限）..."
+  print_info "通过 ${pm} 安装 tinyproxy..."
   case "$pm" in
-    apt) sudo apt update && sudo apt install -y tinyproxy ;;
-    dnf) sudo dnf install -y tinyproxy ;;
-    yum) sudo yum install -y epel-release && sudo yum install -y tinyproxy ;;
+    apt)    sudo apt update && sudo apt install -y tinyproxy ;;
+    dnf)    sudo dnf install -y tinyproxy ;;
+    yum)    sudo yum install -y epel-release && sudo yum install -y tinyproxy ;;
     pacman) sudo pacman -Sy --noconfirm tinyproxy ;;
   esac
   command -v tinyproxy &>/dev/null && { print_ok "tinyproxy 安装成功。"; return 0; }
@@ -140,14 +133,14 @@ install_tinyproxy() {
 check_tinyproxy() {
   command -v tinyproxy &>/dev/null && return 0
   print_warn "tinyproxy 未安装。"
-  read -r -p "是否立即自动安装 tinyproxy? (y/N): " choice
+  read -r -p "是否立即安装 tinyproxy? (y/N): " choice
   [[ "$choice" =~ ^[Yy]$ ]] || die "用户取消安装。"
   install_tinyproxy
 }
 
 # ---------- 交互参数 ----------
 prompt_start_params() {
-  local input_port listen_choice custom_ip
+  local input_port lc custom_ip
   read -r -p "请输入代理端口 (默认 ${DEFAULT_PORT}): " input_port
   PROXY_PORT="${input_port:-$DEFAULT_PORT}"
   [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] \
@@ -157,29 +150,24 @@ prompt_start_params() {
   echo "  1) 0.0.0.0 (所有网卡，允许外部访问) [默认]"
   echo "  2) 127.0.0.1 (仅本地访问)"
   echo "  3) 自定义IP"
-  read -r -p "输入选项 [1-3](默认 1): " listen_choice
-  case "${listen_choice:-1}" in
+  read -r -p "输入选项 [1-3](默认 1): " lc
+  case "${lc:-1}" in
     2) LISTEN_ADDR="127.0.0.1" ;;
-    3)
-      read -r -p "请输入自定义监听IP: " custom_ip
-      [ -n "$custom_ip" ] || die "监听IP不能为空"
-      LISTEN_ADDR="$custom_ip"
-      ;;
+    3) read -r -p "自定义监听IP: " custom_ip; [ -n "$custom_ip" ] || die "IP 不能为空"
+       LISTEN_ADDR="$custom_ip" ;;
     *) LISTEN_ADDR="0.0.0.0" ;;
   esac
-  read -r -p "请输入用户名 (可留空): " PROXY_USER
-  read -r -s -p "请输入密码 (可留空，输入不可见): " PROXY_PASS
-  echo ""
+  read -r -p "用户名 (可留空): " PROXY_USER
+  read -r -s -p "密码 (可留空): " PROXY_PASS; echo ""
 }
 
-# ---------- 非交互参数（环境变量） ----------
+# ---------- 非交互 ----------
 load_env_params() {
   PROXY_PORT="${TINYPROXY_PORT:-${DEFAULT_PORT}}"
   [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] \
     || die "TINYPROXY_PORT 无效：${PROXY_PORT}"
   LISTEN_ADDR="${TINYPROXY_LISTEN:-0.0.0.0}"
-  PROXY_USER="${TINYPROXY_USER:-}"
-  PROXY_PASS="${TINYPROXY_PASS:-}"
+  PROXY_USER="${TINYPROXY_USER:-}"; PROXY_PASS="${TINYPROXY_PASS:-}"
 }
 
 # ---------- 配置生成 ----------
@@ -199,294 +187,180 @@ generate_config() {
     echo "User ${run_user}"
     echo "Group ${run_group}"
     if [ -n "${PROXY_USER:-}" ] && [ -n "${PROXY_PASS:-}" ]; then
-      echo "BasicAuth ${PROXY_USER} ${PROXY_PASS}"
-      AUTH_ENABLED="yes"
+      echo "BasicAuth ${PROXY_USER} ${PROXY_PASS}"; AUTH_ENABLED=yes
     else
-      AUTH_ENABLED="no"
+      AUTH_ENABLED=no
     fi
-    # IP 白名单 - 控制谁能连接
-    if [ "$IP_WHITELIST" = "on" ]; then
-      if allow_has_ips "$IP_ALLOW_FILE"; then
-        while IFS= read -r line; do
-          line="$(echo "$line" | xargs)"
-          [ -z "$line" ] && continue
-          [[ "$line" == \#* ]] && continue
-          echo "Allow ${line}"
-        done < "$IP_ALLOW_FILE"
-      fi
+
+    # IP 白名单
+    if [ "${IP_WHITELIST:-off}" = "on" ] && allow_has_ips "$IP_ALLOW_FILE"; then
+      awk 'NF>0 && !/^[[:space:]]*#/{print "Allow",$0}' "$IP_ALLOW_FILE"
     fi
-    # 域名白名单 - 控制能访问的目标
-    if [ "$DOMAIN_WHITELIST" = "on" ]; then
-      if filter_has_rules "$FILTER_FILE"; then
-        echo "Filter \"${FILTER_FILE}\""
-        echo "FilterDefaultDeny Yes"
-      fi
+
+    # 域名白名单
+    if [ "${DOMAIN_WHITELIST:-off}" = "on" ] && filter_has_rules "$FILTER_FILE"; then
+      echo "Filter \"${FILTER_FILE}\""
+      echo "FilterDefaultDeny Yes"
     fi
   } > "$CONFIG_FILE"
 }
 
-# ---------- 优雅关闭进程 ----------
+# ---------- 进程管理 ----------
 graceful_kill() {
-  local pid="$1" max_wait="${2:-5}" waited=0
+  local pid="$1" w="${2:-5}" c=0
   kill "$pid" 2>/dev/null || return 0
-  while [ "$waited" -lt "$max_wait" ]; do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 1
-    waited=$((waited + 1))
+  while [ "$c" -lt "$w" ]; do
+    kill -0 "$pid" 2>/dev/null || return 0; sleep 1; c=$((c+1))
   done
   kill -9 "$pid" 2>/dev/null || true
 }
 
 # ---------- 启动 ----------
 start_proxy() {
-  check_tinyproxy
-  load_state
-  if [ "${1:-}" = "--env" ]; then
-    load_env_params
-  else
-    prompt_start_params || return 1
-  fi
+  check_tinyproxy; load_state
+  if [ "${1:-}" = "--env" ]; then load_env_params; else prompt_start_params || return 1; fi
   is_port_used "$PROXY_PORT" && die "端口 ${PROXY_PORT} 已被占用。"
-  if [ "$DOMAIN_WHITELIST" = "on" ]; then
-    download_filter || true
-  fi
-  if command -v systemctl &>/dev/null; then
-    sudo systemctl stop tinyproxy 2>/dev/null || true
-  fi
-  generate_config
+  [ "$DOMAIN_WHITELIST" = "on" ] && download_filter || true
+  command -v systemctl &>/dev/null && sudo systemctl stop tinyproxy 2>/dev/null || true
+  generate_config; save_runtime
   tinyproxy -c "$CONFIG_FILE" || die "tinyproxy 启动失败。"
-  local pid="" waited=0
-  while [ ! -f "$PID_FILE" ] && [ "$waited" -lt 3 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
+  local pid="" c=0
+  while [ ! -f "$PID_FILE" ] && [ "$c" -lt 3 ]; do sleep 1; c=$((c+1)); done
   [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    print_ok "代理已启动。"
-    echo "--------------------------------------------------"
-    echo "  监听地址: ${LISTEN_ADDR}"
-    echo "  端口:     ${PROXY_PORT}"
-    echo "  认证:     $( [ "$AUTH_ENABLED" = yes ] && echo '已启用' || echo '未启用' )"
-    if [ "$AUTH_ENABLED" = yes ]; then
-      echo "  代理地址: http://${PROXY_USER}:${PROXY_PASS}@<服务器IP>:${PROXY_PORT}"
-    else
-      echo "  代理地址: http://<服务器IP>:${PROXY_PORT}"
-    fi
-    echo "  IP白名单:  $( [ "$IP_WHITELIST" = on ] && echo '已开启' || echo '未开启' )"
-    echo "  域名白名单: $( [ "$DOMAIN_WHITELIST" = on ] && echo '已开启' || echo '未开启' )"
-    echo "--------------------------------------------------"
+  if [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null; then
+    status_proxy
   else
     tail -5 "$LOG_FILE" 2>/dev/null || true
-    die "代理启动失败，请检查日志：${LOG_FILE}"
+    die "代理启动失败：${LOG_FILE}"
   fi
 }
 
-# ---------- 停止（静默） ----------
+# ---------- 停止 ----------
 stop_proxy() {
-  local pid="" stopped=false
+  local pid="" ok=false
   if [ -f "$PID_FILE" ]; then
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      graceful_kill "$pid"
-      stopped=true
-    fi
+    [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && { graceful_kill "$pid"; ok=true; }
   fi
-  if ! "$stopped"; then
-    local pids
-    pids="$(pgrep -f "tinyproxy.*${CONFIG_FILE}" 2>/dev/null || true)"
-    if [ -n "$pids" ]; then
-      while IFS= read -r pid; do
-        [ -n "$pid" ] && graceful_kill "$pid"
-      done <<< "$pids"
-    fi
+  if ! $ok; then
+    local p; p="$(pgrep -f "tinyproxy.*${CONFIG_FILE}" 2>/dev/null || true)"
+    [ -n "$p" ] && while IFS= read -r pid; do [ -n "$pid" ] && graceful_kill "$pid"; done <<< "$p"
   fi
-  rm -f "$CONFIG_FILE" "$PID_FILE" "$LOG_FILE"
+  rm -f "$CONFIG_FILE" "$PID_FILE" "$LOG_FILE" "$RUNTIME_FILE"
 }
 
-# ---------- 重启（沿用当前参数 + 最新白名单状态） ----------
+# ---------- 重启（从 runtime 文件读参数，不解析配置） ----------
 restart_proxy() {
-  local pid="" running=false
+  local pid=""
   [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && running=true
-  if ! $running; then
-    return 0
-  fi
+  [ -z "${pid:-}" ] || ! kill -0 "${pid}" 2>/dev/null && return 0
 
-  # 从当前配置读取参数
-  local old_port old_listen old_user old_pass
-  if [ -f "$CONFIG_FILE" ]; then
-    old_port="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || true)"
-    old_listen="$(grep -oP '^Listen\s+\K\S+' "$CONFIG_FILE" 2>/dev/null || true)"
-    local auth_line
-    auth_line="$(grep '^BasicAuth' "$CONFIG_FILE" 2>/dev/null || true)"
-    if [ -n "$auth_line" ]; then
-      old_user="$(echo "$auth_line" | awk '{print $2}')"
-      old_pass="$(echo "$auth_line" | awk '{print $3}')"
-    fi
-  fi
-  PROXY_PORT="${old_port:-$DEFAULT_PORT}"
-  LISTEN_ADDR="${old_listen:-0.0.0.0}"
-  PROXY_USER="${old_user:-}"
-  PROXY_PASS="${old_pass:-}"
-
+  load_runtime || { print_warn "未找到运行时参数，无法重启。"; return 1; }
   load_state
-
-  if [ "$DOMAIN_WHITELIST" = "on" ]; then
-    download_filter || true
-  fi
+  [ "$DOMAIN_WHITELIST" = "on" ] && download_filter || true
 
   graceful_kill "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE"
-  sleep 1
-
+  rm -f "$PID_FILE"; sleep 1
   generate_config
-  tinyproxy -c "$CONFIG_FILE" || { print_warn "重启失败，端口可能未释放。"; return 1; }
+  tinyproxy -c "$CONFIG_FILE" || { print_warn "重启失败。"; return 1; }
 
-  local new_pid="" waited=0
-  while [ ! -f "$PID_FILE" ] && [ "$waited" -lt 5 ]; do
-    sleep 1
-    waited=$((waited + 1))
-  done
-  [ -f "$PID_FILE" ] && new_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -z "$new_pid" ] || ! kill -0 "$new_pid" 2>/dev/null; then
-    print_warn "重启后新进程未能确认运行。"
-    return 1
-  fi
+  local c=0
+  while [ ! -f "$PID_FILE" ] && [ "$c" -lt 5 ]; do sleep 1; c=$((c+1)); done
+  [ ! -f "$PID_FILE" ] && { print_warn "新进程未生成 PID 文件。"; return 1; }
+  local np; np="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [ -z "${np:-}" ] || ! kill -0 "${np}" 2>/dev/null && { print_warn "新进程未运行。"; return 1; }
   return 0
 }
 
 # ---------- 状态 ----------
 status_proxy() {
-  local pid="" port="" listen=""
+  local pid=""
   [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    port="$(   grep -oP '^Port\s+\K[0-9]+'   "$CONFIG_FILE" 2>/dev/null || echo "?")"
-    listen="$( grep -oP '^Listen\s+\K\S+'    "$CONFIG_FILE" 2>/dev/null || echo "?")"
+  if [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && [ -f "$CONFIG_FILE" ]; then
+    local port listen
+    port="$(   awk '/^Port[[:space:]]+/{print $2;exit}'     "$CONFIG_FILE" 2>/dev/null || echo "?")"
+    listen="$( awk '/^Listen[[:space:]]+/{print $2;exit}'   "$CONFIG_FILE" 2>/dev/null || echo "?")"
     print_ok "代理运行中 — ${listen}:${port}"
     return 0
   fi
   return 1
 }
 
-# ---------- IP 白名单开关（静默） ----------
+# ---------- 开关 ----------
 toggle_ip_whitelist() {
   load_state
   if [ "$IP_WHITELIST" = "on" ]; then
-    IP_WHITELIST=off
-    save_state
-    restart_proxy
-    return 0
+    IP_WHITELIST=off; save_state; restart_proxy; return
   fi
   check_sudo
-  if [ ! -d "/etc/tinyproxy" ]; then
-    sudo mkdir -p /etc/tinyproxy 2>/dev/null || true
-  fi
+  [ -d /etc/tinyproxy ] || sudo mkdir -p /etc/tinyproxy 2>/dev/null || true
   if [ ! -f "$IP_ALLOW_FILE" ]; then
-    sudo tee "$IP_ALLOW_FILE" > /dev/null <<'EOF'
-# /etc/tinyproxy/allow_ip.txt
-# 每行一个 IP 或 CIDR，允许访问此 HTTP 代理
-# 修改后需要重启代理才能生效
-# 示例:
-# 192.168.1.100
-# 10.0.0.0/8
-# 172.16.0.0/12
+    sudo tee "$IP_ALLOW_FILE" >/dev/null <<'EOF'
+# 每行一个 IP 或 CIDR
+# 例如: 192.168.1.0/24
 
-192.168.1.0/24
 EOF
   fi
-  IP_WHITELIST=on
-  save_state
-  restart_proxy
+  IP_WHITELIST=on; save_state; restart_proxy
 }
 
-# ---------- 域名白名单开关（静默） ----------
 toggle_domain_whitelist() {
   load_state
   if [ "$DOMAIN_WHITELIST" = "on" ]; then
-    DOMAIN_WHITELIST=off
-    save_state
-    restart_proxy
-    return 0
+    DOMAIN_WHITELIST=off; save_state; restart_proxy; return
   fi
   if download_filter; then
-    DOMAIN_WHITELIST=on
-    save_state
-    restart_proxy
+    DOMAIN_WHITELIST=on; save_state; restart_proxy
   fi
 }
 
-# ---------- 菜单 UI ----------
+# ---------- UI ----------
 show_banner() {
   load_state
-  local proxy_status proxy_pid="" proxy_info=""
-  [ -f "$PID_FILE" ] && proxy_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  if [ -n "${proxy_pid:-}" ] && kill -0 "${proxy_pid}" 2>/dev/null; then
-    local p port="?"
-    p="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || true)"
-    [ -n "$p" ] && port="$p"
-    proxy_status="● 已启动"
-    proxy_info="  监听:       $(grep -oP '^Listen\s+\K\S+' "$CONFIG_FILE" 2>/dev/null || echo '?'):${port}"
+  local ps="" pi="" pid=""
+  [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && [ -f "$CONFIG_FILE" ]; then
+    local p; p="$(awk '/^Port/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null || echo "?")"
+    local l; l="$(awk '/^Listen/{print $2;exit}' "$CONFIG_FILE" 2>/dev/null || echo "?")"
+    ps="● 已启动"; pi="  监听:       ${l}:${p}"
   fi
   echo ""
   echo "=================================================="
   echo "        Tinyproxy HTTP 代理管理工具"
   echo "=================================================="
   echo "  配置路径:   /etc/tinyproxy"
-  echo -e "  代理状态:   $([ -n "${proxy_pid:-}" ] && kill -0 "${proxy_pid}" 2>/dev/null && echo "${GREEN}${proxy_status}${NC}" || echo "${RED}○ 未启动${NC}")"
-  [ -n "$proxy_info" ] && echo "$proxy_info"
-  echo -e "  IP 白名单:  $( [ "$IP_WHITELIST" = on ] && echo "${GREEN}● 已开启${NC}" || echo "${RED}○ 未开启${NC}")"
-  echo -e "  域名白名单: $( [ "$DOMAIN_WHITELIST" = on ] && echo "${GREEN}● 已开启${NC}" || echo "${RED}○ 未开启${NC}")"
+  echo -e "  代理状态:   $([ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && echo "${GREEN}${ps}${NC}" || echo "${RED}○ 未启动${NC}")"
+  [ -n "$pi" ] && echo "$pi"
+  echo -e "  IP 白名单:  $( [ "${IP_WHITELIST:-off}" = on ] && echo "${GREEN}● 已开启${NC}" || echo "${RED}○ 未开启${NC}")"
+  echo -e "  域名白名单: $( [ "${DOMAIN_WHITELIST:-off}" = on ] && echo "${GREEN}● 已开启${NC}" || echo "${RED}○ 未开启${NC}")"
 }
 
 show_menu() {
-  local proxy_running=false
-  local pid=""
+  local r=false pid=""
   [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-  [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && proxy_running=true
+  [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && r=true
   echo ""
-  if $proxy_running; then
-    echo "  1) 关闭代理"
-  else
-    echo "  1) 开启代理"
-  fi
-  echo "  2) $([ "$IP_WHITELIST" = on ] && echo '关闭' || echo '开启')IP白名单"
-  echo "  3) $([ "$DOMAIN_WHITELIST" = on ] && echo '关闭' || echo '开启')域名白名单"
+  echo "  1) $($r && echo '关闭' || echo '开启')代理"
+  echo "  2) $( [ "${IP_WHITELIST:-off}" = on ] && echo '关闭' || echo '开启')IP白名单"
+  echo "  3) $( [ "${DOMAIN_WHITELIST:-off}" = on ] && echo '关闭' || echo '开启')域名白名单"
   echo "  0) 退出"
-  echo -n "输入选项 [0-3]: "
+  printf "输入选项 [0-3]: "
 }
 
 run_ui() {
   while true; do
-    show_banner
-    show_menu
-    read -r choice
-    case "${choice}" in
+    show_banner; show_menu; read -r c
+    case "${c}" in
       1)
-        local proxy_running=false
-        local pid=""
+        local r=false pid=""
         [ -f "$PID_FILE" ] && pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && proxy_running=true
-        if $proxy_running; then
-          stop_proxy
-        else
-          start_proxy || true
-        fi
-        continue
-        ;;
-      2)
-        toggle_ip_whitelist
-        continue
-        ;;
-      3)
-        toggle_domain_whitelist
-        continue
-        ;;
-      0)
-        exit 0
-        ;;
-      *)
-        continue
-        ;;
+        [ -n "${pid:-}" ] && kill -0 "${pid}" 2>/dev/null && r=true
+        if $r; then stop_proxy; else start_proxy || true; fi
+        continue ;;
+      2) toggle_ip_whitelist; continue ;;
+      3) toggle_domain_whitelist; continue ;;
+      0) exit 0 ;;
+      *) continue ;;
     esac
   done
 }
@@ -494,43 +368,20 @@ run_ui() {
 # ---------- 入口 ----------
 main() {
   case "${1:-}" in
-    start|--start)
-      shift
-      check_tinyproxy
-      load_state
-      load_env_params
-      if [ "$DOMAIN_WHITELIST" = "on" ]; then
-        download_filter || true
-      fi
-      start_proxy --env
-      ;;
-    stop|--stop)
-      stop_proxy
-      ;;
-    status|--status)
-      load_state
-      status_proxy
-      ;;
+    start|--start) shift; check_tinyproxy; load_state; load_env_params
+      [ "$DOMAIN_WHITELIST" = "on" ] && download_filter || true
+      start_proxy --env ;;
+    stop|--stop) stop_proxy ;;
+    status|--status) load_state; status_proxy ;;
     --help|-h|help)
-      echo "用法：$0 [start|stop|status|--help]"
-      echo "  无参数     交互菜单模式"
-      echo "  start      非交互启动（环境变量 TINYPROXY_* 传参）"
+      echo "用法: $0 [start|stop|status|--help]"
+      echo "  (无参数)   交互菜单"
+      echo "  start      TINYPROXY_PORT|LISTEN|USER|PASS 非交互启动"
       echo "  stop       非交互关闭"
-      echo "  status     查看代理运行状态"
+      echo "  status     查看状态"
       echo ""
-      echo "环境变量:"
-      echo "  TINYPROXY_PORT      端口号（默认 8888）"
-      echo "  TINYPROXY_LISTEN    监听地址（默认 0.0.0.0）"
-      echo "  TINYPROXY_USER      认证用户名"
-      echo "  TINYPROXY_PASS      认证密码"
-      echo ""
-      echo "白名单状态持久化到: ${STATE_FILE}"
-      echo "IP 白名单文件:       ${IP_ALLOW_FILE}"
-      echo "域名白名单文件:      ${FILTER_FILE}"
-      ;;
-    *)
-      run_ui
-      ;;
+      echo "持久化: ${STATE_FILE} | IP: ${IP_ALLOW_FILE} | 域名: ${FILTER_FILE}" ;;
+    *) run_ui ;;
   esac
 }
 
