@@ -1,6 +1,3 @@
-﻿# Tinyproxy Filter 文件 — 放行白名单
-# ============================================================
-
 ^chat\.openai\.com\.cdn\.cloudflare\.net$
 ^openai-api\.arkoselabs\.com$
 ^openaicom-api-bdcpf8c6d2e9atf6\.z01\.azurefd\.net$
@@ -47,9 +44,6 @@
 (^|\.)anthropic\.com$
 (^|\.)claude\.ai$
 (^|\.)claude\.com$
-openai
-colab
-developerprofiles
-generativelanguage
-
-# ============================================================
+(^|\.)colab\.research\.google\.com$
+(^|\.)developerprofiles\.google$
+(^|\.)generativelanguage\.googleapis\.com$
