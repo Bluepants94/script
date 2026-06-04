@@ -141,14 +141,16 @@ enable_ip_whitelist() {
 IPEOF
   fi
   # 先清除外部的 Allow 行，但保留默认的 127.0.0.1 和 ::1
-  sudo sed -i -E '/^Allow[[:space:]]+(127\.0\.0\.1|::1)[[:space:]]*$/!{/^Allow[[:space:]]/d;}' "$CONF"
+  sudo sed -i -E -e '/^Allow[[:space:]]+127\.0\.0\.1[[:space:]]*$/b' \
+                 -e '/^Allow[[:space:]]+::1[[:space:]]*$/b' \
+                 -e '/^Allow[[:space:]]/d' "$CONF"
   # 确保默认的 localhost 在文件里
   grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
   grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
 
-  # 从 allow_ip.txt 读取并追加
+  # 从 allow_ip.txt 读取并追加（兼容用户手写了 Allow 关键字的情况）
   if allow_has_ips "$IP_ALLOW_FILE"; then
-    awk 'NF>0 && !/^[[:space:]]*#/{print "Allow "$0}' "$IP_ALLOW_FILE" \
+    awk 'NF>0 && !/^[[:space:]]*#/{sub(/^Allow[[:space:]]+/, ""); print "Allow "$0}' "$IP_ALLOW_FILE" \
       | sudo tee -a "$CONF" >/dev/null
   fi
 }
@@ -156,7 +158,9 @@ IPEOF
 disable_ip_whitelist() {
   backup_conf
   # 删除外部 Allow 行，保留默认的 127.0.0.1 和 ::1
-  sudo sed -i -E '/^Allow[[:space:]]+(127\.0\.0\.1|::1)[[:space:]]*$/!{/^Allow[[:space:]]/d;}' "$CONF"
+  sudo sed -i -E -e '/^Allow[[:space:]]+127\.0\.0\.1[[:space:]]*$/b' \
+                 -e '/^Allow[[:space:]]+::1[[:space:]]*$/b' \
+                 -e '/^Allow[[:space:]]/d' "$CONF"
   # 确保默认的 localhost 在文件里
   grep -qE '^Allow[[:space:]]+127\.0\.0\.1' "$CONF" 2>/dev/null || echo "Allow 127.0.0.1" | sudo tee -a "$CONF" >/dev/null
   grep -qE '^Allow[[:space:]]+::1' "$CONF" 2>/dev/null || echo "Allow ::1" | sudo tee -a "$CONF" >/dev/null
