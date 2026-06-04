@@ -10,7 +10,6 @@ YAML_CONF="${CONF_DIR}/config.yaml"
 STATE_FILE="${CONF_DIR}/state.env"
 DOMAIN_WL_FILE="${CONF_DIR}/domain_whitelist.txt"
 IP_WL_FILE="${CONF_DIR}/ip_whitelist.txt"
-# 已更新为您的最新 Gost 专属白名单链接
 WHITELIST_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_proxy/whitelist.txt"
 
 # ---------- 颜色 ----------
@@ -32,7 +31,6 @@ is_active() { systemctl -q is-active gost 2>/dev/null; }
 
 get_gost_version() {
     if command -v gost &>/dev/null; then
-        # 提取版本号
         gost -V 2>&1 | head -n 1 | awk '{print $2}' || echo "未知版本"
     else
         echo "未安装"
@@ -44,7 +42,6 @@ init_env() {
     check_sudo
     sudo mkdir -p "$CONF_DIR"
     
-    # 初始化状态文件
     if [ ! -f "$STATE_FILE" ]; then
         sudo bash -c "cat > $STATE_FILE" <<EOF
 GOST_PORT=8888
@@ -54,7 +51,6 @@ DOMAIN_WL_ON=false
 EOF
     fi
 
-    # 初始化 IP 白名单文件 (默认允许本地)
     if [ ! -f "$IP_WL_FILE" ]; then
         sudo bash -c "cat > $IP_WL_FILE" <<EOF
 127.0.0.1
@@ -74,14 +70,50 @@ save_state() {
     fi
 }
 
-# ---------- 安装与更新 Gost v3 ----------
+# ---------- 直连 API 下载与安装模块 ----------
+download_and_install_gost() {
+    local arch=""
+    case $(uname -m) in
+        x86_64|amd64) arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) print_err "暂不支持的架构: $(uname -m)"; return 1 ;;
+    esac
+
+    print_info "正在获取 Gost 最新稳定版信息..."
+    local latest_version
+    # 调用 Github API 获取最新的 Release Tag
+    latest_version=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    
+    if [ -z "$latest_version" ]; then
+        print_err "获取最新版本失败，请检查网络连接。"
+        return 1
+    fi
+
+    local version_num="${latest_version#v}"
+    local filename="gost_${version_num}_linux_${arch}.tar.gz"
+    local download_url="https://github.com/go-gost/gost/releases/download/${latest_version}/${filename}"
+
+    print_info "发现新版本 ${latest_version}，正在下载..."
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    
+    if ! curl -fsSL "$download_url" -o "${tmp_dir}/${filename}"; then
+        print_err "文件下载失败！"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
+    tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"
+    
+    sudo mv "${tmp_dir}/gost" /usr/local/bin/gost
+    sudo chmod +x /usr/local/bin/gost
+    rm -rf "$tmp_dir"
+    return 0
+}
+
 install_gost() {
     check_sudo
-    print_info "正在自动下载并安装 Gost v3..."
-    curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh | sudo bash || {
-        print_err "Gost 安装失败，请检查网络。"
-        exit 1
-    }
+    download_and_install_gost || exit 1
     
     sudo bash -c "cat > /etc/systemd/system/gost.service" <<EOF
 [Unit]
@@ -110,8 +142,7 @@ check_gost() {
 update_gost() {
     check_sudo
     echo ""
-    print_info "开始拉取并更新 Gost v3 至最新版本..."
-    if curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh | sudo bash; then
+    if download_and_install_gost; then
         if is_active; then
             sudo systemctl restart gost 2>/dev/null
             print_ok "Gost 更新成功，并且代理服务已重启！"
@@ -119,7 +150,7 @@ update_gost() {
             print_ok "Gost 更新成功！"
         fi
     else
-        print_err "Gost 更新失败，请检查网络连接。"
+        print_err "Gost 更新失败。"
     fi
     echo ""
     read -r -p "按 回车键 返回菜单..."
@@ -139,7 +170,6 @@ download_whitelist() {
     else
         sudo wget -q -O "$DOMAIN_WL_FILE" "$WHITELIST_URL" 2>/dev/null || return 1
     fi
-    # 注意：这里已经移除了之前的格式清洗步骤，因为您的文件已经是标准 Gost 格式
 }
 
 # ---------- 配置生成 ----------
@@ -223,7 +253,6 @@ stop_proxy() {
 reload_proxy() {
     if ! is_active; then return 1; fi
     check_sudo
-    # 如果开启了域名白名单，重载时强制更新一次白名单文件
     if [ "${DOMAIN_WL_ON:-false}" = "true" ]; then
         sudo rm -f "$DOMAIN_WL_FILE"
         download_whitelist || print_warn "更新白名单失败，尝试使用旧配置。"
@@ -311,7 +340,6 @@ show_menu() {
 
 run_ui() {
     init_env
-    # 后台静默下载白名单文件
     [ -f "$DOMAIN_WL_FILE" ] && [ -s "$DOMAIN_WL_FILE" ] || (download_whitelist &>/dev/null &)
 
     while true; do
