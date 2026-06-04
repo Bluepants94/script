@@ -10,7 +10,8 @@ YAML_CONF="${CONF_DIR}/config.yaml"
 STATE_FILE="${CONF_DIR}/state.env"
 DOMAIN_WL_FILE="${CONF_DIR}/domain_whitelist.txt"
 IP_WL_FILE="${CONF_DIR}/ip_whitelist.txt"
-WHITELIST_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy/whitelist"
+# 已更新为您的最新 Gost 专属白名单链接
+WHITELIST_URL="https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_proxy/whitelist.txt"
 
 # ---------- 颜色 ----------
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -31,7 +32,7 @@ is_active() { systemctl -q is-active gost 2>/dev/null; }
 
 get_gost_version() {
     if command -v gost &>/dev/null; then
-        # 提取版本号，例如输出 gost 3.0.0-rc8，提取 3.0.0-rc8
+        # 提取版本号
         gost -V 2>&1 | head -n 1 | awk '{print $2}' || echo "未知版本"
     else
         echo "未安装"
@@ -124,16 +125,6 @@ update_gost() {
     read -r -p "按 回车键 返回菜单..."
 }
 
-# ---------- 正则转换器 ----------
-format_whitelist_for_gost() {
-    local file="$1"
-    [ -f "$file" ] || return 1
-    check_sudo
-    sudo sed -i -E 's/\(\^\|\\\.\)/\*\./g' "$file"
-    sudo sed -i -E 's/\^//g; s/\$//g' "$file"
-    sudo sed -i -E 's/\\././g' "$file"
-}
-
 # ---------- 域名白名单下载 ----------
 download_whitelist() {
     [ -f "$DOMAIN_WL_FILE" ] && [ -s "$DOMAIN_WL_FILE" ] && return 0
@@ -148,8 +139,7 @@ download_whitelist() {
     else
         sudo wget -q -O "$DOMAIN_WL_FILE" "$WHITELIST_URL" 2>/dev/null || return 1
     fi
-    
-    format_whitelist_for_gost "$DOMAIN_WL_FILE"
+    # 注意：这里已经移除了之前的格式清洗步骤，因为您的文件已经是标准 Gost 格式
 }
 
 # ---------- 配置生成 ----------
@@ -233,6 +223,12 @@ stop_proxy() {
 reload_proxy() {
     if ! is_active; then return 1; fi
     check_sudo
+    # 如果开启了域名白名单，重载时强制更新一次白名单文件
+    if [ "${DOMAIN_WL_ON:-false}" = "true" ]; then
+        sudo rm -f "$DOMAIN_WL_FILE"
+        download_whitelist || print_warn "更新白名单失败，尝试使用旧配置。"
+    fi
+    
     generate_yaml
     sudo systemctl restart gost 2>/dev/null \
         && print_ok "配置已重载生效。" \
@@ -264,7 +260,7 @@ toggle_domain_whitelist() {
     else
         download_whitelist || print_warn "域名白名单文件下载可能失败，将尝试使用本地缓存。"
         save_state "DOMAIN_WL_ON" "true"
-        print_ok "域名白名单已开启（正则已自动兼容）。"
+        print_ok "域名白名单已开启。"
     fi
     is_active && reload_proxy
 }
@@ -285,7 +281,6 @@ show_banner() {
         ps="${RED}○ 未启动${NC}"
     fi
     
-    # 清屏带来更好的交互体验（可选：如不喜欢可删除此行 clear）
     clear
     echo "=================================================="
     echo "        Gost v3 代理管理工具 (HTTP & SOCKS5)"
@@ -307,7 +302,7 @@ show_menu() {
     echo "  1) $($r && echo '关闭' || echo '开启(配置)')代理"
     echo "  2) $([ "${IP_WL_ON:-false}" = "true" ] && echo '关闭' || echo '开启')IP白名单"
     echo "  3) $([ "${DOMAIN_WL_ON:-false}" = "true" ] && echo '关闭' || echo '开启')域名白名单"
-    echo "  4) 重新生成配置并重载"
+    echo "  4) 更新规则并重载配置"
     echo "  5) 更新 Gost 至最新版"
     echo "  0) 退出"
     echo ""
@@ -316,7 +311,7 @@ show_menu() {
 
 run_ui() {
     init_env
-    # 后台静默下载并清洗白名单文件
+    # 后台静默下载白名单文件
     [ -f "$DOMAIN_WL_FILE" ] && [ -s "$DOMAIN_WL_FILE" ] || (download_whitelist &>/dev/null &)
 
     while true; do
