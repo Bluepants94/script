@@ -17,7 +17,6 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; NC='\033[0m'
 
 print_info()  { echo -e "${CYAN}[INFO]${NC}  $1"; }
-print_ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
 print_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 print_err()   { echo -e "${RED}[ERR]${NC}   $1"; }
 
@@ -81,7 +80,6 @@ download_and_install_gost() {
 
     print_info "正在获取 Gost 最新稳定版信息..."
     local latest_version
-    # 调用 Github API 获取最新的 Release Tag
     latest_version=$(curl -s https://api.github.com/repos/go-gost/gost/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
     
     if [ -z "$latest_version" ]; then
@@ -130,7 +128,6 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     sudo systemctl daemon-reload
-    print_ok "Gost v3 及 Systemd 服务安装成功。"
 }
 
 check_gost() {
@@ -145,15 +142,11 @@ update_gost() {
     if download_and_install_gost; then
         if is_active; then
             sudo systemctl restart gost 2>/dev/null
-            print_ok "Gost 更新成功，并且代理服务已重启！"
-        else
-            print_ok "Gost 更新成功！"
         fi
     else
         print_err "Gost 更新失败。"
+        sleep 2
     fi
-    echo ""
-    read -r -p "按 回车键 返回菜单..."
 }
 
 # ---------- 域名白名单下载 ----------
@@ -172,7 +165,7 @@ download_whitelist() {
     fi
 }
 
-# ---------- 配置生成 ----------
+# ---------- 核心修复：动态生成配置 ----------
 generate_yaml() {
     load_state
     local yaml_content="services:
@@ -197,15 +190,26 @@ generate_yaml() {
         yaml_content="${yaml_content}\n    bypass: target-domain-wl"
     fi
 
+    # 修复 IP 白名单注入逻辑：由于 admission 不支持挂载 file:，直接读取 ip_whitelist.txt 并注入 YAML
     if [ "${IP_WL_ON:-false}" = "true" ]; then
         yaml_content="${yaml_content}\n
 admissions:
   - name: client-ip-wl
     whitelist: true
-    matchers:
-      - \"file:${IP_WL_FILE}\""
+    matchers:"
+        # 逐行读取 IP 白名单文件（跳过空行和以 # 开头的注释）
+        if [ -f "$IP_WL_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                # 去除行首尾空格
+                line=$(echo "$line" | xargs)
+                if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                    yaml_content="${yaml_content}\n      - \"${line}\""
+                fi
+            done < "$IP_WL_FILE"
+        fi
     fi
 
+    # 域名分流 bypass 支持外部文件，保持原样
     if [ "${DOMAIN_WL_ON:-false}" = "true" ]; then
         yaml_content="${yaml_content}\n
 bypasses:
@@ -222,32 +226,39 @@ bypasses:
 start_proxy() {
     check_gost; init_env; load_state
 
+    # 1. 端口配置
     local input_port
-    read -r -p "代理端口 (当前: ${GOST_PORT}, 直接回车保持): " input_port
+    read -r -p "代理端口 (当前端口: ${GOST_PORT}, 直接回车保持默认): " input_port
+    
+    if [ "$input_port" = "0" ]; then
+        return 0
+    fi
+
     input_port="${input_port:-$GOST_PORT}"
     [ "$input_port" != "$GOST_PORT" ] && save_state "GOST_PORT" "$input_port"
 
-    local display_auth="${GOST_AUTH:-未设置(免密)}"
-    local input_auth
+    # 2. 账号密码配置
     echo ""
-    read -r -p "设置账号密码 [格式 user:pass] (当前: ${display_auth}, 直接回车跳过, 输入 'none' 清除): " input_auth
-    if [ "$input_auth" = "none" ]; then
+    local input_user
+    read -r -p "请输入账号（为空则跳过，输入 none 清除认证）: " input_user
+    
+    if [ "$input_user" = "none" ]; then
         save_state "GOST_AUTH" ""
-    elif [ -n "$input_auth" ]; then
-        save_state "GOST_AUTH" "$input_auth"
+    elif [ -n "$input_user" ]; then
+        local input_pass
+        read -r -p "请输入密码（为空则跳过）: " input_pass
+        if [ -n "$input_pass" ]; then
+            save_state "GOST_AUTH" "${input_user}:${input_pass}"
+        fi
     fi
 
     generate_yaml
-    sudo systemctl enable gost --now &>/dev/null \
-        && print_ok "代理已启动（端口 ${input_port}）。" \
-        || print_err "启动失败。"
+    sudo systemctl enable gost --now &>/dev/null || print_err "启动失败。"
 }
 
 stop_proxy() {
     check_sudo
-    sudo systemctl stop gost 2>/dev/null \
-        && print_ok "代理已停止。" \
-        || print_err "停止失败。"
+    sudo systemctl stop gost 2>/dev/null || print_err "停止失败。"
 }
 
 reload_proxy() {
@@ -259,9 +270,7 @@ reload_proxy() {
     fi
     
     generate_yaml
-    sudo systemctl restart gost 2>/dev/null \
-        && print_ok "配置已重载生效。" \
-        || print_err "配置应用失败。"
+    sudo systemctl restart gost 2>/dev/null || print_err "配置应用失败。"
 }
 
 # ---------- 开关 ----------
@@ -273,10 +282,8 @@ toggle_ip_whitelist() {
     load_state
     if [ "${IP_WL_ON:-false}" = "true" ]; then
         save_state "IP_WL_ON" "false"
-        print_ok "IP 白名单已关闭。所有人均可连接本代理。"
     else
         save_state "IP_WL_ON" "true"
-        print_ok "IP 白名单已开启。请确保 ${IP_WL_FILE} 中有你的 IP。"
     fi
     is_active && reload_proxy
 }
@@ -285,11 +292,9 @@ toggle_domain_whitelist() {
     load_state
     if [ "${DOMAIN_WL_ON:-false}" = "true" ]; then
         save_state "DOMAIN_WL_ON" "false"
-        print_ok "域名白名单已关闭。允许访问所有网站。"
     else
         download_whitelist || print_warn "域名白名单文件下载可能失败，将尝试使用本地缓存。"
         save_state "DOMAIN_WL_ON" "true"
-        print_ok "域名白名单已开启。"
     fi
     is_active && reload_proxy
 }
@@ -331,7 +336,7 @@ show_menu() {
     echo "  1) $($r && echo '关闭' || echo '开启(配置)')代理"
     echo "  2) $([ "${IP_WL_ON:-false}" = "true" ] && echo '关闭' || echo '开启')IP白名单"
     echo "  3) $([ "${DOMAIN_WL_ON:-false}" = "true" ] && echo '关闭' || echo '开启')域名白名单"
-    echo "  4) 更新规则并重载配置"
+    echo "  4) 重载配置"
     echo "  5) 更新 Gost 至最新版"
     echo "  0) 退出"
     echo ""
@@ -346,13 +351,13 @@ run_ui() {
         show_banner; show_menu
         IFS= read -r c
         case "${c}" in
-            1) toggle_proxy            ; sleep 1.5 ; continue ;;
-            2) toggle_ip_whitelist     ; sleep 1.5 ; continue ;;
-            3) toggle_domain_whitelist ; sleep 1.5 ; continue ;;
-            4) reload_proxy            ; sleep 1.5 ; continue ;;
-            5) update_gost             ; continue ;;
-            0) echo "已退出。"; exit 0 ;;
-            *) continue ;;
+            1) toggle_proxy            ;;
+            2) toggle_ip_whitelist     ;;
+            3) toggle_domain_whitelist ;;
+            4) reload_proxy            ;;
+            5) update_gost             ;;
+            0) exit 0 ;;
+            *) echo -e "${RED}输入错误，请重新输入${NC}"; sleep 1 ;;
         esac
     done
 }
