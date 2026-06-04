@@ -95,6 +95,31 @@ download_filter() {
   [ -s "$FILTER_FILE" ] && return 0 || { rm -f "$FILTER_FILE"; return 1; }
 }
 
+# ---------- 检查过滤文件是否有有效规则（非空行/非注释） ----------
+filter_has_rules() {
+  [ -f "$1" ] || return 1
+  while IFS= read -r line; do
+    line="$(echo "$line" | xargs)"
+    [ -z "$line" ] && continue
+    [[ "$line" == \#* ]] && continue
+    return 0
+  done < "$1"
+  return 1
+}
+
+# ---------- 检查 IP allow 文件是否有有效 IP ----------
+allow_has_ips() {
+  [ -f "$1" ] || return 1
+  [ -s "$1" ] || return 1
+  while IFS= read -r line; do
+    line="$(echo "$line" | xargs)"
+    [ -z "$line" ] && continue
+    [[ "$line" == \#* ]] && continue
+    return 0
+  done < "$1"
+  return 1
+}
+
 # ---------- 安装 ----------
 install_tinyproxy() {
   local pm
@@ -157,28 +182,6 @@ load_env_params() {
   PROXY_PASS="${TINYPROXY_PASS:-}"
 }
 
-# ---------- 从现有配置读取参数 ----------
-read_params_from_config() {
-  if [ ! -f "$CONFIG_FILE" ]; then
-    PROXY_PORT="$DEFAULT_PORT"
-    LISTEN_ADDR="0.0.0.0"
-    PROXY_USER=""
-    PROXY_PASS=""
-    return 1
-  fi
-  PROXY_PORT="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || echo "$DEFAULT_PORT")"
-  LISTEN_ADDR="$(grep -oP '^Listen\s+\K\S+' "$CONFIG_FILE" 2>/dev/null || echo "0.0.0.0")"
-  local auth_line
-  auth_line="$(grep '^BasicAuth' "$CONFIG_FILE" 2>/dev/null || true)"
-  if [ -n "$auth_line" ]; then
-    PROXY_USER="$(echo "$auth_line" | awk '{print $2}')"
-    PROXY_PASS="$(echo "$auth_line" | awk '{print $3}')"
-  else
-    PROXY_USER=""
-    PROXY_PASS=""
-  fi
-}
-
 # ---------- 配置生成 ----------
 generate_config() {
   local run_user run_group
@@ -203,10 +206,10 @@ generate_config() {
     fi
     # IP 白名单 - 控制谁能连接
     if [ "$IP_WHITELIST" = "on" ]; then
-      if [ -f "$IP_ALLOW_FILE" ] && [ -s "$IP_ALLOW_FILE" ]; then
+      if allow_has_ips "$IP_ALLOW_FILE"; then
         while IFS= read -r line; do
           line="$(echo "$line" | xargs)"
-          [ -n "$line" ] || continue
+          [ -z "$line" ] && continue
           [[ "$line" == \#* ]] && continue
           echo "Allow ${line}"
         done < "$IP_ALLOW_FILE"
@@ -214,7 +217,7 @@ generate_config() {
     fi
     # 域名白名单 - 控制能访问的目标
     if [ "$DOMAIN_WHITELIST" = "on" ]; then
-      if [ -f "$FILTER_FILE" ] && [ -s "$FILTER_FILE" ]; then
+      if filter_has_rules "$FILTER_FILE"; then
         echo "Filter \"${FILTER_FILE}\""
         echo "FilterDefaultDeny Yes"
       fi
@@ -309,22 +312,47 @@ restart_proxy() {
     return 0
   fi
 
-  read_params_from_config
+  # 从当前配置读取参数
+  local old_port old_listen old_user old_pass
+  if [ -f "$CONFIG_FILE" ]; then
+    old_port="$(grep -oP '^Port\s+\K[0-9]+' "$CONFIG_FILE" 2>/dev/null || true)"
+    old_listen="$(grep -oP '^Listen\s+\K\S+' "$CONFIG_FILE" 2>/dev/null || true)"
+    local auth_line
+    auth_line="$(grep '^BasicAuth' "$CONFIG_FILE" 2>/dev/null || true)"
+    if [ -n "$auth_line" ]; then
+      old_user="$(echo "$auth_line" | awk '{print $2}')"
+      old_pass="$(echo "$auth_line" | awk '{print $3}')"
+    fi
+  fi
+  PROXY_PORT="${old_port:-$DEFAULT_PORT}"
+  LISTEN_ADDR="${old_listen:-0.0.0.0}"
+  PROXY_USER="${old_user:-}"
+  PROXY_PASS="${old_pass:-}"
+
   load_state
-  [ "$DOMAIN_WHITELIST" = "on" ] && download_filter || true
+
+  if [ "$DOMAIN_WHITELIST" = "on" ]; then
+    download_filter || true
+  fi
 
   graceful_kill "$pid" 2>/dev/null || true
   rm -f "$PID_FILE"
   sleep 1
 
   generate_config
-  tinyproxy -c "$CONFIG_FILE" || return 1
+  tinyproxy -c "$CONFIG_FILE" || { print_warn "重启失败，端口可能未释放。"; return 1; }
 
   local new_pid="" waited=0
-  while [ ! -f "$PID_FILE" ] && [ "$waited" -lt 3 ]; do
+  while [ ! -f "$PID_FILE" ] && [ "$waited" -lt 5 ]; do
     sleep 1
     waited=$((waited + 1))
   done
+  [ -f "$PID_FILE" ] && new_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [ -z "$new_pid" ] || ! kill -0 "$new_pid" 2>/dev/null; then
+    print_warn "重启后新进程未能确认运行。"
+    return 1
+  fi
+  return 0
 }
 
 # ---------- 状态 ----------
@@ -363,6 +391,7 @@ toggle_ip_whitelist() {
 # 10.0.0.0/8
 # 172.16.0.0/12
 
+192.168.1.0/24
 EOF
   fi
   IP_WHITELIST=on
@@ -379,10 +408,11 @@ toggle_domain_whitelist() {
     restart_proxy
     return 0
   fi
-  download_filter
-  DOMAIN_WHITELIST=on
-  save_state
-  restart_proxy
+  if download_filter; then
+    DOMAIN_WHITELIST=on
+    save_state
+    restart_proxy
+  fi
 }
 
 # ---------- 菜单 UI ----------
