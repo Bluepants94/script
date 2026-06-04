@@ -28,13 +28,12 @@ print_err()   { echo -e "${RED}[ERR]${NC}   $1"; }
 # ---------- 信号处理 ----------
 cleanup_on_exit() {
   local exit_code=$?
-  # 只清理临时文件，不杀进程（除非异常退出）
   if [ "$exit_code" -ne 0 ] && [ "$exit_code" -ne 130 ]; then
     print_warn "脚本异常退出，残留文件：${CONFIG_FILE}"
   fi
 }
 trap cleanup_on_exit EXIT
-trap '' INT  # Ctrl+C 由菜单循环自行处理
+trap '' INT
 
 # ---------- 工具函数 ----------
 die() { print_err "$1"; exit "${2:-1}"; }
@@ -93,38 +92,64 @@ check_tinyproxy() {
   install_tinyproxy
 }
 
-# ---------- 交互参数 ----------
+# ---------- 交互参数（所有输入页均支持 0=返回） ----------
 prompt_start_params() {
   local input_port listen_choice custom_ip
-  read -r -p "请输入代理端口 (默认 ${DEFAULT_PORT}): " input_port
+
+  # 端口输入
+  read -r -p "请输入代理端口 (默认 ${DEFAULT_PORT}，输入 0 返回): " input_port
+  if [ "${input_port:-}" = "0" ]; then
+    print_info "已返回。"
+    return 1
+  fi
   PROXY_PORT="${input_port:-$DEFAULT_PORT}"
   [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] \
     || die "端口无效：${PROXY_PORT}"
 
-  echo ""; echo "请选择监听地址:"
+  # 监听地址选择
+  echo ""
+  echo "请选择监听地址:"
   echo "  1) 0.0.0.0 (所有网卡，允许外部访问) [默认]"
   echo "  2) 127.0.0.1 (仅本地访问)"
   echo "  3) 自定义IP"
-  read -r -p "输入选项 [1-3]: " listen_choice
+  echo "  0) 返回"
+  read -r -p "输入选项 [0-3]: " listen_choice
   case "${listen_choice}" in
+    0) print_info "已返回。"; return 1 ;;
     2) LISTEN_ADDR="127.0.0.1" ;;
     3)
-      read -r -p "请输入自定义监听IP: " custom_ip
+      read -r -p "请输入自定义监听IP (输入 0 返回): " custom_ip
+      if [ "${custom_ip:-}" = "0" ]; then print_info "已返回。"; return 1; fi
       [ -n "$custom_ip" ] || die "监听IP不能为空"
       LISTEN_ADDR="$custom_ip"
       ;;
     *) LISTEN_ADDR="0.0.0.0" ;;
   esac
 
-  read -r -p "请输入用户名 (可留空): " PROXY_USER
-  # 密码不回显
-  read -r -s -p "请输入密码 (可留空，输入不可见): " PROXY_PASS
-  echo ""
+  # 用户名
+  read -r -p "请输入用户名 (可留空，输入 0 返回): " PROXY_USER
+  if [ "${PROXY_USER:-}" = "0" ]; then
+    print_info "已返回。"
+    return 1
+  fi
 
+  # 密码（不回显）
+  read -r -s -p "请输入密码 (可留空，输入 0 返回): " PROXY_PASS
+  echo ""
+  if [ "${PROXY_PASS:-}" = "0" ]; then
+    print_info "已返回。"
+    return 1
+  fi
+
+  # IP 白名单
   echo ""
   print_info "IP 白名单设置（留空则允许所有IP访问）"
   print_info "多个IP用空格分隔，支持 CIDR 格式（如 192.168.1.0/24）"
-  read -r -p "请输入允许访问的IP: " ALLOW_IPS
+  read -r -p "请输入允许访问的IP (输入 0 返回): " ALLOW_IPS
+  if [ "${ALLOW_IPS:-}" = "0" ]; then
+    print_info "已返回。"
+    return 1
+  fi
 }
 
 # ---------- 非交互参数（环境变量） ----------
@@ -145,16 +170,12 @@ generate_config() {
   run_user="$(id -un 2>/dev/null || echo "nobody")"
   run_group="$(id -gn 2>/dev/null || echo "nogroup")"
 
-  # 一次性写入完整配置
+  # 一次性写入完整配置（已移除新版 Tinyproxy 废弃的 StartServers / MinSpareServers / MaxSpareServers / MaxRequestsPerChild）
   {
     echo "Port ${PROXY_PORT}"
     echo "Listen ${LISTEN_ADDR}"
     echo "Timeout 600"
     echo "MaxClients 100"
-    echo "StartServers 5"
-    echo "MinSpareServers 5"
-    echo "MaxSpareServers 20"
-    echo "MaxRequestsPerChild 0"
     echo "LogFile \"${LOG_FILE}\""
     echo "LogLevel Info"
     echo "PidFile \"${PID_FILE}\""
@@ -182,14 +203,12 @@ graceful_kill() {
   local pid="$1" max_wait="${2:-5}" waited=0
   kill "$pid" 2>/dev/null || return 0
 
-  # 循环检查，最多等待 max_wait 秒
   while [ "$waited" -lt "$max_wait" ]; do
     kill -0 "$pid" 2>/dev/null || return 0
     sleep 1
     waited=$((waited + 1))
   done
 
-  # 超时后 SIGKILL
   kill -9 "$pid" 2>/dev/null || true
   print_warn "进程 ${pid} 未能优雅退出，已强制终止。"
 }
@@ -198,7 +217,6 @@ graceful_kill() {
 start_proxy() {
   check_tinyproxy
 
-  # 判断交互模式还是环境变量模式
   if [ "${1:-}" = "--env" ]; then
     load_env_params
   else
@@ -207,7 +225,6 @@ start_proxy() {
 
   is_port_used "$PROXY_PORT" && die "端口 ${PROXY_PORT} 已被占用。"
 
-  # 停止可能冲突的系统服务
   if command -v systemctl &>/dev/null; then
     sudo systemctl stop tinyproxy 2>/dev/null || true
   fi
@@ -217,7 +234,6 @@ start_proxy() {
   print_info "正在启动 tinyproxy..."
   tinyproxy -c "$CONFIG_FILE" || die "tinyproxy 启动失败。"
 
-  # 等待 PID 文件生成（最多 3 秒）
   local pid="" waited=0
   while [ ! -f "$PID_FILE" ] && [ "$waited" -lt 3 ]; do
     sleep 1
@@ -241,7 +257,6 @@ start_proxy() {
     echo "  PID:      ${pid}"
     echo "--------------------------------------------------"
   else
-    # tinyproxy 可能已退出，显示日志尾部
     tail -5 "$LOG_FILE" 2>/dev/null || true
     die "代理启动失败，请检查日志：${LOG_FILE}"
   fi
@@ -251,7 +266,6 @@ start_proxy() {
 stop_proxy() {
   local pid="" stopped=false
 
-  # 1) 从 PID 文件获取
   if [ -f "$PID_FILE" ]; then
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
@@ -261,7 +275,6 @@ stop_proxy() {
     fi
   fi
 
-  # 2) 兜底：按配置文件匹配进程
   if ! "$stopped"; then
     local pids
     pids="$(pgrep -f "tinyproxy.*${CONFIG_FILE}" 2>/dev/null || true)"
@@ -275,7 +288,6 @@ stop_proxy() {
     fi
   fi
 
-  # 3) 清理文件
   rm -f "$CONFIG_FILE" "$PID_FILE" "$LOG_FILE"
   print_ok "临时文件已清理。"
 }
@@ -308,8 +320,8 @@ show_banner() {
 
 show_menu() {
   echo ""
-  echo "  1) 开启代理（交互式配置）"
-  echo "  2) 关闭代理（并清理配置）"
+  echo "  1) 开启代理"
+  echo "  2) 关闭代理"
   echo "  3) 查看状态"
   echo "  0) 退出"
   echo -n "输入选项 [0-3]: "
