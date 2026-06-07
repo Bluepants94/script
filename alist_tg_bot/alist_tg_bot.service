@@ -1,0 +1,40 @@
+# alist_tg_bot systemd 服务文件
+# 使用方法：
+# 1. 将本项目放到 Linux 服务器，例如 /opt/alist_tg_bot
+# 2. 确认 /opt/alist_tg_bot/.env 已填写真实配置
+# 3. 将本文件复制到 /etc/systemd/system/alist_tg_bot.service
+# 4. 执行：systemctl daemon-reload && systemctl enable --now alist_tg_bot
+
+[Unit]
+Description=Alist Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 建议新建一个低权限用户运行 Bot，例如：useradd -r -s /usr/sbin/nologin alistbot
+User=root
+Group=root
+
+# 项目所在目录；如果部署路径不同，请同步修改这里和 ExecStart。
+WorkingDirectory=/opt/alist_tg_bot
+
+# config.py 会自动读取 WorkingDirectory 同目录下的 .env。
+# systemd 也会加载这个文件；前面的 - 表示文件不存在时不启动失败。
+EnvironmentFile=-/opt/alist_tg_bot/.env
+
+# 如果使用虚拟环境，请改成：/opt/alist_tg_bot/.venv/bin/python /opt/alist_tg_bot/alist_tg_bot.py
+ExecStart=/usr/bin/python3 /opt/alist_tg_bot/alist_tg_bot.py
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+# 日志可通过 journalctl -u alist_tg_bot -f 查看。
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
