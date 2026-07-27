@@ -261,7 +261,6 @@ show_status() {
     printf '  目标白名单   : %b\n' "$bp_state"
     printf '  开机自启     : %b\n' "$boot_state"
     printf '  配置文件     : %s\n' "$CONFIG_FILE"
-    printf '  %b\n' "${C_DIM}可手动编辑配置后执行 systemctl restart ${SERVICE_NAME} 生效；菜单操作会重新生成并覆盖该文件${C_RESET}"
     if [[ $ENV_OK -ne 1 ]]; then
         echo "  ${C_YELLOW}环境异常（仅可查看状态）：${C_RESET}"
         local p
@@ -554,7 +553,7 @@ list_editor() {
         admission)
             enabled_ref=WHITELIST_ENABLED
             entries_ref=WHITELIST_ENTRIES
-            title="来源 IP 白名单（admission）"
+            title="来源 IP 白名单"
             hint="IP 或 CIDR（如 1.2.3.4 或 10.0.0.0/8）"
             validator="valid_ip_cidr"
             off_msg="放行全部来源"
@@ -563,7 +562,7 @@ list_editor() {
         bypass)
             enabled_ref=BYPASS_ENABLED
             entries_ref=BYPASS_ENTRIES
-            title="目标地址白名单（bypass）"
+            title="目标地址白名单"
             hint="域名/通配符/IP/CIDR（如 example.com、*.example.com、1.2.3.4、10.0.0.0/8）"
             validator="valid_bypass_entry"
             off_msg="放行全部目标"
@@ -596,7 +595,6 @@ list_editor() {
                 printf '  %d) %s\n' "$((i + 1))" "${entries[$i]}"
             done
         fi
-        echo "${C_DIM}批量编辑：直接修改 ${CONFIG_FILE} 后使用主菜单 8 重载生效${C_RESET}"
 
         echo
         echo "1) 添加条目"
@@ -748,9 +746,9 @@ main_menu() {
         echo "  3) 关闭代理"
         echo "  4) 设置监听端口"
         echo "  5) 设置访问鉴权"
-        echo "  6) 来源 IP 白名单（admission）"
-        echo "  7) 目标地址白名单（bypass）"
-        echo "  8) 重载代理（应用手动修改的配置）"
+        echo "  6) 来源 IP 白名单"
+        echo "  7) 目标地址白名单"
+        echo "  8) 重载代理"
         echo "  9) 开机自启（开启 / 关闭）"
         echo "  10) 退出"
         echo
