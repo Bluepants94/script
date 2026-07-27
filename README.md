@@ -34,7 +34,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 # Gost代理
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_proxy/gost_proxy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/gost_proxy/proxy-manager.sh)
 ```
 # 流量消耗器
 ```
