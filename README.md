@@ -30,7 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/head
 ```
 # HTTP代理
 ```
-bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy/http_proxy.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Bluepants94/script/refs/heads/main/http_proxy/proxy-manager.sh)
 ```
 # Gost代理
 ```
