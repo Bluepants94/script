@@ -22,6 +22,8 @@ AUTH_USER=""
 AUTH_PASS=""
 WHITELIST_ENABLED="off"   # on / off
 WHITELIST_ENTRIES=""      # 空格分隔的 IP/CIDR 列表
+BYPASS_ENABLED="off"      # on / off
+BYPASS_ENTRIES=""         # 空格分隔的目标白名单（域名/通配符/IP/CIDR）
 
 ENV_OK=1
 ENV_PROBLEMS=()
@@ -92,6 +94,8 @@ save_settings() {
         printf 'AUTH_PASS=%q\n' "$AUTH_PASS"
         printf 'WHITELIST_ENABLED=%q\n' "$WHITELIST_ENABLED"
         printf 'WHITELIST_ENTRIES=%q\n' "$WHITELIST_ENTRIES"
+        printf 'BYPASS_ENABLED=%q\n' "$BYPASS_ENABLED"
+        printf 'BYPASS_ENTRIES=%q\n' "$BYPASS_ENTRIES"
     } > "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
 }
@@ -120,8 +124,13 @@ generate_config() {
         echo "  listener:"
         echo "    type: tcp"
         if [[ $WHITELIST_ENABLED == "on" && -n $WHITELIST_ENTRIES ]]; then
-            # gost v3 要求 admission 为命名引用，定义在顶层 admissions 列表
+            # gost v3 要求 admission/bypass 为命名引用，定义在顶层列表
             echo "  admission: gost-proxy-wl"
+        fi
+        if [[ $BYPASS_ENABLED == "on" && -n $BYPASS_ENTRIES ]]; then
+            echo "  bypass: gost-proxy-bp"
+        fi
+        if [[ $WHITELIST_ENABLED == "on" && -n $WHITELIST_ENTRIES ]]; then
             echo "admissions:"
             echo "- name: gost-proxy-wl"
             echo "  whitelist: true"
@@ -129,6 +138,16 @@ generate_config() {
             local ip
             for ip in $WHITELIST_ENTRIES; do
                 echo "  - \"${ip}\""
+            done
+        fi
+        if [[ $BYPASS_ENABLED == "on" && -n $BYPASS_ENTRIES ]]; then
+            echo "bypasses:"
+            echo "- name: gost-proxy-bp"
+            echo "  whitelist: true"
+            echo "  matchers:"
+            local t
+            for t in $BYPASS_ENTRIES; do
+                echo "  - \"${t}\""
             done
         fi
     } > "$CONFIG_FILE"
@@ -190,7 +209,7 @@ port_in_use() {
 # 状态栏
 # ---------------------------------------------------------------------------
 show_status() {
-    local ver listen_state port_state auth_state wl_state boot_state
+    local ver listen_state port_state auth_state wl_state bp_state boot_state
     ver=$(gost_version_text)
 
     if service_active; then
@@ -219,6 +238,14 @@ show_status() {
         wl_state="${C_YELLOW}关闭${C_RESET}（已保存 ${count} 条）"
     fi
 
+    local bp_count=0 t
+    for t in $BYPASS_ENTRIES; do bp_count=$((bp_count + 1)); done
+    if [[ $BYPASS_ENABLED == "on" ]]; then
+        bp_state="${C_GREEN}开启${C_RESET}（${bp_count} 条）"
+    else
+        bp_state="${C_YELLOW}关闭${C_RESET}（已保存 ${bp_count} 条）"
+    fi
+
     if service_enabled; then
         boot_state="${C_GREEN}已开启${C_RESET}"
     else
@@ -230,8 +257,11 @@ show_status() {
     printf '  监听状态     : %b\n' "$listen_state"
     printf '  当前端口     : %b\n' "$port_state"
     printf '  访问鉴权     : %b\n' "$auth_state"
-    printf '  IP 白名单    : %b\n' "$wl_state"
+    printf '  来源白名单   : %b\n' "$wl_state"
+    printf '  目标白名单   : %b\n' "$bp_state"
     printf '  开机自启     : %b\n' "$boot_state"
+    printf '  配置文件     : %s\n' "$CONFIG_FILE"
+    printf '  %b\n' "${C_DIM}可手动编辑配置后执行 systemctl restart ${SERVICE_NAME} 生效；菜单操作会重新生成并覆盖该文件${C_RESET}"
     if [[ $ENV_OK -ne 1 ]]; then
         echo "  ${C_YELLOW}环境异常（仅可查看状态）：${C_RESET}"
         local p
@@ -486,7 +516,7 @@ set_auth() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. 白名单管理（客户端来源 IP / CIDR，支持多条）
+# 6 / 7. 白名单管理（来源 admission / 目标 bypass，支持多条，逐条增删）
 # ---------------------------------------------------------------------------
 valid_ip_cidr() {
     local s="$1" ip mask octet
@@ -503,22 +533,61 @@ valid_ip_cidr() {
     return 0
 }
 
-whitelist_menu() {
+# bypass 条目：域名 / 通配符域名 / IP / CIDR / IP 范围
+valid_bypass_entry() {
+    local s="$1"
+    [[ -n $s && $s != *[[:space:]]* ]] || return 1
+    valid_ip_cidr "$s" && return 0
+    [[ $s =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}-([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
+    [[ $s =~ ^(\*\.)?([A-Za-z0-9-]+\.)*[A-Za-z0-9-]+$ ]] && return 0
+    return 1
+}
+
+# 通用白名单编辑菜单：list_editor admission | bypass
+list_editor() {
     require_env || return 1
+
+    local kind="$1"
+    local title hint validator off_msg on_msg
+    local -n enabled_ref entries_ref
+    case "$kind" in
+        admission)
+            enabled_ref=WHITELIST_ENABLED
+            entries_ref=WHITELIST_ENTRIES
+            title="来源 IP 白名单（admission）"
+            hint="IP 或 CIDR（如 1.2.3.4 或 10.0.0.0/8）"
+            validator="valid_ip_cidr"
+            off_msg="放行全部来源"
+            on_msg="仅允许列表中的来源连接"
+            ;;
+        bypass)
+            enabled_ref=BYPASS_ENABLED
+            entries_ref=BYPASS_ENTRIES
+            title="目标地址白名单（bypass）"
+            hint="域名/通配符/IP/CIDR（如 example.com、*.example.com、1.2.3.4、10.0.0.0/8）"
+            validator="valid_bypass_entry"
+            off_msg="放行全部目标"
+            on_msg="仅允许访问列表中的目标"
+            ;;
+        *)
+            err "未知白名单类型：${kind}"
+            return 1
+            ;;
+    esac
 
     local choice
     while true; do
         echo
-        echo "--- IP 白名单管理 ---"
-        if [[ $WHITELIST_ENABLED == "on" ]]; then
-            echo "状态：${C_GREEN}开启${C_RESET}（仅允许以下来源连接）"
+        echo "--- ${title} ---"
+        if [[ $enabled_ref == "on" ]]; then
+            echo "状态：${C_GREEN}开启${C_RESET}（${on_msg}）"
         else
-            echo "状态：${C_YELLOW}关闭${C_RESET}（放行全部来源）"
+            echo "状态：${C_YELLOW}关闭${C_RESET}（${off_msg}）"
         fi
 
         local -a entries=()
-        local ip i
-        for ip in $WHITELIST_ENTRIES; do entries+=("$ip"); done
+        local e i
+        for e in $entries_ref; do entries+=("$e"); done
         if [[ ${#entries[@]} -eq 0 ]]; then
             echo "当前条目：（空）"
         else
@@ -527,12 +596,13 @@ whitelist_menu() {
                 printf '  %d) %s\n' "$((i + 1))" "${entries[$i]}"
             done
         fi
+        echo "${C_DIM}批量编辑：直接修改 ${CONFIG_FILE} 后使用主菜单 8 重载生效${C_RESET}"
 
         echo
-        echo "1) 添加 IP/CIDR"
+        echo "1) 添加条目"
         echo "2) 删除条目"
-        if [[ $WHITELIST_ENABLED == "on" ]]; then
-            echo "3) 关闭白名单（放行全部来源）"
+        if [[ $enabled_ref == "on" ]]; then
+            echo "3) 关闭白名单（${off_msg}）"
         else
             echo "3) 开启白名单"
         fi
@@ -541,23 +611,23 @@ whitelist_menu() {
 
         case "$choice" in
             1)
-                local newip
-                read -rp "请输入 IP 或 CIDR（如 1.2.3.4 或 10.0.0.0/8）: " newip
-                if ! valid_ip_cidr "$newip"; then
-                    err "格式无效：${newip}"
+                local newentry
+                read -rp "请输入条目（${hint}）: " newentry
+                if ! "$validator" "$newentry"; then
+                    err "格式无效：${newentry}"
                     continue
                 fi
-                for ip in "${entries[@]}"; do
-                    if [[ $ip == "$newip" ]]; then
+                for e in "${entries[@]}"; do
+                    if [[ $e == "$newentry" ]]; then
                         warn "该条目已存在"
                         continue 2
                     fi
                 done
-                entries+=("$newip")
-                WHITELIST_ENTRIES="${entries[*]}"
+                entries+=("$newentry")
+                entries_ref="${entries[*]}"
                 save_settings
                 generate_config
-                ok "已添加：${newip}"
+                ok "已添加：${newentry}"
                 ;;
             2)
                 if [[ ${#entries[@]} -eq 0 ]]; then
@@ -573,22 +643,22 @@ whitelist_menu() {
                 local removed="${entries[$((idx - 1))]}"
                 unset 'entries[$((idx - 1))]'
                 entries=("${entries[@]}")
-                WHITELIST_ENTRIES="${entries[*]:-}"
+                entries_ref="${entries[*]:-}"
                 save_settings
                 generate_config
                 ok "已删除：${removed}"
                 ;;
             3)
-                if [[ $WHITELIST_ENABLED == "on" ]]; then
-                    WHITELIST_ENABLED="off"
-                    ok "白名单已关闭，放行全部来源"
+                if [[ $enabled_ref == "on" ]]; then
+                    enabled_ref="off"
+                    ok "白名单已关闭，${off_msg}"
                 else
                     if [[ ${#entries[@]} -eq 0 ]]; then
                         err "白名单为空，开启后将拒绝所有连接，请先添加条目"
                         continue
                     fi
-                    WHITELIST_ENABLED="on"
-                    ok "白名单已开启，仅允许列表中的来源连接"
+                    enabled_ref="on"
+                    ok "白名单已开启，${on_msg}"
                 fi
                 save_settings
                 generate_config
@@ -613,6 +683,32 @@ whitelist_menu() {
             fi
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# 8. 重载代理：按当前 config.yaml 重启服务（保留手动修改，不重新生成配置）
+# ---------------------------------------------------------------------------
+reload_proxy() {
+    require_env || return 1
+
+    if [[ ! -f $CONFIG_FILE ]]; then
+        err "配置文件不存在：${CONFIG_FILE}（请先通过菜单 2 开启一次代理）"
+        return 1
+    fi
+    if ! service_active; then
+        warn "代理当前未在运行，如需启动请使用菜单 2"
+        return 0
+    fi
+
+    info "正在按当前配置文件重载（不覆盖手动修改）..."
+    systemctl restart "$SERVICE_NAME"
+    sleep 1
+    if service_active; then
+        ok "重载完成，已应用 ${CONFIG_FILE} 中的最新内容"
+    else
+        err "重载失败，手动修改的配置可能有误，请检查：journalctl -u ${SERVICE_NAME} -n 50"
+        return 1
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -652,22 +748,26 @@ main_menu() {
         echo "  3) 关闭代理"
         echo "  4) 设置监听端口"
         echo "  5) 设置访问鉴权"
-        echo "  6) IP 白名单管理"
-        echo "  7) 开机自启（开启 / 关闭）"
-        echo "  8) 退出"
+        echo "  6) 来源 IP 白名单（admission）"
+        echo "  7) 目标地址白名单（bypass）"
+        echo "  8) 重载代理（应用手动修改的配置）"
+        echo "  9) 开机自启（开启 / 关闭）"
+        echo "  10) 退出"
         echo
-        read -rp "请选择 [1-8]: " choice || { echo; exit 0; }
+        read -rp "请选择 [1-10]: " choice || { echo; exit 0; }
 
         case "$choice" in
-            1) install_or_update_gost; pause ;;
-            2) start_proxy;           pause ;;
-            3) stop_proxy;            pause ;;
-            4) set_port;              pause ;;
-            5) set_auth;              pause ;;
-            6) whitelist_menu ;;
-            7) toggle_autostart;      pause ;;
-            8) echo "再见。"; exit 0 ;;
-            *) warn "无效选择，请输入 1-8"; sleep 1 ;;
+            1)  install_or_update_gost; pause ;;
+            2)  start_proxy;            pause ;;
+            3)  stop_proxy;             pause ;;
+            4)  set_port;               pause ;;
+            5)  set_auth;               pause ;;
+            6)  list_editor admission ;;
+            7)  list_editor bypass ;;
+            8)  reload_proxy;           pause ;;
+            9)  toggle_autostart;       pause ;;
+            10) echo "再见。"; exit 0 ;;
+            *)  warn "无效选择，请输入 1-10"; sleep 1 ;;
         esac
     done
 }
