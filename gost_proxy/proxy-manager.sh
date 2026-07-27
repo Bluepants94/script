@@ -9,6 +9,8 @@ set -uo pipefail
 readonly GOST_BIN="/usr/local/bin/gost"
 readonly CONF_DIR="/etc/gost-proxy"
 readonly SETTINGS_FILE="${CONF_DIR}/settings.env"
+readonly ADMISSION_LIST="${CONF_DIR}/admission.list"
+readonly BYPASS_LIST="${CONF_DIR}/bypass.list"
 readonly CONFIG_FILE="${CONF_DIR}/config.yaml"
 readonly SERVICE_NAME="gost-proxy.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -21,9 +23,10 @@ PORT="38080"
 AUTH_USER=""
 AUTH_PASS=""
 WHITELIST_ENABLED="off"   # on / off
-WHITELIST_ENTRIES=""      # 空格分隔的 IP/CIDR 列表
 BYPASS_ENABLED="off"      # on / off
-BYPASS_ENTRIES=""         # 空格分隔的目标白名单（域名/通配符/IP/CIDR）
+# 旧版兼容：条目曾内嵌在 settings.env，现已迁移到 admission.list / bypass.list
+WHITELIST_ENTRIES=""
+BYPASS_ENTRIES=""
 
 ENV_OK=1
 ENV_PROBLEMS=()
@@ -93,11 +96,34 @@ save_settings() {
         printf 'AUTH_USER=%q\n' "$AUTH_USER"
         printf 'AUTH_PASS=%q\n' "$AUTH_PASS"
         printf 'WHITELIST_ENABLED=%q\n' "$WHITELIST_ENABLED"
-        printf 'WHITELIST_ENTRIES=%q\n' "$WHITELIST_ENTRIES"
         printf 'BYPASS_ENABLED=%q\n' "$BYPASS_ENABLED"
-        printf 'BYPASS_ENTRIES=%q\n' "$BYPASS_ENTRIES"
     } > "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
+}
+
+# 从列表文件读取条目：忽略 # 注释与空行，兼容 CRLF 与首尾空白
+read_entries() {
+    local file="$1"
+    [[ -f $file ]] || return 0
+    sed 's/#.*$//' "$file" | tr -d '\r' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' || true
+}
+
+# 旧版 settings.env 内嵌条目 → 独立列表文件（仅当列表文件不存在时）
+migrate_legacy_entries() {
+    if [[ ! -f $ADMISSION_LIST && -n $WHITELIST_ENTRIES ]]; then
+        mkdir -p "$CONF_DIR"
+        tr ' ' '\n' <<< "$WHITELIST_ENTRIES" | grep -v '^$' > "$ADMISSION_LIST" || true
+        chmod 600 "$ADMISSION_LIST" 2>/dev/null || true
+        WHITELIST_ENTRIES=""
+    fi
+    if [[ ! -f $BYPASS_LIST && -n $BYPASS_ENTRIES ]]; then
+        mkdir -p "$CONF_DIR"
+        tr ' ' '\n' <<< "$BYPASS_ENTRIES" | grep -v '^$' > "$BYPASS_LIST" || true
+        chmod 600 "$BYPASS_LIST" 2>/dev/null || true
+        BYPASS_ENTRIES=""
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -110,6 +136,15 @@ yaml_escape() {
 
 generate_config() {
     mkdir -p "$CONF_DIR"
+
+    local -a wl_entries=() bp_entries=()
+    if [[ $WHITELIST_ENABLED == "on" ]]; then
+        mapfile -t wl_entries < <(read_entries "$ADMISSION_LIST")
+    fi
+    if [[ $BYPASS_ENABLED == "on" ]]; then
+        mapfile -t bp_entries < <(read_entries "$BYPASS_LIST")
+    fi
+
     {
         echo "services:"
         echo "- name: gost-proxy"
@@ -123,30 +158,30 @@ generate_config() {
         fi
         echo "  listener:"
         echo "    type: tcp"
-        if [[ $WHITELIST_ENABLED == "on" && -n $WHITELIST_ENTRIES ]]; then
-            # gost v3 要求 admission/bypass 为命名引用，定义在顶层列表
+        # gost v3 要求 admission/bypass 为命名引用，定义在顶层列表
+        if [[ ${#wl_entries[@]} -gt 0 ]]; then
             echo "  admission: gost-proxy-wl"
         fi
-        if [[ $BYPASS_ENABLED == "on" && -n $BYPASS_ENTRIES ]]; then
+        if [[ ${#bp_entries[@]} -gt 0 ]]; then
             echo "  bypass: gost-proxy-bp"
         fi
-        if [[ $WHITELIST_ENABLED == "on" && -n $WHITELIST_ENTRIES ]]; then
+        if [[ ${#wl_entries[@]} -gt 0 ]]; then
             echo "admissions:"
             echo "- name: gost-proxy-wl"
             echo "  whitelist: true"
             echo "  matchers:"
-            local ip
-            for ip in $WHITELIST_ENTRIES; do
-                echo "  - \"${ip}\""
+            local e
+            for e in "${wl_entries[@]}"; do
+                echo "  - \"${e}\""
             done
         fi
-        if [[ $BYPASS_ENABLED == "on" && -n $BYPASS_ENTRIES ]]; then
+        if [[ ${#bp_entries[@]} -gt 0 ]]; then
             echo "bypasses:"
             echo "- name: gost-proxy-bp"
             echo "  whitelist: true"
             echo "  matchers:"
             local t
-            for t in $BYPASS_ENTRIES; do
+            for t in "${bp_entries[@]}"; do
                 echo "  - \"${t}\""
             done
         fi
@@ -230,16 +265,18 @@ show_status() {
         auth_state="${C_YELLOW}未启用${C_RESET}"
     fi
 
-    local count=0 ip
-    for ip in $WHITELIST_ENTRIES; do count=$((count + 1)); done
+    local -a wl_arr=() bp_arr=()
+    mapfile -t wl_arr < <(read_entries "$ADMISSION_LIST")
+    mapfile -t bp_arr < <(read_entries "$BYPASS_LIST")
+
+    local count=${#wl_arr[@]}
     if [[ $WHITELIST_ENABLED == "on" ]]; then
         wl_state="${C_GREEN}开启${C_RESET}（${count} 条）"
     else
         wl_state="${C_YELLOW}关闭${C_RESET}（已保存 ${count} 条）"
     fi
 
-    local bp_count=0 t
-    for t in $BYPASS_ENTRIES; do bp_count=$((bp_count + 1)); done
+    local bp_count=${#bp_arr[@]}
     if [[ $BYPASS_ENABLED == "on" ]]; then
         bp_state="${C_GREEN}开启${C_RESET}（${bp_count} 条）"
     else
@@ -547,12 +584,12 @@ list_editor() {
     require_env || return 1
 
     local kind="$1"
-    local title hint validator off_msg on_msg
-    local -n enabled_ref entries_ref
+    local title hint validator off_msg on_msg list_file
+    local -n enabled_ref
     case "$kind" in
         admission)
             enabled_ref=WHITELIST_ENABLED
-            entries_ref=WHITELIST_ENTRIES
+            list_file="$ADMISSION_LIST"
             title="来源 IP 白名单"
             hint="IP 或 CIDR（如 1.2.3.4 或 10.0.0.0/8）"
             validator="valid_ip_cidr"
@@ -561,7 +598,7 @@ list_editor() {
             ;;
         bypass)
             enabled_ref=BYPASS_ENABLED
-            entries_ref=BYPASS_ENTRIES
+            list_file="$BYPASS_LIST"
             title="目标地址白名单"
             hint="域名/通配符/IP/CIDR（如 example.com、*.example.com、1.2.3.4、10.0.0.0/8）"
             validator="valid_bypass_entry"
@@ -585,8 +622,8 @@ list_editor() {
         fi
 
         local -a entries=()
-        local e i
-        for e in $entries_ref; do entries+=("$e"); done
+        local i
+        mapfile -t entries < <(read_entries "$list_file")
         if [[ ${#entries[@]} -eq 0 ]]; then
             echo "当前条目：（空）"
         else
@@ -609,7 +646,7 @@ list_editor() {
 
         case "$choice" in
             1)
-                local newentry
+                local newentry e
                 read -rp "请输入条目（${hint}）: " newentry
                 if ! "$validator" "$newentry"; then
                     err "格式无效：${newentry}"
@@ -621,8 +658,9 @@ list_editor() {
                         continue 2
                     fi
                 done
-                entries+=("$newentry")
-                entries_ref="${entries[*]}"
+                mkdir -p "$CONF_DIR"
+                printf '%s\n' "$newentry" >> "$list_file"
+                chmod 600 "$list_file"
                 save_settings
                 generate_config
                 ok "已添加：${newentry}"
@@ -639,9 +677,11 @@ list_editor() {
                     continue
                 fi
                 local removed="${entries[$((idx - 1))]}"
-                unset 'entries[$((idx - 1))]'
-                entries=("${entries[@]}")
-                entries_ref="${entries[*]:-}"
+                local tmpf
+                tmpf=$(mktemp) || { err "创建临时文件失败"; continue; }
+                grep -vxF -- "$removed" "$list_file" > "$tmpf" 2>/dev/null || true
+                mv "$tmpf" "$list_file"
+                chmod 600 "$list_file"
                 save_settings
                 generate_config
                 ok "已删除：${removed}"
@@ -684,27 +724,38 @@ list_editor() {
 }
 
 # ---------------------------------------------------------------------------
-# 8. 重载代理：按当前 config.yaml 重启服务（保留手动修改，不重新生成配置）
+# 8. 重载代理：设置/列表文件较新时先重新生成配置；config.yaml 较新时
+#    保留手动修改，仅重启服务
 # ---------------------------------------------------------------------------
 reload_proxy() {
     require_env || return 1
+
+    load_settings
 
     if [[ ! -f $CONFIG_FILE ]]; then
         err "配置文件不存在：${CONFIG_FILE}（请先通过菜单 2 开启一次代理）"
         return 1
     fi
+
+    if [[ $SETTINGS_FILE -nt $CONFIG_FILE ]] \
+        || [[ -f $ADMISSION_LIST && $ADMISSION_LIST -nt $CONFIG_FILE ]] \
+        || [[ -f $BYPASS_LIST && $BYPASS_LIST -nt $CONFIG_FILE ]]; then
+        info "检测到设置/白名单文件更新，正在重新生成配置..."
+        generate_config
+    fi
+
     if ! service_active; then
-        warn "代理当前未在运行，如需启动请使用菜单 2"
+        warn "代理当前未在运行，配置已就绪，如需启动请使用菜单 2"
         return 0
     fi
 
-    info "正在按当前配置文件重载（不覆盖手动修改）..."
+    info "正在重载..."
     systemctl restart "$SERVICE_NAME"
     sleep 1
     if service_active; then
-        ok "重载完成，已应用 ${CONFIG_FILE} 中的最新内容"
+        ok "重载完成"
     else
-        err "重载失败，手动修改的配置可能有误，请检查：journalctl -u ${SERVICE_NAME} -n 50"
+        err "重载失败，配置可能有误，请检查：journalctl -u ${SERVICE_NAME} -n 50"
         return 1
     fi
 }
@@ -739,6 +790,7 @@ main_menu() {
     local choice
     while true; do
         clear
+        load_settings
         check_env
         show_status
         echo "  1) 安装 / 更新 gost"
@@ -772,4 +824,5 @@ main_menu() {
 
 trap 'echo; echo "已退出。"; exit 0' INT TERM
 load_settings
+migrate_legacy_entries
 main_menu
